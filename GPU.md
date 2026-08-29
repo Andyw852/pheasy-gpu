@@ -111,7 +111,8 @@ Verified numerics (GPU vs CPU):
 * `GpuRidgeCV.alpha_` vs `sklearn.RidgeCV.alpha_`: exact match
 * `qr_solve` vs `numpy.linalg.lstsq`: ~5e-15
 * `GpuLassoCV.alpha_` vs `sklearn.LassoCV.alpha_`: identical; coef rel diff
-  ~4e-9 (synthetic), ~3.5e-4 / 5.9e-6 (c7 SM, n=8, debias off) after the fix.
+  ~4e-9 (synthetic), ~3.5e-4 / 5.9e-6 (c7 SM, n=8, debias off, tol=1e-6) after
+  the fix -- the 3.5e-4 is a tol artifact, see the fixed-alpha scan below.
 
 Recheck after the Lipschitz fix (`dev/recheck_lasso.py`, RTX 3090):
 * level 1: `_power_lipschitz == lambda_max(G)` to ~1e-15 (no lambda_max^2).
@@ -126,6 +127,15 @@ Recheck after the Lipschitz fix (`dev/recheck_lasso.py`, RTX 3090):
   and the CV curve is still falling, so nnz is near-dense (~92%). This is a
   grid/data property of the holdout config, not a FISTA bug; `run_pheasy` can
   widen the grid via `PHEASY_ALPHA_DECADES`.
+* Fixed-alpha scan (`dev/alpha_scan.py`, no CV, tol=1e-8 CD / 1e-7 FISTA):
+  LASSO coef rel diff vs nnz on the c7 SM degrades monotonically with
+  conditioning -- 1.8e-10 (1.5% nnz) -> 8e-9 (12%) -> 1.2e-7 (57%) -> 4.5e-7
+  (90%) -> 1.25e-6 (98.5%); the sklearn CD converged at every point (max
+  n_iter=1438, no ConvergenceWarning). So the level-3 LASSO 3.5e-4 is NOT a
+  conditioning floor: at the same ~90%-dense point the two solvers agree to
+  4.5e-7 with tight tol, and the 3.5e-4 comes from the recheck's tol=1e-6
+  stopping early in the near-OLS regime. GPU FISTA tracks sklearn CD to ~1.3e-6
+  across the whole density range when tol is tight.
 
 ## Memory (RTX 3090, full n=45 dense SM 25515x3678)
 
@@ -166,10 +176,12 @@ PHEASY_USE_GPU=0 python holdout_eval.py <data_dir> --methods OLS LASSO --n-confi
 diff <(grep -E "OLS|LASSO" gpu.out) <(grep -E "OLS|LASSO" cpu.out)
 ```
 
-OLS should match to ~1e-8 (identical SVD). LASSO/ALASSO match to ~1e-6 to ~1e-4
-(FISTA vs coordinate descent on the same optimum, depending on conditioning);
-the post-fix recheck (`dev/recheck_lasso.py`) measured alpha_/support identical
-and raw coef (debias off) rel diff 3.5e-4 / 5.9e-6 on the c7 SM (n=8). To force
+OLS should match to ~1e-8 (identical SVD). LASSO/ALASSO match to ~1e-8 in the
+sparse regime, degrading to ~1e-6 as nnz -> 100% (FISTA vs coordinate descent on
+the same optimum, conditioning-dependent): the fixed-alpha scan
+(`dev/alpha_scan.py`, tol=1e-8) measured LASSO coef rel diff 1.8e-10 -> 1.25e-6
+as nnz ran 1.5% -> 98.5% on the c7 SM. The recheck's raw (debias-off) LASSO
+3.5e-4 at ~92% nnz is a tol=1e-6 artifact, not a conditioning floor. To force
 the identical sklearn solver for a bit-exact LASSO diff, add `PHEASY_GPU_LASSO=0`
 to both runs.
 
