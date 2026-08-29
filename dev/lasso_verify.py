@@ -19,6 +19,6 @@ gcv.fit(As, y)
 print("gpu GpuLassoCV : alpha=%.6e  nnz=%d" % (gcv.alpha_, int(np.count_nonzero(gcv.coef_))), flush=True)
 d = float(np.linalg.norm(lcv.coef_ - gcv.coef_) / max(np.linalg.norm(lcv.coef_), 1e-30))
 print("coef rel diff = %.3e" % d, flush=True)
-print("alpha rel diff = %.3e" % abs(lcv.alpha_ - gcv.alpha_) / max(lcv.alpha_, 1e-30), flush=True)
+print("alpha rel diff = %.3e" % (abs(lcv.alpha_ - gcv.alpha_) / max(lcv.alpha_, 1e-30)), flush=True)
 print("DONE", flush=True)
 
