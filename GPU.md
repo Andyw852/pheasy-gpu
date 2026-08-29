@@ -24,8 +24,10 @@ times faster on the 3090 for the `holdout_eval` matrices. The FISTA Lipschitz
 constant is `lambda_max(G)`, computed exactly with `torch.linalg.eigvalsh`
 (matching the CPU Gram path); an earlier power-iteration version returned
 `lambda_max^2`, shrinking the step by ~lambda_max and stalling FISTA inside
-`cv_max_iter` (dense, non-sparse results). Any ~1e-4 agreement numbers that
-predate this fix should be re-checked. Set `PHEASY_GPU_LASSO=0` to force the
+`cv_max_iter` (dense, non-sparse results). Re-checked on the 3090
+(`dev/recheck_lasso.py`): GpuLassoCV coef agrees with sklearn LassoCV to ~4e-9
+(synthetic) and alpha_/coef match exactly on the c7 SM (n=8). Set
+`PHEASY_GPU_LASSO=0` to force the
 sklearn coordinate-descent path when you want bit-identical LASSO against the
 original pheasy.
 
@@ -98,9 +100,9 @@ At the full n=24 scale the CPU baseline measured ~1804 s (OLS) and ~1715 s
 (RIDGE) per fold on the shared box; the GPU SVD for 13608x3678 is ~28 s, so
 the end-to-end holdout drops from hours to minutes.
 
-> The RFE timing and the SM-load / LASSO rows predate the review fixes (the
-> R-only rank-check pass, the slice-before-multiply, the Lipschitz fix). Re-run
-> on the GPU before quoting them.
+> The RFE timing predates the R-only rank-check pass (re-run before quoting).
+> LASSO/ALASSO were re-measured after the fixes: 38/41 s GPU FISTA vs 418/306 s
+> sklearn CD on the c7 SM (n=8); see the recheck note in "Verified numerics".
 
 Verified numerics (GPU vs CPU):
 * `lstsq` vs `numpy.linalg.lstsq`: ~1e-15
@@ -108,8 +110,15 @@ Verified numerics (GPU vs CPU):
 * `GpuRidgeCV.alpha_` vs `sklearn.RidgeCV.alpha_`: exact match
 * `qr_solve` vs `numpy.linalg.lstsq`: ~5e-15
 * `GpuLassoCV.alpha_` vs `sklearn.LassoCV.alpha_`: identical; coef rel diff
-  ~1e-4 (FISTA vs coordinate descent). Predates the Lipschitz fix (above) and
-  should be re-confirmed on GPU.
+  ~4e-9 (synthetic) and 0.000e+00 (c7 SM, n=8) after the Lipschitz fix.
+
+Recheck after the Lipschitz fix (`dev/recheck_lasso.py`, RTX 3090):
+* level 1: `_power_lipschitz == lambda_max(G)` to ~1e-15 (no lambda_max^2).
+* level 2 (synthetic): alpha_ identical, nnz identical, coef rel diff 3.9e-9.
+* level 3 (c7 SM, n=8): LASSO alpha_ 7.3236e-08 identical, coef rel diff
+  0.000e+00; ALASSO alpha_ 7.3236e-10 identical, coef rel diff 0.000e+00. Both
+  backends print the same "grid MINIMUM" warning (the grid lower bound is
+  still too high at n=8), so it is a grid/data property, not a FISTA bug.
 
 ## Memory (RTX 3090, full n=45 dense SM 25515x3678)
 
@@ -151,8 +160,10 @@ diff <(grep -E "OLS|LASSO" gpu.out) <(grep -E "OLS|LASSO" cpu.out)
 ```
 
 OLS should match to ~1e-8 (identical SVD). LASSO/ALASSO match to ~1e-4
-(FISTA vs coordinate descent on the same optimum); to force the identical
-sklearn solver for a bit-exact LASSO diff, add `PHEASY_GPU_LASSO=0` to both runs.
+(FISTA vs coordinate descent on the same optimum); the post-fix recheck
+(`dev/recheck_lasso.py`) measured alpha_ identical and coef rel diff 0.000e+00
+on the c7 SM (n=8). To force the identical sklearn solver for a bit-exact
+LASSO diff, add `PHEASY_GPU_LASSO=0` to both runs.
 
 ## Limitations
 
