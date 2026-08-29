@@ -39,31 +39,40 @@ def _gpu():
     return gpu_backend
 
 
+def _gpu_footprint_ok(gb, n, m):
+    """True when the ~4x dense-solve footprint of an n x m matrix fits VRAM.
+
+    The SVD path (lstsq) peaks at ~A + U + Vh + cuSOLVER workspace ~= 4x the
+    A footprint (GPU.md measures ~3.2 GB for the 25515x3678 SM whose A alone
+    is 0.75 GB), so estimate that worst case, not just A.
+    """
+    footprint = 4 * n * m * 8
+    avail = gb.available_memory_bytes()
+    if avail is None:
+        return True
+    frac = float(os.environ.get("PHEASY_GPU_MEM_FRACTION", "0.8"))
+    return footprint <= avail * frac
+
+
 def _gpu_dense(A):
     """True when A should be solved on the GPU (dense, or sparse small enough to densify).
 
     A dense ndarray is accepted only when A plus its p x p Gram fit in
     PHEASY_GPU_MEM_FRACTION (default 0.8) of the free VRAM; this is the OOM
     fallback -- an oversized dense system degrades to the CPU instead of
-    crashing the run.
+    crashing the run. A sparse container is densified only when it is cheap
+    enough on the host (PHEASY_MAX_DENSE / host-RAM budget) AND the same VRAM
+    footprint gate passes.
     """
     gb = _gpu()
     if gb is None:
         return False
     if isinstance(A, np.ndarray):
-        n, m = A.shape
-        # The SVD path (lstsq) peaks at ~A + U + Vh + cuSOLVER workspace ~= 4x
-        # the A footprint (GPU.md measures ~3.2 GB for the 25515x3678 SM whose
-        # A alone is 0.75 GB). Estimate the worst-case dense peak, not just A.
-        footprint = 4 * n * m * 8
-        avail = gb.available_memory_bytes()
-        if avail is not None:
-            frac = float(os.environ.get("PHEASY_GPU_MEM_FRACTION", "0.8"))
-            if footprint > avail * frac:
-                return False
-        return True
+        return _gpu_footprint_ok(gb, *A.shape)
     if sp.issparse(A):
-        return _should_densify_sparse(A)
+        # _should_densify_sparse only checks the HOST budget; the densified
+        # matrix still has to fit VRAM, so run the same gate as the ndarray path.
+        return _should_densify_sparse(A) and _gpu_footprint_ok(gb, *A.shape)
     return False
 
 
@@ -1924,14 +1933,12 @@ class Optimizer(object):
             #   alphas = 10^alpha_min ... 10^alpha_max
             self._alpha = np.logspace(alpha_min, alpha_max, nalpha)
 
-        try:
-            from pheasy_gpu.core import gpu_backend as _gb
-            # None = auto: reset so a prior Optimizer(use_gpu=False) does not
-            # pin this (and all later) fits to the CPU. The mode is
-            # process-global (last-created Optimizer wins), not per-instance.
-            _gb.set_gpu_mode(None if use_gpu is None else bool(use_gpu))
-        except Exception:
-            pass
+        # Store the override on the instance. The process-global mode is only
+        # touched inside fit() (and restored afterwards), so constructing an
+        # Optimizer never clobbers a gb.set_gpu_mode(False) the caller set
+        # earlier, and "build N optimizers, then fit each" keeps each
+        # instance's own choice.
+        self._use_gpu = use_gpu
 
         self._group_size = None
         self._results = {}
@@ -1953,6 +1960,27 @@ class Optimizer(object):
         return coef
 
     def fit(self, A, F, weights=None):
+        # Apply the per-instance GPU override only for the duration of this fit,
+        # then restore the process-global mode. Constructing must NOT touch the
+        # global mode (a gb.set_gpu_mode(False) set by the caller survives an
+        # Optimizer(use_gpu=None) construction), and a batch of optimizers built
+        # first then fit one-by-one each sees its own override.
+        _gb_mod = None
+        _prev_mode = None
+        try:
+            from pheasy_gpu.core import gpu_backend as _gb_mod
+            _prev_mode = _gb_mod.get_gpu_mode()
+        except Exception:
+            pass
+        if _gb_mod is not None and self._use_gpu is not None:
+            _gb_mod.set_gpu_mode(bool(self._use_gpu))
+        try:
+            return self._fit_impl(A, F, weights)
+        finally:
+            if _gb_mod is not None:
+                _gb_mod.set_gpu_mode(_prev_mode)
+
+    def _fit_impl(self, A, F, weights=None):
         method = self._method.upper().replace("_", "-")
         if method in ("RFE-OLS-TSQR", "RFE-TSQR"):
             method = "RFE-OLS-TSQR"

@@ -42,6 +42,7 @@ __all__ = [
     "available_memory_bytes",
     "enabled",
     "set_gpu_mode",
+    "get_gpu_mode",
     "device",
     "lstsq",
     "qr_solve",
@@ -76,6 +77,11 @@ def set_gpu_mode(mode):
     _mode = mode
 
 
+def get_gpu_mode():
+    """Return the current process-global dispatch mode (None/True/False)."""
+    return _mode
+
+
 def available():
     """True when torch + a CUDA device are importable."""
     t = _torch()
@@ -88,15 +94,24 @@ def available():
 
 
 def available_memory_bytes():
-    """Free VRAM on the current device in bytes (None when unknown)."""
+    """Usable VRAM on the current device in bytes (None when unknown).
+
+    mem_get_info is driver-level (cudaMemGetInfo), which counts blocks the torch
+    caching allocator has RESERVED-but-not-allocated as "used"; those are
+    immediately reusable without a cudaMalloc, so add them back. Otherwise the
+    first big fit parks cache in memory, "free" shrinks for the rest of the run,
+    and later dense solves silently fall back to the CPU.
+    """
     t = _torch()
     if t is None:
         return None
     try:
         if not t.cuda.is_available():
             return None
-        free, _total = t.cuda.mem_get_info(device())
-        return int(free)
+        dev = device()
+        free, _total = t.cuda.mem_get_info(dev)
+        reusable = t.cuda.memory_reserved(dev) - t.cuda.memory_allocated(dev)
+        return int(free + reusable)
     except Exception:
         return None
 
@@ -334,7 +349,7 @@ def _fista_gram(Gt, bt, alpha, x0=None, max_iter=3000, tol=1e-7,
                 lipschitz=None, penalty_weights=None, n_samples=None):
     """FISTA LASSO on the precomputed Gram: min 0.5||Ax-y||^2 + alpha sum w|x|.
 
-    Mirrors optimizer._fista_lasso (Gram path) exactly, on GPU tensors.
+    Mirrors optimizer._fista_lasso (Gram path) on GPU tensors (same fixed point).
     Returns (x, n_iter) with x a GPU tensor.
 
     The adaptive-restart overshoot check needs one host scalar per iteration;
@@ -353,6 +368,15 @@ def _fista_gram(Gt, bt, alpha, x0=None, max_iter=3000, tol=1e-7,
 
     if alpha <= 0:
         coef = torch.linalg.lstsq(Gt, bt, driver="gels").solution
+        if not bool(torch.isfinite(coef).all()):
+            # CUDA gels silently returns NaN/inf on a rank-deficient Gram
+            # (pytorch#117122); fall back to the rcond-thresholded SVD like
+            # lstsq() / qr_solve().
+            U, S, Vh = torch.linalg.svd(Gt, full_matrices=False)
+            rcond = Gt.shape[0] * torch.finfo(Gt.dtype).eps
+            cutoff = rcond * S.max()
+            Sinv = torch.where(S > cutoff, 1.0 / S, torch.zeros_like(S))
+            coef = Vh.T @ (Sinv * (U.T @ bt))
         return coef, 0
 
     if lipschitz is None:
@@ -610,6 +634,7 @@ class GpuRidgeCV(object):
         U, S, Vh = torch.linalg.svd(At, full_matrices=False)
         Ut_y = U.T @ yt
         S2 = S * S
+        U2 = U * U                                # n x p, alpha-independent: hoist
         scores = []
         coefs = []
         for a in self.alphas:
@@ -617,8 +642,8 @@ class GpuRidgeCV(object):
             d = S / (S2 + a)
             w = Vh.T @ (d * Ut_y)
             ratio = S2 / (S2 + a)
-            h = (U * U) @ ratio                 # hat-matrix diagonal (leverage)
-            r = yt - At @ w
+            h = U2 @ ratio                        # hat-matrix diagonal (leverage)
+            r = yt - U @ (ratio * Ut_y)           # residual via SVD (saves At @ w)
             denom = torch.clamp(1.0 - h, min=1e-8)  # guard n~p & alpha~0 -> h~1
             score = float(((r * r) / (denom * denom)).mean().item())
             scores.append(score)

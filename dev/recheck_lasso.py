@@ -134,34 +134,44 @@ def _load(d, n_configs, rows_per_config):
     return SM, F
 
 
-def _fit(method, SM, F, gpu_lasso, rows_per_config):
+def _fit(method, SM, F, gpu_lasso, rows_per_config, decades=4.0):
     """Fit once (debias forced off); return (coef, alpha_, n_iter_, stdout, sec)."""
     from pheasy_gpu.core.optimizer import Optimizer, derive_alpha_grid
-    os.environ["PHEASY_GPU_LASSO"] = "1" if gpu_lasso else "0"
-    os.environ["PHEASY_CV_GROUP_SIZE"] = str(rows_per_config)
-    # Force debias OFF: with the default debias=1, o.results["coef"] is the
-    # relaxed-LASSO OLS refit on the support, computed by identical numpy code
-    # once both backends agree on alpha*/support -- so the coef comparison would
-    # read exactly 0 without actually testing FISTA-vs-CD coefficient agreement.
-    os.environ["PHEASY_LASSO_DEBIAS"] = "0"
-    kw = dict(nalpha=20, cv=5, tol=1e-6, max_iter=20000, alpha_auto=True,
-              decades=4.0, rand_seed=0, standardize=True)
-    if method == "LASSO":
-        kw["alpha"] = derive_alpha_grid(SM, F, nalpha=20, decades=4.0,
-                                        standardize=True)
-    t0 = time.time()
-    o = Optimizer(method, **kw)
-    buf = io.StringIO()
-    # capture, but -- unlike holdout_eval.py -- do NOT discard: the [CV] WARNING
-    # tie/flat-tail lines are the whole point of this comparison.
-    with contextlib.redirect_stdout(buf):
-        o.fit(SM, F)
-    return (np.asarray(o.results["coef"], dtype=np.float64),
-            float(o._model.alpha_), int(getattr(o._model, "n_iter_", -1)),
-            buf.getvalue(), time.time() - t0)
+    _keys = ("PHEASY_GPU_LASSO", "PHEASY_CV_GROUP_SIZE", "PHEASY_LASSO_DEBIAS")
+    _prev = {k: os.environ.get(k) for k in _keys}
+    try:
+        os.environ["PHEASY_GPU_LASSO"] = "1" if gpu_lasso else "0"
+        os.environ["PHEASY_CV_GROUP_SIZE"] = str(rows_per_config)
+        # Force debias OFF: with the default debias=1, o.results["coef"] is the
+        # relaxed-LASSO OLS refit on the support, computed by identical numpy
+        # code once both backends agree on alpha*/support -- so the coef
+        # comparison would read exactly 0 without actually testing
+        # FISTA-vs-CD coefficient agreement.
+        os.environ["PHEASY_LASSO_DEBIAS"] = "0"
+        kw = dict(nalpha=20, cv=5, tol=1e-6, max_iter=20000, alpha_auto=True,
+                  decades=decades, rand_seed=0, standardize=True)
+        if method == "LASSO":
+            kw["alpha"] = derive_alpha_grid(SM, F, nalpha=20, decades=decades,
+                                            standardize=True)
+        t0 = time.time()
+        o = Optimizer(method, **kw)
+        buf = io.StringIO()
+        # capture, but -- unlike holdout_eval.py -- do NOT discard: the [CV]
+        # WARNING tie/flat-tail lines are the whole point of this comparison.
+        with contextlib.redirect_stdout(buf):
+            o.fit(SM, F)
+        return (np.asarray(o.results["coef"], dtype=np.float64),
+                float(o._model.alpha_), int(getattr(o._model, "n_iter_", -1)),
+                buf.getvalue(), time.time() - t0)
+    finally:
+        for k in _keys:
+            if _prev[k] is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = _prev[k]
 
 
-def level_real(data_dir, n_configs, rows_per_config, methods):
+def level_real(data_dir, n_configs, rows_per_config, methods, decades=4.0):
     print("\n=== level 3: %s on %s (n_configs=%d) ==="
           % ("/".join(methods), data_dir, n_configs), flush=True)
     SM, F = _load(data_dir, n_configs, rows_per_config)
@@ -170,7 +180,7 @@ def level_real(data_dir, n_configs, rows_per_config, methods):
         print("\n-- %s --" % m, flush=True)
         rows = {}
         for label, gpu in (("gpu-fista", True), ("sklearn-cd", False)):
-            c, a, nit, out, sec = _fit(m, SM, F, gpu, rows_per_config)
+            c, a, nit, out, sec = _fit(m, SM, F, gpu, rows_per_config, decades)
             ties = [ln for ln in out.splitlines() if "alphas tie" in ln]
             atmin = [ln for ln in out.splitlines() if "grid MINIMUM" in ln]
             rows[label] = (c, a, nit, ties, atmin)
@@ -208,6 +218,8 @@ def main():
     ap.add_argument("--rows-per-config", type=int, default=567)
     ap.add_argument("--methods", default="LASSO ALASSO",
                     help="space-separated, same convention as holdout_eval.py")
+    ap.add_argument("--decades", type=float, default=4.0,
+                    help="alpha-grid width in decades for level 3 (default 4.0)")
     args = ap.parse_args()
 
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -222,7 +234,7 @@ def main():
     if args.level in ("real", "all"):
         if args.data_dir:
             level_real(args.data_dir, args.n_configs, args.rows_per_config,
-                       args.methods.split())
+                       args.methods.split(), args.decades)
         elif args.level == "real":
             ap.error("--level real needs --data-dir")
         else:
