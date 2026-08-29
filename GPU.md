@@ -26,7 +26,8 @@ constant is `lambda_max(G)`, computed exactly with `torch.linalg.eigvalsh`
 `lambda_max^2`, shrinking the step by ~lambda_max and stalling FISTA inside
 `cv_max_iter` (dense, non-sparse results). Re-checked on the 3090
 (`dev/recheck_lasso.py`): GpuLassoCV coef agrees with sklearn LassoCV to ~4e-9
-(synthetic) and alpha_/coef match exactly on the c7 SM (n=8). Set
+(synthetic); on the c7 SM (n=8) alpha_/support are identical and the raw FISTA
+coef (debias off) agrees to ~3.5e-4 / 5.9e-6. Set
 `PHEASY_GPU_LASSO=0` to force the
 sklearn coordinate-descent path when you want bit-identical LASSO against the
 original pheasy.
@@ -110,15 +111,21 @@ Verified numerics (GPU vs CPU):
 * `GpuRidgeCV.alpha_` vs `sklearn.RidgeCV.alpha_`: exact match
 * `qr_solve` vs `numpy.linalg.lstsq`: ~5e-15
 * `GpuLassoCV.alpha_` vs `sklearn.LassoCV.alpha_`: identical; coef rel diff
-  ~4e-9 (synthetic) and 0.000e+00 (c7 SM, n=8) after the Lipschitz fix.
+  ~4e-9 (synthetic), ~3.5e-4 / 5.9e-6 (c7 SM, n=8, debias off) after the fix.
 
 Recheck after the Lipschitz fix (`dev/recheck_lasso.py`, RTX 3090):
 * level 1: `_power_lipschitz == lambda_max(G)` to ~1e-15 (no lambda_max^2).
 * level 2 (synthetic): alpha_ identical, nnz identical, coef rel diff 3.9e-9.
-* level 3 (c7 SM, n=8): LASSO alpha_ 7.3236e-08 identical, coef rel diff
-  0.000e+00; ALASSO alpha_ 7.3236e-10 identical, coef rel diff 0.000e+00. Both
-  backends print the same "grid MINIMUM" warning (the grid lower bound is
-  still too high at n=8), so it is a grid/data property, not a FISTA bug.
+* level 3 (c7 SM, n=8): alpha_ and support identical for LASSO (7.3236e-08,
+  nnz 3398) and ALASSO (7.3236e-10, nnz 3102). Raw FISTA-vs-CD coefficients
+  (debias OFF): LASSO coef rel diff 3.5e-4, ALASSO 5.9e-6. With debias ON
+  (the default) the delivered relaxed-LASSO coefficients are bit-identical
+  because both backends run the same numpy OLS refit on the same support.
+* level 3 (c7 SM, n=8): both backends print the same "grid MINIMUM" warning at
+  `decades=4.0` (the holdout_eval default): alpha_ sits at the grid lower bound
+  and the CV curve is still falling, so nnz is near-dense (~92%). This is a
+  grid/data property of the holdout config, not a FISTA bug; `run_pheasy` can
+  widen the grid via `PHEASY_ALPHA_DECADES`.
 
 ## Memory (RTX 3090, full n=45 dense SM 25515x3678)
 
@@ -161,9 +168,9 @@ diff <(grep -E "OLS|LASSO" gpu.out) <(grep -E "OLS|LASSO" cpu.out)
 
 OLS should match to ~1e-8 (identical SVD). LASSO/ALASSO match to ~1e-4
 (FISTA vs coordinate descent on the same optimum); the post-fix recheck
-(`dev/recheck_lasso.py`) measured alpha_ identical and coef rel diff 0.000e+00
-on the c7 SM (n=8). To force the identical sklearn solver for a bit-exact
-LASSO diff, add `PHEASY_GPU_LASSO=0` to both runs.
+(`dev/recheck_lasso.py`) measured alpha_/support identical and raw coef (debias
+off) rel diff 3.5e-4 / 5.9e-6 on the c7 SM (n=8). To force the identical
+sklearn solver for a bit-exact LASSO diff, add `PHEASY_GPU_LASSO=0` to both runs.
 
 ## Limitations
 
