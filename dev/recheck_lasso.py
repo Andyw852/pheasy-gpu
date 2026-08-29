@@ -135,10 +135,15 @@ def _load(d, n_configs, rows_per_config):
 
 
 def _fit(method, SM, F, gpu_lasso, rows_per_config):
-    """Fit once; return (coef, alpha_, n_iter_, captured stdout, seconds)."""
+    """Fit once (debias forced off); return (coef, alpha_, n_iter_, stdout, sec)."""
     from pheasy_gpu.core.optimizer import Optimizer, derive_alpha_grid
     os.environ["PHEASY_GPU_LASSO"] = "1" if gpu_lasso else "0"
     os.environ["PHEASY_CV_GROUP_SIZE"] = str(rows_per_config)
+    # Force debias OFF: with the default debias=1, o.results["coef"] is the
+    # relaxed-LASSO OLS refit on the support, computed by identical numpy code
+    # once both backends agree on alpha*/support -- so the coef comparison would
+    # read exactly 0 without actually testing FISTA-vs-CD coefficient agreement.
+    os.environ["PHEASY_LASSO_DEBIAS"] = "0"
     kw = dict(nalpha=20, cv=5, tol=1e-6, max_iter=20000, alpha_auto=True,
               decades=4.0, rand_seed=0, standardize=True)
     if method == "LASSO":
@@ -179,7 +184,8 @@ def level_real(data_dir, n_configs, rows_per_config, methods):
         adiff = abs(ag - asl) / max(asl, 1e-30)
         cdiff = float(np.linalg.norm(cg - cs) / max(float(np.linalg.norm(cs)), 1e-30))
         _ok(adiff < 1e-12, "%s: same alpha*" % m, "rel diff %.2e" % adiff)
-        _ok(cdiff < 1e-3, "%s: coef agreement" % m, "rel diff %.3e" % cdiff)
+        _ok(cdiff < 1e-3, "%s: coef agreement (debias off)" % m,
+            "rel diff %.3e" % cdiff)
         # Not a hard failure: a genuinely flat tail can survive the fix. But if
         # the GPU side ties and the sklearn side does not, FISTA is still short.
         if tg and not ts:
