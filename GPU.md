@@ -166,11 +166,12 @@ PHEASY_USE_GPU=0 python holdout_eval.py <data_dir> --methods OLS LASSO --n-confi
 diff <(grep -E "OLS|LASSO" gpu.out) <(grep -E "OLS|LASSO" cpu.out)
 ```
 
-OLS should match to ~1e-8 (identical SVD). LASSO/ALASSO match to ~1e-4
-(FISTA vs coordinate descent on the same optimum); the post-fix recheck
-(`dev/recheck_lasso.py`) measured alpha_/support identical and raw coef (debias
-off) rel diff 3.5e-4 / 5.9e-6 on the c7 SM (n=8). To force the identical
-sklearn solver for a bit-exact LASSO diff, add `PHEASY_GPU_LASSO=0` to both runs.
+OLS should match to ~1e-8 (identical SVD). LASSO/ALASSO match to ~1e-6 to ~1e-4
+(FISTA vs coordinate descent on the same optimum, depending on conditioning);
+the post-fix recheck (`dev/recheck_lasso.py`) measured alpha_/support identical
+and raw coef (debias off) rel diff 3.5e-4 / 5.9e-6 on the c7 SM (n=8). To force
+the identical sklearn solver for a bit-exact LASSO diff, add `PHEASY_GPU_LASSO=0`
+to both runs.
 
 ## Limitations
 

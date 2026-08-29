@@ -1967,9 +1967,11 @@ class Optimizer(object):
         # first then fit one-by-one each sees its own override.
         _gb_mod = None
         _prev_mode = None
+        _have_prev = False
         try:
             from pheasy_gpu.core import gpu_backend as _gb_mod
             _prev_mode = _gb_mod.get_gpu_mode()
+            _have_prev = True
         except Exception:
             pass
         if _gb_mod is not None and self._use_gpu is not None:
@@ -1977,7 +1979,7 @@ class Optimizer(object):
         try:
             return self._fit_impl(A, F, weights)
         finally:
-            if _gb_mod is not None:
+            if _gb_mod is not None and _have_prev:
                 _gb_mod.set_gpu_mode(_prev_mode)
 
     def _fit_impl(self, A, F, weights=None):
