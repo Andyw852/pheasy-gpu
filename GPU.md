@@ -128,14 +128,19 @@ Recheck after the Lipschitz fix (`dev/recheck_lasso.py`, RTX 3090):
   grid/data property of the holdout config, not a FISTA bug; `run_pheasy` can
   widen the grid via `PHEASY_ALPHA_DECADES`.
 * Fixed-alpha scan (`dev/alpha_scan.py`, no CV, tol=1e-8 CD / 1e-7 FISTA):
-  LASSO coef rel diff vs nnz on the c7 SM degrades monotonically with
+  LASSO |FISTA-CD|/|CD| vs nnz on the c7 SM degrades monotonically with
   conditioning -- 1.8e-10 (1.5% nnz) -> 8e-9 (12%) -> 1.2e-7 (57%) -> 4.5e-7
-  (90%) -> 1.25e-6 (98.5%); the sklearn CD converged at every point (max
-  n_iter=1438, no ConvergenceWarning). So the level-3 LASSO 3.5e-4 is NOT a
-  conditioning floor: at the same ~90%-dense point the two solvers agree to
-  4.5e-7 with tight tol, and the 3.5e-4 comes from the recheck's tol=1e-6
-  stopping early in the near-OLS regime. GPU FISTA tracks sklearn CD to ~1.3e-6
-  across the whole density range when tol is tight.
+  (90%) -> 1.25e-6 (98.5%). Neither solver hit its iteration cap: sklearn CD
+  n_iter <=1438 (no ConvergenceWarning) and FISTA n_iter <=600 (final-refit cap
+  5000), so the curve is a genuine solver difference, not a cap artifact. A
+  tol=1e-12 CD reference puts both solvers within ~1e-6 of truth with no
+  consistent winner: err_fista/err_cd = 9.1e-8 / 2.8e-8 (57%), 3.4e-7 / 4.7e-7
+  (90%), 2.5e-7 / 1.1e-6 (98.5%) -- at the densest point CD, not FISTA, is the
+  one further off, so the |F-C| gap is the vector difference of two comparable
+  stopping-criterion errors, not a one-sided FISTA error. The level-3 LASSO
+  3.5e-4 is
+  therefore the recheck's tol=1e-6 stopping early in the near-OLS regime, not a
+  conditioning floor.
 
 ## Memory (RTX 3090, full n=45 dense SM 25515x3678)
 
@@ -176,14 +181,15 @@ PHEASY_USE_GPU=0 python holdout_eval.py <data_dir> --methods OLS LASSO --n-confi
 diff <(grep -E "OLS|LASSO" gpu.out) <(grep -E "OLS|LASSO" cpu.out)
 ```
 
-OLS should match to ~1e-8 (identical SVD). LASSO/ALASSO match to ~1e-8 in the
-sparse regime, degrading to ~1e-6 as nnz -> 100% (FISTA vs coordinate descent on
-the same optimum, conditioning-dependent): the fixed-alpha scan
-(`dev/alpha_scan.py`, tol=1e-8) measured LASSO coef rel diff 1.8e-10 -> 1.25e-6
-as nnz ran 1.5% -> 98.5% on the c7 SM. The recheck's raw (debias-off) LASSO
-3.5e-4 at ~92% nnz is a tol=1e-6 artifact, not a conditioning floor. To force
-the identical sklearn solver for a bit-exact LASSO diff, add `PHEASY_GPU_LASSO=0`
-to both runs.
+OLS should match to ~1e-8 (identical SVD). LASSO/ALASSO match to ~1e-9..1e-7 in
+the sparse regime (nnz < 60%), degrading to ~1e-6 as nnz -> 100%. That is the
+joint relaxation of the two solvers' stopping criteria in the near-OLS regime,
+not a GPU-specific limit: the CPU `_LassoCVIterative` shares the same tol/iter
+caps as `GpuLassoCV`. The fixed-alpha scan (`dev/alpha_scan.py`) measured
+LASSO |FISTA-CD|/|CD| 1.8e-10 -> 1.25e-6 as nnz ran 1.5% -> 98.5% on the c7 SM.
+The recheck's raw (debias-off) LASSO 3.5e-4 at ~92% nnz is a tol=1e-6 artifact,
+not a conditioning floor. To force the identical sklearn solver for a bit-exact
+LASSO diff, add `PHEASY_GPU_LASSO=0` to both runs.
 
 ## Limitations
 
