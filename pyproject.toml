@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pheasy-gpu"
+version = "0.0.2"
+description = "GPU-accelerated force-constant extraction from finite displacements via compressive sensing (PyTorch/CUDA backend for pheasy)"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy>=1.22",
+    "scipy>=1.8",
+    "scikit-learn>=1.1",
+    "spglib>=2.0",
+    "phonopy>=2.17",
+    "ase>=3.22",
+    "h5py>=3.6",
+    "joblib>=1.2",
+    "f90nml>=1.4",
+]
+
+[project.optional-dependencies]
+fast = ["celer>=0.7"]
+gpu = ["torch>=2.0"]
+
+[project.scripts]
+pheasy-gpu = "pheasy_gpu.run_pheasy:main"
+
+# Flat layout: the repository root IS the package (it holds __init__.py
+# directly), so packages.find with include=["pheasy_gpu*"] matches nothing and
+# installs an empty distribution. Map the package names explicitly.
+[tool.setuptools]
+packages = ["pheasy_gpu", "pheasy_gpu.core", "pheasy_gpu.interface", "pheasy_gpu.structure"]
+
+[tool.setuptools.package-dir]
+"pheasy_gpu" = "."
+"pheasy_gpu.core" = "core"
+"pheasy_gpu.interface" = "interface"
+"pheasy_gpu.structure" = "structure"

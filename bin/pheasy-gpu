@@ -1,0 +1,8 @@
+#!/usr/bin/env python3
+"""Console entry point (also installed as the ``pheasy-gpu`` command)."""
+import sys
+
+from pheasy_gpu.run_pheasy import main
+
+if __name__ == "__main__":
+    sys.exit(main())

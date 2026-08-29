@@ -1,0 +1,27 @@
+*.bak*
+__pycache__/
+*.egg-info/
+
+# download staging / scan result cache (regenerated, not committed)
+.staging/
+.scan_results/
+
+# 拟合脚本在测试材料目录里运行时生成的中间缓存（不入库）
+test/*/.pheasy_stamp*
+test/*/dim_detected.txt
+test/*/sm_prime.npz
+test/*/ns_*.npz
+test/*/cs.pkl
+test/*/neighbor_list.pkl
+test/*/fm1d.npz
+test/*/sm_dense.npy*
+test/*/fc2.hdf5
+test/*/fc3.hdf5
+test/*/fc4.hdf5
+test/*/FORCE_CONSTANTS
+test/*/FORCE_CONSTANTS_3RD
+test/*/FORCE_CONSTANTS_4TH
+test/*/phi.npz
+
+# local-only agent notes with real GPU-box identifiers (never commit)
+AGENTS.local.md
