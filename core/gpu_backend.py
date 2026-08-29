@@ -213,9 +213,9 @@ def qr_solve(A, y):
 
     Matches _solve_qr semantics: QR for full-rank tall systems, SVD (min-norm)
     when the system is underdetermined or rank deficient. CUDA gels SILENTLY
-    returns NaN/inf for rank-deficient inputs (pytorch#117122), so instead of
-    trusting driver="gels" we factorize R ourselves and check its diagonal with
-    the same threshold _solve_qr uses before doing the triangular solve.
+    returns NaN/inf for rank-deficient inputs (pytorch#117122), so we first
+    factorize R only (mode="r", no Q materialization), check its diagonal with
+    the same threshold _solve_qr uses, then run the fast gels solve.
     """
     import torch
     A = np.asarray(A, dtype=np.float64)
@@ -226,7 +226,10 @@ def qr_solve(A, y):
     if m < n:
         return lstsq(A, y)          # underdetermined -> min-norm SVD
     try:
-        Q, R = torch.linalg.qr(At, mode="reduced")
+        _R = torch.linalg.qr(At, mode="r")
+        # mode="r" returns only R, but the container differs across torch
+        # versions (named tuple with .R, or a plain (R,) tuple).
+        R = _R.R if hasattr(_R, "R") else (_R[-1] if isinstance(_R, tuple) else _R)
         diag = R.diagonal().abs()
         if diag.numel() == 0:
             return lstsq(A, y)
@@ -236,8 +239,7 @@ def qr_solve(A, y):
         tol = torch.finfo(torch.float64).eps * max(m, n) * dmax
         if float(diag.min().item()) <= tol:
             return lstsq(A, y)      # rank deficient -> SVD
-        rhs = (Q.T @ yt).reshape(-1, 1)
-        coef = torch.linalg.solve_triangular(R, rhs, upper=True).reshape(-1)
+        coef = torch.linalg.lstsq(At, yt, driver="gels").solution
     except Exception:
         return lstsq(A, y)
     if not bool(torch.isfinite(coef).all()):
@@ -308,6 +310,11 @@ def _power_lipschitz(Gt, power_iters=15):
     ||G v||^2 = lambda_max^2, shrinking the step by ~lambda_max and stalling
     FISTA inside cv_max_iter. The power_iters argument is kept for signature
     compatibility and ignored.
+
+    Note: eigvalsh is a full O(p^3) decomposition, called once per CV fold
+    (n_splits + 1 times per fit); p=3678 is acceptable. If this ever becomes
+    the bottleneck, fall back to a power iteration whose final line is the
+    Rayleigh quotient v . (G v) -- not ||G v||^2 -- with a small safety factor.
     """
     import torch
     if Gt.shape[0] == 0:
@@ -676,14 +683,17 @@ def load_sensing_matrix(sm_prime, ns_harm, ns_anharm, n_rows, dtype=np.float64):
     crow = torch.as_tensor(sm.indptr, dtype=torch.int32, device=device())
     ccol = torch.as_tensor(sm.indices, dtype=torch.int32, device=device())
     cval = torch.as_tensor(sm.data, dtype=torch.float64, device=device())
+    spt = None
     try:
         spt = torch.sparse_csr_tensor(crow, ccol, cval, size=sm.shape,
                                       dtype=torch.float64, device=device())
         SM = torch.sparse.mm(spt, NSt)
     except Exception:
         # Release the failed CSR tensors before the COO retry so a CSR OOM does
-        # not compound with a second (larger) COO allocation.
+        # not compound with a second (larger) COO allocation. del only drops the
+        # refcount; empty_cache() returns the block to the driver.
         del spt, crow, ccol, cval
+        torch.cuda.empty_cache()
         smc = sm.tocoo()
         idx = torch.as_tensor(np.vstack([smc.row, smc.col]), dtype=torch.long,
                               device=device())

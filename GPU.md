@@ -14,7 +14,7 @@ separate package named `pheasy_gpu` so both can be installed side by side.
 | RIDGE | `sklearn.RidgeCV` (generalized CV) | SVD hat-matrix GCV (identical alpha) |
 | LASSO | `sklearn.LassoCV` (coordinate descent) | Gram-based FISTA (GPU by default) |
 | ALASSO | ridge pilot + `LassoCV` on scaled cols | ridge pilot + FISTA with per-column weights |
-| RFE | `scipy.linalg.lstsq` per subset | QR (`gels`) per subset, SVD fallback |
+| RFE | `scipy.linalg.lstsq` per subset | rank-checked QR + `gels` per subset, SVD fallback |
 | SM loading | `sm_prime @ NS` (sparse) on CPU | `torch.sparse.mm` on GPU (**holdout_eval only**) |
 
 **LASSO/ALASSO default to the GPU Gram-based FISTA.** FISTA solves the exact
@@ -31,16 +31,17 @@ original pheasy.
 
 **RFE uses QR for the per-subset solves**, not the SVD. QR is
 backward-stable for the full-rank subsets and ~50x faster on the 3090 than the
-FP64 SVD. `qr_solve` now factorizes R itself and checks its diagonal (the same
-threshold as `_solve_qr`), falling back to the SVD for rank-deficient or wide
-subsets; CUDA `gels` silently returns NaN/inf on rank-deficient inputs, so the
-earlier try/except fallback never fired. Verified `qr_solve` vs
+FP64 SVD. `qr_solve` factorizes R only (`mode="r"`, no Q materialization),
+checks its diagonal (the same threshold as `_solve_qr`), falls back to the SVD
+for rank-deficient or wide subsets, then runs the fast cuSOLVER `gels` solve;
+CUDA `gels` silently returns NaN/inf on rank-deficient inputs, so the earlier
+try/except fallback never fired. Verified `qr_solve` vs
 `numpy.linalg.lstsq` to ~5e-15 (full rank).
 
 **`RFE-OLS-TSQR` (alias `RFE-TSQR`) is also GPU-accelerated.** Its dense
 subset solves go through the same `qr_solve` path as RFE (the Q-less tall-skinny
-blocked QR is a memory optimisation for CPU tall matrices; on the GPU the
-equivalent cuSOLVER `gels` is used). Its BIC/AIC stopping rule is opt-in via
+blocked QR is a memory optimisation for CPU tall matrices; on the GPU the same
+rank-checked QR + `gels` path is used). Its BIC/AIC stopping rule is opt-in via
 `PHEASY_TSQR_CRITERION=bic`; the default is `cv`, which makes it select the same
 support as RFE. Verified on n=8: ~72 s, nnz=2092.
 
@@ -91,11 +92,15 @@ PHEASY_USE_GPU=0 python holdout_eval.py <data_dir> ...
 | RIDGE (50-alpha GCV) | ~1700 s (n=24) | ~16 s |
 | LASSO (20-alpha grouped CV) | ~939 s | ~40 s |
 | ALASSO (20-alpha weighted CV) | ~940 s | ~35 s |
-| RFE (step 0.05, 3-fold) | SVD per subset (hours) | ~99 s (QR) |
+| RFE (step 0.05, 3-fold) | SVD per subset (hours) | ~99 s (QR; pre-rank-check) |
 
 At the full n=24 scale the CPU baseline measured ~1804 s (OLS) and ~1715 s
 (RIDGE) per fold on the shared box; the GPU SVD for 13608x3678 is ~28 s, so
 the end-to-end holdout drops from hours to minutes.
+
+> The RFE timing and the SM-load / LASSO rows predate the review fixes (the
+> R-only rank-check pass, the slice-before-multiply, the Lipschitz fix). Re-run
+> on the GPU before quoting them.
 
 Verified numerics (GPU vs CPU):
 * `lstsq` vs `numpy.linalg.lstsq`: ~1e-15
@@ -115,7 +120,7 @@ Peak GPU memory by operation:
 | SM load (`sm_prime @ NS`, CSR sparse.mm) | ~2.3 GB |
 | dense SM tensor (float64) | 0.75 GB |
 | OLS / RIDGE SVD (`U`, `S`, `Vh` + workspace) | ~3.2 GB |
-| RFE / TSQR QR (`gels` + workspace) | ~2.4 GB |
+| RFE / TSQR QR (rank-check + `gels` + workspace) | ~2.4 GB (re-measure) |
 | LASSO / ALASSO FISTA (per-fold Gram + A_va copies) | ~0.5-1.5 GB (see note) |
 
 The 24 GB 3090 is therefore far from memory-bound at n=45 (peak ~3.2 GB); the

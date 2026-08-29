@@ -52,7 +52,10 @@ def _gpu_dense(A):
         return False
     if isinstance(A, np.ndarray):
         n, m = A.shape
-        footprint = n * m * 8 + m * m * 8     # A + Gram (lower bound on peak)
+        # The SVD path (lstsq) peaks at ~A + U + Vh + cuSOLVER workspace ~= 4x
+        # the A footprint (GPU.md measures ~3.2 GB for the 25515x3678 SM whose
+        # A alone is 0.75 GB). Estimate the worst-case dense peak, not just A.
+        footprint = 4 * n * m * 8
         avail = gb.available_memory_bytes()
         if avail is not None:
             frac = float(os.environ.get("PHEASY_GPU_MEM_FRACTION", "0.8"))
