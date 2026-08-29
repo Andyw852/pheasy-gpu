@@ -15,20 +15,27 @@ separate package named `pheasy_gpu` so both can be installed side by side.
 | LASSO | `sklearn.LassoCV` (coordinate descent) | Gram-based FISTA (GPU by default) |
 | ALASSO | ridge pilot + `LassoCV` on scaled cols | ridge pilot + FISTA with per-column weights |
 | RFE | `scipy.linalg.lstsq` per subset | QR (`gels`) per subset, SVD fallback |
-| SM loading | `sm_prime @ NS` (sparse) on CPU | `torch.sparse.mm` on GPU |
+| SM loading | `sm_prime @ NS` (sparse) on CPU | `torch.sparse.mm` on GPU (**holdout_eval only**) |
 
 **LASSO/ALASSO default to the GPU Gram-based FISTA.** FISTA solves the exact
 same convex problem as sklearn's coordinate descent and, once the per-iteration
 host sync is amortised (`PHEASY_FISTA_RESTART_EVERY`, default 5), is several
-times faster on the 3090 for the `holdout_eval` matrices. It agrees with
-sklearn to ~1e-4 (same optimum, different algorithm). Set `PHEASY_GPU_LASSO=0`
-to force the sklearn coordinate-descent path when you want bit-identical LASSO
-against the original pheasy.
+times faster on the 3090 for the `holdout_eval` matrices. The FISTA Lipschitz
+constant is `lambda_max(G)`, computed exactly with `torch.linalg.eigvalsh`
+(matching the CPU Gram path); an earlier power-iteration version returned
+`lambda_max^2`, shrinking the step by ~lambda_max and stalling FISTA inside
+`cv_max_iter` (dense, non-sparse results). Any ~1e-4 agreement numbers that
+predate this fix should be re-checked. Set `PHEASY_GPU_LASSO=0` to force the
+sklearn coordinate-descent path when you want bit-identical LASSO against the
+original pheasy.
 
-**RFE uses QR (`gels`) for the per-subset solves**, not the SVD. QR is
+**RFE uses QR for the per-subset solves**, not the SVD. QR is
 backward-stable for the full-rank subsets and ~50x faster on the 3090 than the
-FP64 SVD; `qr_solve` falls back to the SVD for rank-deficient subsets. Verified
-`qr_solve` vs `numpy.linalg.lstsq` to ~5e-15.
+FP64 SVD. `qr_solve` now factorizes R itself and checks its diagonal (the same
+threshold as `_solve_qr`), falling back to the SVD for rank-deficient or wide
+subsets; CUDA `gels` silently returns NaN/inf on rank-deficient inputs, so the
+earlier try/except fallback never fired. Verified `qr_solve` vs
+`numpy.linalg.lstsq` to ~5e-15 (full rank).
 
 **`RFE-OLS-TSQR` (alias `RFE-TSQR`) is also GPU-accelerated.** Its dense
 subset solves go through the same `qr_solve` path as RFE (the Q-less tall-skinny
@@ -41,7 +48,8 @@ support as RFE. Verified on n=8: ~72 s, nnz=2092.
 
 Activation (in priority order):
 
-1. `Optimizer(..., use_gpu=True/False)` -- explicit per-fit override.
+1. `Optimizer(..., use_gpu=True/False)` -- explicit process-wide override
+   (last-created Optimizer wins; there is no per-instance isolation).
 2. `PHEASY_USE_GPU` env var: `0`/`off` forces CPU, `1`/`on` forces GPU,
    unset -> auto (GPU when `torch.cuda.is_available()`).
 
@@ -59,18 +67,18 @@ PHEASY_USE_GPU=0 python holdout_eval.py <data_dir> ...
 
 ## Tuning knobs
 
-* `PHEASY_GPU_DEVICE` -- CUDA device index (default `0` / first visible device).
-* `PHEASY_GPU_DTYPE` -- `float64` (default, matches the CPU path) or `float32`
-  (faster; the sensing matrix is stored float32 anyway, but float64 matches the
-  CPU reference numerics).
-* `PHEASY_FISTA_LIPSCHITZ_SAFETY` -- power-iteration safety factor for the FISTA
-  step (default 1.02, same as the CPU path).
+* `PHEASY_GPU_DEVICE` -- CUDA device index (default `0` / first visible
+  device); read fresh on every call (no caching).
+* `PHEASY_GPU_MEM_FRACTION` -- fraction of free VRAM a dense solve may occupy
+  before it falls back to the CPU (default 0.8).
 * `PHEASY_FISTA_RESTART_EVERY` -- how often (iterations) the FISTA adaptive-
   restart overshoot check syncs to the host (default 5). Higher = fewer syncs,
   marginally less-frequent restarts; the fixed point is unchanged.
 * `PHEASY_GPU_LASSO` -- `0` routes LASSO/ALASSO to the sklearn coordinate-
   descent path (bit-identical to original pheasy); unset/`1` uses the GPU FISTA
   (default).
+* `PHEASY_LASSO_1SE` -- `1` applies the one-standard-error rule to LASSO
+  alpha selection on all backends (dense, iterative, and GPU).
 
 ## Measured performance (RTX 3090, c7 sensing matrix 25515x6588)
 
@@ -94,7 +102,9 @@ Verified numerics (GPU vs CPU):
 * `ridge_solve` vs `sklearn.Ridge`: ~1e-15
 * `GpuRidgeCV.alpha_` vs `sklearn.RidgeCV.alpha_`: exact match
 * `qr_solve` vs `numpy.linalg.lstsq`: ~5e-15
-* `GpuLassoCV.alpha_` vs `sklearn.LassoCV.alpha_`: identical; coef rel diff ~3e-5
+* `GpuLassoCV.alpha_` vs `sklearn.LassoCV.alpha_`: identical; coef rel diff
+  ~1e-4 (FISTA vs coordinate descent). Predates the Lipschitz fix (above) and
+  should be re-confirmed on GPU.
 
 ## Memory (RTX 3090, full n=45 dense SM 25515x3678)
 
@@ -106,16 +116,20 @@ Peak GPU memory by operation:
 | dense SM tensor (float64) | 0.75 GB |
 | OLS / RIDGE SVD (`U`, `S`, `Vh` + workspace) | ~3.2 GB |
 | RFE / TSQR QR (`gels` + workspace) | ~2.4 GB |
-| LASSO / ALASSO FISTA (Gram `p x p` + SM) | ~0.87 GB |
+| LASSO / ALASSO FISTA (per-fold Gram + A_va copies) | ~0.5-1.5 GB (see note) |
 
 The 24 GB 3090 is therefore far from memory-bound at n=45 (peak ~3.2 GB); the
 binding constraint is FP64 compute (the SVD), not memory. Memory notes:
 
-* **LASSO/ALASSO are naturally memory-friendly**: FISTA works on the Gram
-  (`p x p` = 108 MB), independent of the number of rows `n`.
-* **Loading uses CSR** (not COO): ~5x faster and ~half the sparse-tensor memory.
-* **`PHEASY_GPU_DTYPE=float32`** halves everything (SM 0.38 GB, peak ~1.6 GB)
-  at the cost of ~1e-7 float32 rounding vs the float64 CPU reference.
+* **LASSO/ALASSO work on the Gram (`p x p` = 108 MB at p=3678), but
+  `GpuLassoCV` holds one Gram per CV fold plus one `A_va` copy per fold** --
+  5-fold p=3678 is ~540 MB of Grams alone, so a single-Gram figure understates
+  the CV peak.
+* **Loading uses CSR** (not COO): ~5x faster and ~half the sparse-tensor memory,
+  and it slices `sm_prime[:n_rows]` before multiplying.
+* **The backend is uniformly float64.** A `PHEASY_GPU_DTYPE=float32` mode was
+  removed because it only affected a few entry points and silently mixed
+  precisions.
 * The dense SM (`n x p`) materialisation is inherent to the dense path; the
   `TwoLevelSM` LinearOperator path (still CPU) avoids it for very large systems.
 
@@ -139,8 +153,12 @@ sklearn solver for a bit-exact LASSO diff, add `PHEASY_GPU_LASSO=0` to both runs
 
 * The two-level `TwoLevelSM` LinearOperator path (used by `run_pheasy` for very
   large systems that never materialize the dense sensing matrix) still runs its
-  LSMR/FISTA matvecs on the CPU; the GPU backend targets the dense path (which
-  is what `holdout_eval` and small-to-medium `run_pheasy` systems use).
+  LSMR/FISTA matvecs on the CPU.
+* **GPU SM loading is wired into `holdout_eval.py` only.** The `pheasy-gpu`
+  CLI (`run_pheasy.py`) still assembles `SM_prime @ NS` with scipy on the CPU;
+  the "SM load 1421s -> 28s" row above applies to `holdout_eval`, not to the
+  CLI. The CLI *does* get GPU-accelerated fitting (OLS/LASSO/ALASSO/RIDGE/RFE
+  solves) once SM is assembled.
 * `torch.linalg.lstsq` on CUDA only exposes `driver="gels"`, so `lstsq()` here
   reimplements the SVD (gelsd) solve with `torch.linalg.svd` -- numerically
   equivalent to scipy, at a small constant-factor cost.

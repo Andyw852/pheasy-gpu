@@ -8,16 +8,16 @@ the GPU.
 
 Activation (in priority order):
 
-1. Optimizer(..., use_gpu=True/False) -- explicit per-fit override.
+1. Optimizer(..., use_gpu=True/False) -- explicit process-wide override
+   (the last-created Optimizer wins; there is no per-instance isolation).
 2. PHEASY_USE_GPU env var: "0"/"false"/"off" forces CPU, "1"/"true"/"on"
    forces GPU, unset -> auto (GPU if available).
 3. Auto mode uses the GPU when torch.cuda.is_available() is true.
 
 Tuning knobs:
 
-* PHEASY_GPU_DEVICE -- CUDA device index (default 0 / first visible device).
-* PHEASY_GPU_DTYPE -- float64 (default, matches the CPU path) or float32
-  (faster, ~half precision).
+* PHEASY_GPU_DEVICE -- CUDA device index (default 0 / first visible device);
+  read fresh on every device() call (no caching).
 
 Design notes
 ------------
@@ -39,6 +39,7 @@ import numpy as np
 
 __all__ = [
     "available",
+    "available_memory_bytes",
     "enabled",
     "set_gpu_mode",
     "device",
@@ -55,7 +56,6 @@ __all__ = [
 
 _torch_mod = None
 _mode = None          # None = auto, True = force on, False = force off
-_device = None        # cached torch.device
 
 
 def _torch():
@@ -87,6 +87,20 @@ def available():
         return False
 
 
+def available_memory_bytes():
+    """Free VRAM on the current device in bytes (None when unknown)."""
+    t = _torch()
+    if t is None:
+        return None
+    try:
+        if not t.cuda.is_available():
+            return None
+        free, _total = t.cuda.mem_get_info(device())
+        return int(free)
+    except Exception:
+        return None
+
+
 def _env_wants():
     v = os.environ.get("PHEASY_USE_GPU", None)
     if v is None:
@@ -106,26 +120,32 @@ def enabled():
 
 
 def device():
-    global _device
-    if _device is None:
-        import torch
-        dev = os.environ.get("PHEASY_GPU_DEVICE", None)
-        if dev is not None:
-            _device = torch.device("cuda:%d" % int(dev))
-        else:
-            _device = torch.device("cuda:0")
-    return _device
+    """CUDA device, read fresh from PHEASY_GPU_DEVICE each call (no caching)."""
+    import torch
+    dev = os.environ.get("PHEASY_GPU_DEVICE", None)
+    if dev is not None:
+        return torch.device("cuda:%d" % int(dev))
+    return torch.device("cuda:0")
 
 
 def _dtype():
+    """Torch dtype used by the backend -- always float64.
+
+    A float32 mode (PHEASY_GPU_DTYPE=float32) was removed: it only affected a
+    few entry points (gram / predict / top_eigval) while the dense solvers and
+    CV classes stayed float64, silently mixing precisions and breaking the
+    ~1e-7 agreement with the CPU reference. The backend is uniformly float64.
+    """
     import torch
-    return torch.float64 if os.environ.get("PHEASY_GPU_DTYPE", "float64") == "float64" else torch.float32
+    return torch.float64
 
 
 def _to_torch(A, dtype=None):
     import torch
     if dtype is None:
         dtype = _dtype()
+    if hasattr(A, "toarray"):        # scipy sparse -> dense
+        A = A.toarray()
     arr = np.ascontiguousarray(A)
     if arr.dtype.kind not in "fc":
         arr = arr.astype(np.float64)
@@ -189,21 +209,40 @@ def lstsq(A, y):
 
 
 def qr_solve(A, y):
-    """QR least squares via torch driver="gels" with an SVD fallback.
+    """QR least squares with an SVD fallback for rank-deficient / wide systems.
 
-    Matches _solve_qr semantics: QR for full-rank systems, SVD when the QR
-    result is unavailable / rank deficient.
+    Matches _solve_qr semantics: QR for full-rank tall systems, SVD (min-norm)
+    when the system is underdetermined or rank deficient. CUDA gels SILENTLY
+    returns NaN/inf for rank-deficient inputs (pytorch#117122), so instead of
+    trusting driver="gels" we factorize R ourselves and check its diagonal with
+    the same threshold _solve_qr uses before doing the triangular solve.
     """
     import torch
     A = np.asarray(A, dtype=np.float64)
     y = np.asarray(y, dtype=np.float64).ravel()
     At = _to_torch(A, torch.float64)
     yt = _to_torch(y, torch.float64).reshape(-1)
+    m, n = At.shape
+    if m < n:
+        return lstsq(A, y)          # underdetermined -> min-norm SVD
     try:
-        coef = torch.linalg.lstsq(At, yt, driver="gels").solution
-        return _to_numpy(coef, np.float64)
+        Q, R = torch.linalg.qr(At, mode="reduced")
+        diag = R.diagonal().abs()
+        if diag.numel() == 0:
+            return lstsq(A, y)
+        dmax = float(diag.max().item())
+        if dmax == 0.0:
+            return lstsq(A, y)
+        tol = torch.finfo(torch.float64).eps * max(m, n) * dmax
+        if float(diag.min().item()) <= tol:
+            return lstsq(A, y)      # rank deficient -> SVD
+        rhs = (Q.T @ yt).reshape(-1, 1)
+        coef = torch.linalg.solve_triangular(R, rhs, upper=True).reshape(-1)
     except Exception:
         return lstsq(A, y)
+    if not bool(torch.isfinite(coef).all()):
+        return lstsq(A, y)
+    return _to_numpy(coef, np.float64)
 
 
 def ridge_solve(A, y, alpha):
@@ -259,21 +298,21 @@ def predict(A, coef):
 # FISTA (GPU) -- mirrors optimizer._fista_lasso with a precomputed Gram
 # ---------------------------------------------------------------------------
 def _power_lipschitz(Gt, power_iters=15):
-    """||A||_2^2 = lambda_max(A^T A) by power iteration on the Gram (PSD)."""
+    """lambda_max(G) -- the Lipschitz constant of the Gram-form gradient.
+
+    The Gram-form objective is 0.5 x^T G x - b^T x; its gradient G x - b has
+    Lipschitz constant ||G||_2 = lambda_max(G), so the FISTA step is
+    1/lambda_max. The CPU Gram path uses the exact scipy.linalg.eigvalsh(G)[-1]
+    (no safety factor); mirror it with a torch eigendecomposition. A previous
+    power-iteration version applied the Gram one extra time and returned
+    ||G v||^2 = lambda_max^2, shrinking the step by ~lambda_max and stalling
+    FISTA inside cv_max_iter. The power_iters argument is kept for signature
+    compatibility and ignored.
+    """
     import torch
-    n = Gt.shape[0]
-    v = torch.randn(n, dtype=Gt.dtype, device=Gt.device)
-    v = v / (v.norm() + 1e-300)
-    for _ in range(power_iters):
-        v = Gt @ v
-        vn = v.norm()
-        if vn < 1e-30:
-            break
-        v = v / vn
-    u = Gt @ v
-    L = float(u.dot(u).item())
-    safety = float(os.environ.get("PHEASY_FISTA_LIPSCHITZ_SAFETY", "1.02"))
-    return max(L, 1e-12) * safety
+    if Gt.shape[0] == 0:
+        return 0.0
+    return float(torch.linalg.eigvalsh(Gt)[-1].item())
 
 
 def _soft_threshold_t(x, thr):
@@ -385,6 +424,13 @@ class GpuLassoCV(object):
 
     def fit(self, A, y, sample_weight=None):
         import torch
+        if sample_weight is not None:
+            raise NotImplementedError(
+                "GpuLassoCV does not support sample_weight; use the CPU path")
+        if self.fit_intercept:
+            raise NotImplementedError(
+                "GpuLassoCV does not support fit_intercept (intercept_ is "
+                "always 0); use the CPU path")
         y64 = np.asarray(y, dtype=np.float64).ravel()
         n_samples, m = A.shape
         At = _to_torch(A, torch.float64)
@@ -473,6 +519,13 @@ class GpuLassoCV(object):
                       % (tied.size, best_mean, float(self.alphas[tied].min()),
                          float(self.alphas[tied].max()), _cv_max_n_iter,
                          cv_max_iter), flush=True)
+        # PHEASY_LASSO_1SE: one-standard-error rule (largest alpha within 1 SE
+        # of the CV minimum) -- matches _reselect_alpha on the dense path.
+        if os.environ.get("PHEASY_LASSO_1SE", "0").lower() in ("1", "true", "yes"):
+            se = float(mse_path[best_i].std(ddof=1) / np.sqrt(mse_path.shape[1])) \
+                if mse_path.shape[1] > 1 else 0.0
+            cand = np.flatnonzero(mean_path <= best_mean + se)
+            best_i = int(cand[np.argmax(self.alphas[cand])])
         self._alpha_at_min = (best_i == 0)
         self._alpha_at_min_flat = (
             self._alpha_at_min and tied.size > 1
@@ -537,6 +590,13 @@ class GpuRidgeCV(object):
 
     def fit(self, A, y, sample_weight=None):
         import torch
+        if sample_weight is not None:
+            raise NotImplementedError(
+                "GpuRidgeCV does not support sample_weight; use the CPU path")
+        if self.fit_intercept:
+            raise NotImplementedError(
+                "GpuRidgeCV does not support fit_intercept (intercept_ is "
+                "always 0); use the CPU path")
         y64 = np.asarray(y, dtype=np.float64).ravel()
         At = _to_torch(A, torch.float64)
         yt = _to_torch(y64, torch.float64).reshape(-1)
@@ -552,7 +612,7 @@ class GpuRidgeCV(object):
             ratio = S2 / (S2 + a)
             h = (U * U) @ ratio                 # hat-matrix diagonal (leverage)
             r = yt - At @ w
-            denom = 1.0 - h
+            denom = torch.clamp(1.0 - h, min=1e-8)  # guard n~p & alpha~0 -> h~1
             score = float(((r * r) / (denom * denom)).mean().item())
             scores.append(score)
             coefs.append(w)
@@ -576,12 +636,25 @@ def load_sensing_matrix(sm_prime, ns_harm, ns_anharm, n_rows, dtype=np.float64):
     """Compute SM = sm_prime @ block_diag(ns_harm, ns_anharm) on the GPU.
 
     sm_prime is a scipy sparse CSR/CSC matrix (float32 or float64),
-    ns_harm / ns_anharm are dense 2-D arrays (or scipy sparse). Returns
-    SM[:n_rows] as a dense NumPy array of the requested dtype.
+    ns_harm / ns_anharm are dense 2-D arrays (or scipy sparse). Returns the
+    first n_rows rows as a dense NumPy array of the requested dtype.
 
     Falls back to a CPU scipy multiply when the GPU is unavailable.
     """
     import torch
+    # Slice first: holdout_eval only needs the first n_rows, so do not
+    # materialize the full product (5.6x the work at n=8/45) or its footprint.
+    sm = sm_prime[:n_rows].tocsr()
+
+    if not enabled():
+        # CPU path: keep NS sparse (like holdout_eval's own fallback) instead of
+        # densifying it -- avoids a large dense block-diagonal allocation.
+        import scipy.sparse as sp
+        NS = sp.block_diag([ns_harm, ns_anharm], format="csr")
+        SM = sm @ NS
+        return np.asarray(SM.toarray(), dtype=dtype)
+
+    # GPU path: torch.sparse.mm needs a dense RHS, so build the dense NS here.
     nsh = ns_harm.toarray() if hasattr(ns_harm, "toarray") else np.asarray(ns_harm)
     nsa = ns_anharm.toarray() if hasattr(ns_anharm, "toarray") else np.asarray(ns_anharm)
     nh, mh = nsh.shape
@@ -590,16 +663,16 @@ def load_sensing_matrix(sm_prime, ns_harm, ns_anharm, n_rows, dtype=np.float64):
     NS[:nh, :mh] = nsh
     NS[nh:, mh:] = nsa
 
-    if not enabled():
-        SM = sm_prime @ NS
-        return np.asarray(SM[:n_rows], dtype=dtype)
+    if sm.nnz >= 2 ** 31:
+        raise ValueError(
+            "nnz=%d exceeds the int32 range torch CSR indices use; split the "
+            "scan or load on CPU" % sm.nnz)
 
     NSt = torch.as_tensor(np.ascontiguousarray(NS), dtype=torch.float64,
                            device=device())
     # CSR path: ~5x faster and ~half the sparse-tensor memory of COO on
     # torch 2.x (indices are int32 and stored once). Fall back to COO if the
     # CSR kernel is unavailable.
-    sm = sm_prime.tocsr()
     crow = torch.as_tensor(sm.indptr, dtype=torch.int32, device=device())
     ccol = torch.as_tensor(sm.indices, dtype=torch.int32, device=device())
     cval = torch.as_tensor(sm.data, dtype=torch.float64, device=device())
@@ -608,6 +681,9 @@ def load_sensing_matrix(sm_prime, ns_harm, ns_anharm, n_rows, dtype=np.float64):
                                       dtype=torch.float64, device=device())
         SM = torch.sparse.mm(spt, NSt)
     except Exception:
+        # Release the failed CSR tensors before the COO retry so a CSR OOM does
+        # not compound with a second (larger) COO allocation.
+        del spt, crow, ccol, cval
         smc = sm.tocoo()
         idx = torch.as_tensor(np.vstack([smc.row, smc.col]), dtype=torch.long,
                               device=device())
@@ -615,6 +691,5 @@ def load_sensing_matrix(sm_prime, ns_harm, ns_anharm, n_rows, dtype=np.float64):
         spt = torch.sparse_coo_tensor(idx, vals, smc.shape,
                                       device=device()).coalesce()
         SM = torch.sparse.mm(spt, NSt)
-    out = SM[:n_rows]
-    return _to_numpy(out, dtype)
+    return _to_numpy(SM, dtype)
 

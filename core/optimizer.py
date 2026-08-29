@@ -40,11 +40,24 @@ def _gpu():
 
 
 def _gpu_dense(A):
-    """True when A should be solved on the GPU (dense, or sparse small enough to densify)."""
+    """True when A should be solved on the GPU (dense, or sparse small enough to densify).
+
+    A dense ndarray is accepted only when A plus its p x p Gram fit in
+    PHEASY_GPU_MEM_FRACTION (default 0.8) of the free VRAM; this is the OOM
+    fallback -- an oversized dense system degrades to the CPU instead of
+    crashing the run.
+    """
     gb = _gpu()
     if gb is None:
         return False
     if isinstance(A, np.ndarray):
+        n, m = A.shape
+        footprint = n * m * 8 + m * m * 8     # A + Gram (lower bound on peak)
+        avail = gb.available_memory_bytes()
+        if avail is not None:
+            frac = float(os.environ.get("PHEASY_GPU_MEM_FRACTION", "0.8"))
+            if footprint > avail * frac:
+                return False
         return True
     if sp.issparse(A):
         return _should_densify_sparse(A)
@@ -1291,7 +1304,7 @@ class _LassoCVModel:
                 self.alphas, self.cv, self.tol, self.max_iter, self.rand_seed,
                 self.n_jobs, fit_intercept=self.fit_intercept,
                 group_size=self.group_size, selection=self.selection)
-            it.fit(A, y, sample_weight=sample_weight)
+            it.fit(_to_dense_f64(A), y, sample_weight=sample_weight)
             self.model_ = it
             self.coef_ = it.coef_
             self.intercept_ = it.intercept_
@@ -1549,7 +1562,7 @@ class _AdaptiveLassoCV(_LassoCVModel):
                 self.n_jobs, fit_intercept=self.fit_intercept,
                 group_size=self.group_size, selection=self.selection,
                 penalty_weights=self._weights, grid_diag=_grid_diag)
-            it.fit(A, y, sample_weight=sample_weight)
+            it.fit(_to_dense_f64(A), y, sample_weight=sample_weight)
             self.model_ = it
             self.coef_ = it.coef_
             self.intercept_ = it.intercept_ if self.fit_intercept else 0.0
@@ -1908,12 +1921,14 @@ class Optimizer(object):
             #   alphas = 10^alpha_min ... 10^alpha_max
             self._alpha = np.logspace(alpha_min, alpha_max, nalpha)
 
-        if use_gpu is not None:
-            try:
-                from pheasy_gpu.core import gpu_backend as _gb
-                _gb.set_gpu_mode(bool(use_gpu))
-            except Exception:
-                pass
+        try:
+            from pheasy_gpu.core import gpu_backend as _gb
+            # None = auto: reset so a prior Optimizer(use_gpu=False) does not
+            # pin this (and all later) fits to the CPU. The mode is
+            # process-global (last-created Optimizer wins), not per-instance.
+            _gb.set_gpu_mode(None if use_gpu is None else bool(use_gpu))
+        except Exception:
+            pass
 
         self._group_size = None
         self._results = {}
@@ -2033,7 +2048,7 @@ class Optimizer(object):
                 if _gpu_dense(A_fit):
                     self._model = _gpu().GpuRidgeCV(
                         alphas=self._alpha, fit_intercept=self._fit_intercept)
-                    self._model.fit(A_fit, F64, sample_weight=weights)
+                    self._model.fit(_to_dense_f64(A_fit), F64, sample_weight=weights)
                     coef = self._model.coef_
                 else:
                     self._model = RidgeCV(alphas=self._alpha, fit_intercept=self._fit_intercept)

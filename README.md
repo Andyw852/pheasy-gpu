@@ -34,10 +34,10 @@ pip install -e '.[fast]'  # + celer, a faster LASSO solver (CPU path)
 
 ```bash
 python3 tools/prepare_dataset.py POSCAR SPOSCAR dataset_disps.npy dataset_forces.npy
-pheasy --dim 3 3 3 -w 3 -s --c3 5.2
-pheasy --dim 3 3 3 -w 3 -c --c3 5.2
-pheasy --dim 3 3 3 -w 3 -d --c3 5.2 --ndata 45 --disp_file
-pheasy --dim 3 3 3 -w 3 -f --c3 5.2 --ndata 45 -l OLS --full_ifc --hdf5
+pheasy-gpu --dim 3 3 3 -w 3 -s --c3 5.2
+pheasy-gpu --dim 3 3 3 -w 3 -c --c3 5.2
+pheasy-gpu --dim 3 3 3 -w 3 -d --c3 5.2 --ndata 45 --disp_file
+pheasy-gpu --dim 3 3 3 -w 3 -f --c3 5.2 --ndata 45 -l OLS --full_ifc --hdf5
 ```
 
 ## Notes
@@ -47,3 +47,5 @@ pheasy --dim 3 3 3 -w 3 -f --c3 5.2 --ndata 45 -l OLS --full_ifc --hdf5
   curve goes flat and the fit ends up over-regularized. Use `--tol 1e-6`.
 - `PHEASY_SM_DTYPE` (`float64` default) controls the precision of SM / NS / FM.
   All of them must agree, otherwise scipy silently upcasts.
+- `tools/prepare_dataset.py` is a repository utility (not installed by pip);
+  run it from the checkout, not from the installed package.
