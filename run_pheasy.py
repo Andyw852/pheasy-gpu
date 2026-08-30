@@ -1212,7 +1212,12 @@ class WorkFlow(object):
                 **alpha_kwargs,
             )
             if settings.MODEL.upper() == "LASSO":
-                logger.info("Fitting force constants via the coordinate descent LASSO.")
+                from pheasy_gpu.core.optimizer import _lasso_backend
+                _be = _lasso_backend(SM)
+                _label = {"gpu": "FISTA (GPU Gram)",
+                          "iterative": "FISTA (CPU)",
+                          "dense": "coordinate descent"}.get(_be, _be)
+                logger.info("Fitting force constants via %s LASSO." % _label)
             elif settings.MODEL.upper() == "ALASSO":
                 logger.info("Fitting force constants via Adaptive LASSO (ALASSO).")
             elif settings.MODEL.upper() == "OLS":

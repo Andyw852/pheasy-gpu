@@ -42,6 +42,9 @@ pheasy-gpu --dim 3 3 3 -w 3 -f --c3 5.2 --ndata 45 -l OLS --full_ifc --hdf5
 
 ## Notes
 
+- The `pheasy-gpu` CLI has no `--use-gpu` flag: GPU activation is via the
+  `PHEASY_USE_GPU` env var (`1` force GPU, `0` force CPU, unset = auto).
+  See `GPU.md`.
 - LASSO / ALASSO need a tight tolerance. `--tol 1e-3` is *not* tight: sklearn
   scales it by `||y||^2`, coordinate descent stops early at small alpha, the CV
   curve goes flat and the fit ends up over-regularized. Use `--tol 1e-6`.

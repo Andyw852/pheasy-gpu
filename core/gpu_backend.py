@@ -8,10 +8,15 @@ the GPU.
 
 Activation (in priority order):
 
-1. Optimizer(..., use_gpu=True/False) -- explicit process-wide override
-   (the last-created Optimizer wins; there is no per-instance isolation).
-2. PHEASY_USE_GPU env var: "0"/"false"/"off" forces CPU, "1"/"true"/"on"
-   forces GPU, unset -> auto (GPU if available).
+1. Optimizer(..., use_gpu=True/False) -- scoped to that instance's fit(): it
+   sets the global mode for the duration of fit() and restores it afterward, so
+   constructing an Optimizer no longer clobbers a caller's earlier
+   set_gpu_mode(...).
+2. set_gpu_mode(mode) / PHEASY_USE_GPU env var -- the process-wide switch
+   ("0"/"false"/"off" forces CPU, "1"/"true"/"on" forces GPU, unset -> auto).
+   Direct gb.* calls (e.g. load_sensing_matrix) follow ONLY this switch and
+   never see an Optimizer's use_gpu; likewise Optimizer.predict() outside fit()
+   runs under the ambient mode.
 3. Auto mode uses the GPU when torch.cuda.is_available() is true.
 
 Tuning knobs:
