@@ -133,11 +133,16 @@ Recheck after the Lipschitz fix (`dev/recheck_lasso.py`, RTX 3090):
   (90%) -> 1.25e-6 (98.5%). Neither solver hit its iteration cap: sklearn CD
   n_iter <=1438 (no ConvergenceWarning) and FISTA n_iter <=600 (final-refit cap
   5000), so the curve is a genuine solver difference, not a cap artifact. A
-  tol=1e-12 CD reference puts both solvers within ~1e-6 of truth with no
-  consistent winner: err_fista/err_cd = 9.1e-8 / 2.8e-8 (57%), 3.4e-7 / 4.7e-7
-  (90%), 2.5e-7 / 1.1e-6 (98.5%) -- at the densest point CD, not FISTA, is the
-  one further off, so the |F-C| gap is the vector difference of two comparable
-  stopping-criterion errors, not a one-sided FISTA error. The level-3 LASSO
+  tol=1e-12 CD reference is a certified KKT point (KKT violation 1.7e-10 /
+  1.4e-9 / 1.3e-8 at 57% / 90% / 98.5% nnz) but, with lam_min(A.T A / n) =
+  6.7e-7, its own coefficient error is only bounded to sqrt(2*gap/mu) = 2.6e-4,
+  so the err_fista/err_cd distances to it (9.1e-8/2.8e-8, 3.4e-7/4.7e-7,
+  2.5e-7/1.1e-6) sit below its resolution limit, not certified distances to the
+  true minimizer. The reference is itself CD, so err_cd is if anything
+  understated by correlated error (same sweep/active-set as the loose CD), and
+  err_cd still exceeds err_fista at 98.5% -- so the |F-C| gap is the vector
+  difference of two comparable stopping-criterion errors, not a one-sided FISTA
+  error. The level-3 LASSO
   3.5e-4 is
   therefore the recheck's tol=1e-6 stopping early in the near-OLS regime, not a
   conditioning floor.
