@@ -142,10 +142,8 @@ Recheck after the Lipschitz fix (`dev/recheck_lasso.py`, RTX 3090):
   understated by correlated error (same sweep/active-set as the loose CD), and
   err_cd still exceeds err_fista at 98.5% -- so the |F-C| gap is the vector
   difference of two comparable stopping-criterion errors, not a one-sided FISTA
-  error. The level-3 LASSO
-  3.5e-4 is
-  therefore the recheck's tol=1e-6 stopping early in the near-OLS regime, not a
-  conditioning floor.
+  error. The level-3 LASSO 3.5e-4 is therefore the recheck's tol=1e-6 stopping
+  early in the near-OLS regime, not a conditioning floor.
 
 ## Memory (RTX 3090, full n=45 dense SM 25515x3678)
 
