@@ -7,6 +7,20 @@ solvers, not an error vs truth; pass --reference to also fit a tol=1e-12 CD
 reference and report err_fista / err_cd (each solver's error vs that reference,
 which separates "FISTA is off" from "CD is off").
 
+The tol=1e-12 reference is itself CD, so err_cd is if anything understated by
+correlated error (same algorithm / sweep order / active-set trajectory as the
+loose CD), while err_fista is a genuinely independent difference. To certify
+how good the reference actually is, the --reference path also prints:
+
+  * lam_min(A.T A / n): the strong-convexity modulus mu in
+    ||x - x*|| <= sqrt(2*gap/mu). With a tiny lam_min the dual-gap tolerance
+    maps to a large allowed coefficient error.
+  * kkt = max violation of the KKT conditions / alpha (algorithm-independent,
+    unlike CD's self-reported dual gap): c = A.T (y - A x) / n must equal
+    alpha*sign(x) on the support and stay <= alpha off it.
+  * gap / bound: the CD dual gap and the resulting sqrt(2*gap/mu) upper bound
+    on the reference's coefficient error.
+
 Note the FISTA side runs through GpuLassoCV, whose final full-data refit is
 capped at max_iter=5000 / tol=1e-7 (shared verbatim with the CPU
 _LassoCVIterative), so a printed FISTA n_iter of 5000 at dense alphas means the
@@ -39,7 +53,7 @@ def main():
     ap.add_argument("--max-iter", type=int, default=200000)
     ap.add_argument("--reference", action="store_true",
                     help="also fit a tol=1e-12 / max_iter=1e6 CD reference and "
-                         "report err_fista / err_cd (error vs that reference)")
+                         "report err_fista / err_cd + a KKT certificate")
     args = ap.parse_args()
 
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -69,10 +83,19 @@ def main():
     As = SM / cn
     p = As.shape[1]
 
-    header = "%-11s %8s %8s %12s  %-30s" % ("alpha", "nnz", "nnz%", "|F-C|/|C|",
+    lam_min = None
+    if args.reference:
+        # lambda_min of the standardized Gram (A.T A / n): the strong-convexity
+        # modulus mu, and the conditioning knob that maps the dual-gap tolerance
+        # into an allowed coefficient error.
+        Gram = As.T @ As / As.shape[0]
+        lam_min = float(np.linalg.eigvalsh(Gram)[0])
+        print("lam_min(A.T A / n) = %.3e" % lam_min, flush=True)
+
+    header = "%-11s %8s %8s %12s  %-20s" % ("alpha", "nnz", "nnz%", "|F-C|/|C|",
                                              "iters")
     if args.reference:
-        header += "  %10s %10s" % ("err_fista", "err_cd")
+        header += "  %10s %10s  %s" % ("err_fista", "err_cd", "kkt/gap/bound")
     print(header, flush=True)
     for a in alphas:
         g = gb.GpuLassoCV([a], cv=2, tol=args.tol, max_iter=args.max_iter,
@@ -90,7 +113,7 @@ def main():
             note += " CD-ConvWarning"
         if int(g.n_iter_) >= 5000:
             note += " FISTA-cap"
-        row = "%-11.3e %8d %7.1f%% %12.3e  %-30s" % (a, nnz, 100.0 * nnz / p,
+        row = "%-11.3e %8d %7.1f%% %12.3e  %-20s" % (a, nnz, 100.0 * nnz / p,
                                                       rel, note)
         if args.reference:
             with warnings.catch_warnings(record=True) as w2:
@@ -101,7 +124,20 @@ def main():
             rden = max(float(np.linalg.norm(ref.coef_)), 1e-30)
             err_f = float(np.linalg.norm(g.coef_ - ref.coef_) / rden)
             err_c = float(np.linalg.norm(s.coef_ - ref.coef_) / rden)
-            row += "  %10.3e %10.3e" % (err_f, err_c)
+            # KKT certificate (algorithm-independent, unlike CD's self-reported
+            # dual gap): c = A.T (y - A x) / n is the data-term gradient of
+            # (1/2n)||y-Ax||^2 + a||x||_1, and at a KKT point c_j = a sign(x_j)
+            # on the support and |c_j| <= a off it.
+            rr = F - As @ ref.coef_
+            cc = As.T @ rr / As.shape[0]
+            S = ref.coef_ != 0
+            v_on = float(np.abs(cc[S] - a * np.sign(ref.coef_[S])).max()) if S.any() else 0.0
+            v_off = float(max((np.abs(cc[~S]) - a).max(), 0.0)) if (~S).any() else 0.0
+            kkt = max(v_on, v_off) / a
+            dgap = float(getattr(ref, "dual_gap_", float("nan")))
+            bound = float(np.sqrt(2.0 * dgap / lam_min)) if (lam_min and lam_min > 0 and dgap >= 0) else float("nan")
+            row += "  %10.3e %10.3e  kkt=%.1e gap=%.1e bound=%.1e" % (
+                err_f, err_c, kkt, dgap, bound)
             if rconv:
                 row += " ref-hit-cap"
         print(row, flush=True)
