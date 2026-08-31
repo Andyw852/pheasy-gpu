@@ -622,7 +622,9 @@ class GpuRidgeCV(object):
     """
 
     def __init__(self, alphas, cv=5, rand_seed=None, group_size=None):
-        self.alphas = np.asarray(alphas, dtype=np.float64)
+        # sort ascending so the CV tie-break leans toward the SMALLEST alpha
+        # (matching GpuLassoCV), independent of the caller's grid order.
+        self.alphas = np.sort(np.asarray(alphas, dtype=np.float64))
         self.cv = cv
         self.rand_seed = rand_seed
         self.group_size = group_size
@@ -637,7 +639,7 @@ class GpuRidgeCV(object):
         yt = _to_torch(y64, torch.float64).reshape(-1)
         splits = _make_cv_splits(At.shape[0], self.cv, self.rand_seed,
                                  self.group_size)
-        alphas = np.asarray(self.alphas, dtype=np.float64)
+        alphas = self.alphas  # sorted ascending (see __init__)
         mse_path = np.zeros((len(alphas), len(splits)), dtype=np.float64)
         for k, (tr, va) in enumerate(splits):
             U, S, Vh = torch.linalg.svd(At[tr], full_matrices=False)
@@ -647,8 +649,24 @@ class GpuRidgeCV(object):
                 a = float(a)
                 pred = AvV @ ((S / (S * S + a)) * Uty)
                 mse_path[j, k] = float(((pred - yt[va]) ** 2).mean().item())
-        best = int(np.argmin(mse_path.mean(axis=1)))
-        self.alpha_ = float(alphas[best])
+        # Tie-break toward the SMALLEST alpha on a flat CV tail: scan from the
+        # largest alpha down and accept `<=`, mirroring GpuLassoCV.  (The old
+        # np.argmin took the *first* min in the caller's unsorted order.)
+        mean_path = mse_path.mean(axis=1)
+        best_i = len(alphas) - 1
+        best_mean = float(mean_path[best_i])
+        for a_i in range(len(alphas) - 1, -1, -1):
+            _m = float(mean_path[a_i])
+            if _m <= best_mean:
+                best_mean = _m
+                best_i = a_i
+        self._alpha_at_min = (best_i == 0)
+        if self._alpha_at_min:
+            print("[CV] WARNING: alpha* %.3e sits at the grid MINIMUM; the RIDGE "
+                  "CV curve is still falling at the low end -- widening the grid "
+                  "only pushes alpha* toward OLS."
+                  % float(alphas[0]), flush=True)
+        self.alpha_ = float(alphas[best_i])
         # final refit at the selected alpha (closed form, full data)
         U, S, Vh = torch.linalg.svd(At, full_matrices=False)
         Uty = U.T @ yt

@@ -76,12 +76,20 @@ def _blas_limit(n_outer):
     degrades to a no-op instead of raising.
     """
     per = max(1, _avail_cores() // max(1, n_outer))
+    # Import OUTSIDE the yield scope: a `yield` inside `try` means any
+    # ImportError raised by the *body* (the code inside `with _blas_limit`)
+    # would be caught here and trigger a second yield ->
+    # "RuntimeError: generator didn't stop after throw()", destroying the
+    # original error. Deciding the import up front keeps body exceptions intact.
     try:
         from threadpoolctl import threadpool_limits
+    except ImportError:
+        threadpool_limits = None
+    if threadpool_limits is None:
+        yield
+    else:
         with threadpool_limits(limits=per):
             yield
-    except ImportError:
-        yield
 
 
 def _gpu():
@@ -2242,12 +2250,15 @@ class Optimizer(object):
                     # [FIX P47] weighted ridge == unweighted ridge on
                     # sqrt(weights)-scaled rows; scale on the host, then grouped
                     # CV on the GPU (one torch SVD per fold).
-                    A_g = _to_dense_f64(A_fit)
+                    # Reuse A_dense (already densified just above) instead of a
+                    # second _to_dense_f64() copy; the *sw scaling allocates a
+                    # fresh array, so the caller's A_fit is never mutated.
+                    A_g = A_dense
                     y_g = F64
                     if weights is not None:
                         sw = np.sqrt(np.asarray(weights, dtype=np.float64).ravel())
-                        A_g = A_g * sw[:, None]
-                        y_g = y_g * sw
+                        A_g = A_dense * sw[:, None]
+                        y_g = F64 * sw
                     self._model = _gpu().GpuRidgeCV(
                         alphas=self._alpha, cv=self._cv,
                         rand_seed=self._rand_seed, group_size=self._group_size)
