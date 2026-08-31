@@ -59,3 +59,41 @@ these timings are the dense/near-OLS end of the spectrum.
 - The dense near-OLS regime (alpha at grid minimum) makes LASSO/ALASSO do
   more CD/FISTA iterations than a well-regularized fit would; speed ranking is
   unaffected but absolute times are the slow end.
+## Memory (c7 SM n=8, same config as the speed table)
+
+Measured with `dev/mem_bench.py` (RTX 3090, `torch.cuda.max_memory_allocated`
+peak per fit; host RSS = process high-water mark).
+
+| method | GPU VRAM peak | host RSS (GPU backend) |
+|---|---|---|
+| SM load (CSR sparse.mm -> dense) | 579 MB | 1.76 GB |
+| OLS   | 839 MB | 1.76 GB |
+| RIDGE | 847 MB | 1.76 GB |
+| LASSO | 1581 MB | 2.06 GB |
+| ALASSO | 1581 MB | 2.07 GB |
+| RFE   | 864 MB | 2.08 GB |
+
+CPU RAM per backend (n=8, host side):
+
+- cpu_blas (single process): ~1.5-2 GB = dense SM 133 MB + SVD workspace.
+- cpu_njobs (16 loky workers): ~2-3 GB = 16 x ~107 MB training-fold copy +
+  CD workspace. The memory-aware cap (`_lasso_n_jobs`) computes per_worker =
+  4536x3678x8 = 133.5 MB against a 6 GB budget (PHEASY_LASSO_MEM_GB) -> cap 48,
+  so n_jobs=16 is NOT memory-limited at n=8. At n=45 (per_worker 716 MiB) the
+  same budget caps workers to 8 - the OOM guard the cap exists for.
+
+Findings:
+
+- Memory is never the binding constraint: 24 GB VRAM peaks at ~1.6 GB (n=8)
+  and ~3.2 GB (n=45, GPU.md); the bottleneck is FP64 compute, not memory.
+- LASSO/ALASSO are the heaviest (1581 MB) because GpuLassoCV holds one Gram
+  (p x p = 108 MB) plus one A_va copy per CV fold: 5-fold = ~540 MB Grams +
+  ~133 MB A_va, plus the 133 MB SM and FISTA workspace -> the 1.58 GB peak.
+  OLS/RIDGE/RFE need only one SVD/QR workspace (~840-870 MB).
+- n_jobs process parallelism costs host RAM ~linearly in worker count but stays
+  bounded by the 6 GB budget; the GPU path spends its parallel budget in VRAM
+  (a few hundred MB) instead, so it scales without RAM pressure.
+- Note: mem_bench did not set PHEASY_RFE_STEP, so its RFE used the default
+  step=0.05 (nnz 3153 vs 2575 at step=0.3); the VRAM peak (864 MB) is the
+  round-0 full-feature QR and is step-independent.
+
