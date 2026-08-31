@@ -719,7 +719,7 @@ class GpuRidgeCV(object):
                 a = float(a)
                 pred = AvV @ ((S / (S * S + a)) * Uty)
                 col[j] = float(((pred - yva) ** 2).mean().item())
-            return k, col
+            return col
 
         if len(devs) > 1:
             from concurrent.futures import ThreadPoolExecutor
@@ -739,7 +739,7 @@ class GpuRidgeCV(object):
                         mse_path[:, k] = col
         else:
             for k in range(len(splits)):
-                _, col = _fold(k, devs[0])
+                col = _fold(k, devs[0])
                 mse_path[:, k] = col
 
         # Tie-break toward the SMALLEST alpha on a flat CV tail: scan from the
