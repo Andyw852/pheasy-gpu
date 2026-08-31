@@ -613,51 +613,49 @@ class GpuLassoCV(object):
 # RIDGE CV (GPU) -- drop-in for sklearn RidgeCV(cv=None) generalized CV
 # ---------------------------------------------------------------------------
 class GpuRidgeCV(object):
-    """Ridge CV over an alpha grid via generalized (leave-one-out) CV.
+    """Ridge CV over an alpha grid via grouped K-fold CV (closed form, GPU).
 
-    Reproduces sklearn RidgeCV(alphas=..., fit_intercept=False, cv=None):
-    for each alpha the ridge solution and the SVD hat-matrix leverage give the
-    LOO error mean((y - Xw)^2 / (1 - h)^2); the alpha minimizing it wins.
+    [FIX P46/P47] grouped CV -- one torch SVD per fold -- instead of the old
+    leave-one-out GCV. LOO leaks the other 3N-1 rows of the same configuration
+    into training and biases alpha* toward 0. The Optimizer pre-scales A and y
+    by sqrt(weights) for weighted ridge, so fit() takes no sample_weight.
     """
 
-    def __init__(self, alphas, fit_intercept=False):
+    def __init__(self, alphas, cv=5, rand_seed=None, group_size=None):
         self.alphas = np.asarray(alphas, dtype=np.float64)
-        self.fit_intercept = fit_intercept
+        self.cv = cv
+        self.rand_seed = rand_seed
+        self.group_size = group_size
 
     def fit(self, A, y, sample_weight=None):
         import torch
         if sample_weight is not None:
             raise NotImplementedError(
-                "GpuRidgeCV does not support sample_weight; use the CPU path")
-        if self.fit_intercept:
-            raise NotImplementedError(
-                "GpuRidgeCV does not support fit_intercept (intercept_ is "
-                "always 0); use the CPU path")
+                "GpuRidgeCV: pre-scale A,y by sqrt(weights) before calling")
         y64 = np.asarray(y, dtype=np.float64).ravel()
         At = _to_torch(A, torch.float64)
         yt = _to_torch(y64, torch.float64).reshape(-1)
+        splits = _make_cv_splits(At.shape[0], self.cv, self.rand_seed,
+                                 self.group_size)
+        alphas = np.asarray(self.alphas, dtype=np.float64)
+        mse_path = np.zeros((len(alphas), len(splits)), dtype=np.float64)
+        for k, (tr, va) in enumerate(splits):
+            U, S, Vh = torch.linalg.svd(At[tr], full_matrices=False)
+            Uty = U.T @ yt[tr]
+            AvV = At[va] @ Vh.T                  # A_va @ V  (Vh = V^H; real -> V^T)
+            for j, a in enumerate(alphas):
+                a = float(a)
+                pred = AvV @ ((S / (S * S + a)) * Uty)
+                mse_path[j, k] = float(((pred - yt[va]) ** 2).mean().item())
+        best = int(np.argmin(mse_path.mean(axis=1)))
+        self.alpha_ = float(alphas[best])
+        # final refit at the selected alpha (closed form, full data)
         U, S, Vh = torch.linalg.svd(At, full_matrices=False)
-        Ut_y = U.T @ yt
-        S2 = S * S
-        U2 = U * U                                # n x p, alpha-independent: hoist
-        scores = []
-        coefs = []
-        for a in self.alphas:
-            a = float(a)
-            d = S / (S2 + a)
-            w = Vh.T @ (d * Ut_y)
-            ratio = S2 / (S2 + a)
-            h = U2 @ ratio                        # hat-matrix diagonal (leverage)
-            r = yt - U @ (ratio * Ut_y)           # residual via SVD (saves At @ w)
-            denom = torch.clamp(1.0 - h, min=1e-8)  # guard n~p & alpha~0 -> h~1
-            score = float(((r * r) / (denom * denom)).mean().item())
-            scores.append(score)
-            coefs.append(w)
-        best = int(np.argmin(scores))
-        self.coef_ = _to_numpy(coefs[best], np.float64)
-        self.alpha_ = float(self.alphas[best])
+        Uty = U.T @ yt
+        self.coef_ = _to_numpy(Vh.T @ ((S / (S * S + self.alpha_)) * Uty),
+                               np.float64)
         self.intercept_ = 0.0
-        self._gcv_scores_ = np.asarray(scores, dtype=np.float64)
+        self.mse_path_ = mse_path
         return self
 
     def predict(self, A):

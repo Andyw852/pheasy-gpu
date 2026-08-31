@@ -11,7 +11,7 @@ separate package named `pheasy_gpu` so both can be installed side by side.
 | Method | CPU (scipy/sklearn) | GPU (torch/cuSOLVER) |
 |---|---|---|
 | OLS | `scipy.linalg.lstsq` (gelsd SVD) | `torch.linalg.svd` + rcond solve |
-| RIDGE | `sklearn.RidgeCV` (generalized CV) | SVD hat-matrix GCV (identical alpha) |
+| RIDGE | grouped K-fold CV (closed form) | grouped K-fold CV (closed form, SVD per fold) |
 | LASSO | `sklearn.LassoCV` (coordinate descent) | Gram-based FISTA (GPU by default) |
 | ALASSO | ridge pilot + `LassoCV` on scaled cols | ridge pilot + FISTA with per-column weights |
 | RFE | `scipy.linalg.lstsq` per subset | rank-checked QR + `gels` per subset, SVD fallback |
@@ -92,7 +92,7 @@ PHEASY_USE_GPU=0 python holdout_eval.py <data_dir> ...
 |---|---|---|
 | SM load (25515x6588 @ 6588x3678) | ~1421 s | ~28 s |
 | OLS (4536x3678, gelsd vs SVD) | ~600+ s | ~21 s |
-| RIDGE (50-alpha GCV) | ~1700 s (n=24) | ~16 s |
+| RIDGE (50-alpha grouped CV) | ~1700 s (n=24) | ~16 s |
 | LASSO (20-alpha grouped CV) | ~939 s | ~40 s |
 | ALASSO (20-alpha weighted CV) | ~940 s | ~35 s |
 | RFE (step 0.05, 3-fold) | SVD per subset (hours) | ~99 s (QR; pre-rank-check) |
@@ -104,11 +104,17 @@ the end-to-end holdout drops from hours to minutes.
 > The RFE timing predates the R-only rank-check pass (re-run before quoting).
 > LASSO/ALASSO were re-measured after the fixes: 38/41 s GPU FISTA vs 418/306 s
 > sklearn CD on the c7 SM (n=8); see the recheck note in "Verified numerics".
+>
+> RIDGE switched from leave-one-out GCV to grouped K-fold CV (P46) -- the same
+> grouped splits as LASSO/ALASSO/RFE. The ~1700 s / ~16 s figures above were
+> measured with the old GCV (one SVD); grouped CV costs K SVDs per fit, so
+> re-measure before quoting RIDGE timing.
 
 Verified numerics (GPU vs CPU):
 * `lstsq` vs `numpy.linalg.lstsq`: ~1e-15
 * `ridge_solve` vs `sklearn.Ridge`: ~1e-15
-* `GpuRidgeCV.alpha_` vs `sklearn.RidgeCV.alpha_`: exact match
+* `GpuRidgeCV` grouped-CV == CPU grouped-CV closed form: ~1e-15 (both now
+  grouped K-fold CV, not GCV)
 * `qr_solve` vs `numpy.linalg.lstsq`: ~5e-15
 * `GpuLassoCV.alpha_` vs `sklearn.LassoCV.alpha_`: identical; coef rel diff
   ~4e-9 (synthetic), ~3.5e-4 / 5.9e-6 (c7 SM, n=8, debias off, tol=1e-6) after
