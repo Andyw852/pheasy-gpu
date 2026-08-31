@@ -121,6 +121,53 @@ def available_memory_bytes():
         return None
 
 
+def _device_free_bytes(dev):
+    """Free (usable) VRAM in bytes on a specific CUDA device (None if unknown).
+
+    Same accounting as available_memory_bytes() (adds back torch's
+    reserved-but-unallocated cache) but for an arbitrary device index.
+    """
+    t = _torch()
+    if t is None:
+        return None
+    try:
+        if not t.cuda.is_available():
+            return None
+        free, _total = t.cuda.mem_get_info(dev)
+        reusable = t.cuda.memory_reserved(dev) - t.cuda.memory_allocated(dev)
+        return int(free + reusable)
+    except Exception:
+        return None
+
+
+def _multi_gpu_devices(min_free_bytes=0):
+    """Device indices for fold-parallel CV, filtered by free VRAM.
+
+    PHEASY_GPU_DEVICES="1,2,4" pins an explicit list; otherwise all visible
+    devices are considered. Devices with usable VRAM < min_free_bytes are
+    dropped (so a busy shared GPU is skipped). Falls back to the single
+    device() when nothing qualifies.
+    """
+    import torch
+    if not available():
+        return [0]
+    n = torch.cuda.device_count()
+    if n <= 1:
+        return [0]
+    raw = os.environ.get("PHEASY_GPU_DEVICES", "").strip()
+    if raw:
+        devs = [int(x) for x in raw.split(",") if x.strip() != ""]
+    else:
+        devs = list(range(n))
+    devs = [d for d in devs if 0 <= d < n]
+    if min_free_bytes > 0:
+        devs = [d for d in devs
+                if (_device_free_bytes(d) or 0) >= min_free_bytes]
+    if not devs:
+        return [int(device().index)]
+    return devs
+
+
 def _env_wants():
     v = os.environ.get("PHEASY_USE_GPU", None)
     if v is None:
@@ -635,20 +682,66 @@ class GpuRidgeCV(object):
             raise NotImplementedError(
                 "GpuRidgeCV: pre-scale A,y by sqrt(weights) before calling")
         y64 = np.asarray(y, dtype=np.float64).ravel()
-        At = _to_torch(A, torch.float64)
-        yt = _to_torch(y64, torch.float64).reshape(-1)
-        splits = _make_cv_splits(At.shape[0], self.cv, self.rand_seed,
-                                 self.group_size)
+        A64 = np.ascontiguousarray(A, dtype=np.float64)
+        n, m = A64.shape
+        splits = _make_cv_splits(n, self.cv, self.rand_seed, self.group_size)
         alphas = self.alphas  # sorted ascending (see __init__)
         mse_path = np.zeros((len(alphas), len(splits)), dtype=np.float64)
-        for k, (tr, va) in enumerate(splits):
-            U, S, Vh = torch.linalg.svd(At[tr], full_matrices=False)
-            Uty = U.T @ yt[tr]
-            AvV = At[va] @ Vh.T                  # A_va @ V  (Vh = V^H; real -> V^T)
+
+        # [multi-GPU] fold-parallel CV: one thread per device, each fold's dense
+        # SVD on its device. Memory guard: a device is used only when its usable
+        # VRAM covers the fold's ~4x SVD footprint (matching _gpu_footprint_ok);
+        # otherwise we fall back to fewer devices (ultimately single). Each
+        # device's folds run serially inside its own thread, so the per-device
+        # peak is exactly one fold (At + U + Vh + workspace).
+        n_train = max(int(len(tr)) for tr, _ in splits)
+        footprint = 4 * n_train * m * 8
+        frac = float(os.environ.get("PHEASY_GPU_MEM_FRACTION", "0.8"))
+        min_free = footprint / frac if frac > 0 else footprint
+        devs = _multi_gpu_devices(min_free_bytes=min_free)
+        devs = devs[:len(splits)]
+        if len(devs) > 1:
+            print("[GPU] RIDGE CV fold-parallel on %d device(s); fold footprint "
+                  "~%.2f GB" % (len(devs), footprint / 1e9), flush=True)
+
+        def _fold(k, dev):
+            tr, va = splits[k]
+            d = torch.device("cuda:%d" % dev)
+            At = torch.as_tensor(A64[tr], dtype=torch.float64, device=d)
+            yt = torch.as_tensor(y64[tr], dtype=torch.float64, device=d)
+            Ava = torch.as_tensor(A64[va], dtype=torch.float64, device=d)
+            yva = torch.as_tensor(y64[va], dtype=torch.float64, device=d)
+            U, S, Vh = torch.linalg.svd(At, full_matrices=False)
+            Uty = U.T @ yt
+            AvV = Ava @ Vh.T                  # A_va @ V  (Vh = V^H; real -> V^T)
+            col = np.empty(len(alphas), dtype=np.float64)
             for j, a in enumerate(alphas):
                 a = float(a)
                 pred = AvV @ ((S / (S * S + a)) * Uty)
-                mse_path[j, k] = float(((pred - yt[va]) ** 2).mean().item())
+                col[j] = float(((pred - yva) ** 2).mean().item())
+            return k, col
+
+        if len(devs) > 1:
+            from concurrent.futures import ThreadPoolExecutor
+            folds_by_dev = [[] for _ in devs]
+            for k in range(len(splits)):
+                folds_by_dev[k % len(devs)].append(k)
+
+            def _run_dev(di):
+                out = {}
+                for k in folds_by_dev[di]:
+                    out[k] = _fold(k, devs[di])
+                return out
+
+            with ThreadPoolExecutor(max_workers=len(devs)) as ex:
+                for out in ex.map(_run_dev, range(len(devs))):
+                    for k, col in out.items():
+                        mse_path[:, k] = col
+        else:
+            for k in range(len(splits)):
+                _, col = _fold(k, devs[0])
+                mse_path[:, k] = col
+
         # Tie-break toward the SMALLEST alpha on a flat CV tail: scan from the
         # largest alpha down and accept `<=`, mirroring GpuLassoCV.  (The old
         # np.argmin took the *first* min in the caller's unsorted order.)
@@ -667,7 +760,9 @@ class GpuRidgeCV(object):
                   "only pushes alpha* toward OLS."
                   % float(alphas[0]), flush=True)
         self.alpha_ = float(alphas[best_i])
-        # final refit at the selected alpha (closed form, full data)
+        # final refit at the selected alpha (closed form, full data, device())
+        At = _to_torch(A64, torch.float64)
+        yt = _to_torch(y64, torch.float64).reshape(-1)
         U, S, Vh = torch.linalg.svd(At, full_matrices=False)
         Uty = U.T @ yt
         self.coef_ = _to_numpy(Vh.T @ ((S / (S * S + self.alpha_)) * Uty),
