@@ -964,6 +964,9 @@ class TwoLevelSM(LinearOperator):
                 self._gpu_mv = _gb.GpuSparseMV(SM_prime)
                 print("[GPU-SM] SpMV on %d device(s), dtype=%s" % (
                     len(self._gpu_mv._devs), SM_prime.dtype), flush=True)
+                # GPU rmatvec uses its own transpose blocks; do not also
+                # cache the 60.5 GB CPU transpose (SM_primeT stays a view).
+                self._cache_T = False
             except Exception as _e:
                 print("[GPU-SM] SpMV unavailable (%s); using CPU" % _e, flush=True)
                 self._gpu_mv = None
