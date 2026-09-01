@@ -75,7 +75,7 @@ except ImportError:
 
 
 
-def _cap_n_jobs_by_memory(n_jobs, cs_full):
+def _cap_n_jobs_by_memory(n_jobs, cs_full, n_configs=0, per_config_bytes=0):
     """[FIX P04] Cap joblib workers so the pickled cluster space fits in RAM.
 
     Each worker receives its own copy of ``cs_full``; on a memory-tight node
@@ -95,21 +95,26 @@ def _cap_n_jobs_by_memory(n_jobs, cs_full):
     except (ValueError, OSError, AttributeError):
         return n_jobs
     try:
-        per_worker = len(_pk.dumps(cs_full, protocol=_pk.HIGHEST_PROTOCOL))
+        per_worker_cs = len(_pk.dumps(cs_full, protocol=_pk.HIGHEST_PROTOCOL))
     except Exception:
         return n_jobs
+    if per_worker_cs <= 0:
+        return n_jobs
+    # x3: pickle buffer in the parent + unpickled object in the child + slack
+    per_worker_cs *= 3.0
+    _chunk_size = max(1, int(np.ceil(n_configs / max(1, n_jobs))))
+    per_worker = per_worker_cs + _chunk_size * max(0, per_config_bytes)
     if per_worker <= 0:
         return n_jobs
     frac = float(_os.environ.get("PHEASY_SM_MEM_FRACTION", "0.6"))
-    # x3: pickle buffer in the parent + unpickled object in the child + slack
-    budget = max(1, int(avail * frac / (per_worker * 3.0)))
+    budget = max(1, int(avail * frac / per_worker))
     n_cpu = _os.cpu_count() or 1
     capped = max(1, min(n_jobs if n_jobs > 0 else n_cpu, budget, n_cpu))
     if capped < n_jobs:
         logger.warning(
-            "- PHEASY_N_JOBS=%d would need ~%.1f GB for the cluster-space copies "
+            "- PHEASY_N_JOBS=%d would need ~%.1f GB for the cluster-space copies + chunk results "
             "but only %.1f GB is available; capping to %d worker(s).",
-            n_jobs, n_jobs * per_worker * 3.0 / 1e9, avail / 1e9, capped,
+            n_jobs, n_jobs * per_worker / 1e9, avail / 1e9, capped,
         )
     return capped
 
@@ -416,7 +421,18 @@ class WorkFlow(object):
                     # 被 OOM-killer 干掉的情况, 日志停在 "N workers." 之后什么
                     # 都没有, 看起来像卡死。这里: 先按可用内存压 n_jobs, 再对
                     # worker 崩溃做串行回退。
-                    _n_jobs = _cap_n_jobs_by_memory(_n_jobs, self.CS_full)
+                    # [C1] per-config block estimate: n_rows x n_cols x
+                    # (8+4 bytes/nnz) x 0.1 density (conservative; observed
+                    # ~0.055 for 2+3-body SM). Feeds the chunk-aware cap.
+                    try:
+                        _per_cfg_bytes = int(
+                            u_matrix.shape[1] * 3
+                            * self.CS_full.total_number_of_ifcs()
+                            * 12 * 0.1)
+                    except Exception:
+                        _per_cfg_bytes = int(64e6)
+                    _n_jobs = _cap_n_jobs_by_memory(
+                        _n_jobs, self.CS_full, len(_u_list), _per_cfg_bytes)
                     if _n_jobs != 1:
                         logger.info(
                             "- Parallel sensing matrix construction: {} workers.".format(_n_jobs)
@@ -428,9 +444,11 @@ class WorkFlow(object):
                             # ~2x SLOWER than serial for 8 configs). Batch configs
                             # into contiguous chunks: CS_full pickled once per
                             # worker instead of once per configuration.
-                            _chunk_size = max(1, int(np.ceil(len(_u_list) / _n_jobs)))
-                            _chunks = [list(_u_list[i:i + _chunk_size])
-                                       for i in range(0, len(_u_list), _chunk_size)]
+                            # [C2] np.array_split gives exactly _n_jobs balanced chunks
+                            # (ceil() can strand workers: ndata=10, n_jobs=8 -> 5 chunks).
+                            _chunks = [list(c) for c in np.array_split(
+                                np.asarray(_u_list, dtype=object), _n_jobs)
+                                if len(c)]
                             _results = Parallel(n_jobs=_n_jobs)(
                                 delayed(_build_sensing_chunk)(self.CS_full, _chunk)
                                 for _chunk in _chunks
