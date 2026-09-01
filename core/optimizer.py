@@ -26,6 +26,30 @@ from sklearn.metrics import (
 )
 from sklearn.model_selection import GroupKFold, KFold
 
+try:
+    from sparse_dot_mkl import dot_product_mkl as _mkl_dot
+except Exception:                                   # pragma: no cover
+    _mkl_dot = None
+
+
+def _sp_mv(M, v):
+    """Sparse matvec, MKL-multithreaded when sparse_dot_mkl is installed.
+
+    scipy's CSR matvec is single-threaded and holds the GIL -- the reason the
+    LSMR fit only showed ~1.9 cores. sparse_dot_mkl wraps mkl_sparse_?_mv
+    (multithreaded, GIL-releasing) over the same CSR layout; a 1-D right-hand
+    side is reshaped to a column and raveled back. Falls back to scipy's plain
+    matmul (and to the native matmul for non-sparse M) when unavailable.
+    """
+    if _mkl_dot is not None and sp.issparse(M):
+        try:
+            out = _mkl_dot(M, np.ascontiguousarray(v).reshape(-1, 1), cast=False)
+            return np.asarray(out).ravel()
+        except Exception:
+            pass
+    return M @ v
+
+
 __all__ = ["Optimizer", "TwoLevelSM"]
 
 
@@ -927,17 +951,35 @@ class TwoLevelSM(LinearOperator):
         self.NS = NS
         dt = dtype if dtype is not None else SM_prime.dtype
         self._dt = dt
+        # Lazily-built CSR transposes. scipy's SM_prime.T is a CSC *view* that
+        # does scatter-write in matvec; a real CSR transpose is read-sequential
+        # and MKL-friendly. Each instance (incl. row_slice children) owns its
+        # own cache, so slicing never reuses a stale transpose.
+        self._SMpT = None
+        self._NST = None
         super().__init__(np.dtype(dt), (SM_prime.shape[0], NS.shape[1]))
+
+    @property
+    def SM_primeT(self):
+        if self._SMpT is None:
+            self._SMpT = self.SM_prime.T.tocsr()
+        return self._SMpT
+
+    @property
+    def NST(self):
+        if self._NST is None:
+            self._NST = self.NS.T.tocsr()
+        return self._NST
 
     def _matvec(self, v):
         v = np.ascontiguousarray(v, dtype=self._dt)
-        t = self.NS @ v
-        return self.SM_prime @ np.ascontiguousarray(t, dtype=self._dt)
+        t = _sp_mv(self.NS, v)
+        return _sp_mv(self.SM_prime, np.ascontiguousarray(t, dtype=self._dt))
 
     def _rmatvec(self, u):
         u = np.ascontiguousarray(u, dtype=self._dt)
-        t = self.SM_prime.T @ u
-        return self.NS.T @ np.ascontiguousarray(t, dtype=self._dt)
+        t = _sp_mv(self.SM_primeT, u)
+        return _sp_mv(self.NST, np.ascontiguousarray(t, dtype=self._dt))
 
     def col_norms(self):
         """Exact ||SM[:, j]|| (the true sensing-matrix column norms)."""
