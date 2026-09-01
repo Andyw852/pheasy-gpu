@@ -954,6 +954,19 @@ class TwoLevelSM(LinearOperator):
         self.NS = NS
         dt = dtype if dtype is not None else SM_prime.dtype
         self._dt = dt
+        # [GPU-SM] optional cuSPARSE SpMV for the SM_prime half (row-split
+        # across PHEASY_GPU_SM_NGPU devices). NS stays on the CPU. Falls
+        # back to the scipy path silently when unavailable.
+        self._gpu_mv = None
+        if os.environ.get("PHEASY_GPU_SM", "0").lower() in ("1", "true", "yes"):
+            try:
+                from pheasy_gpu.core import gpu_backend as _gb
+                self._gpu_mv = _gb.GpuSparseMV(SM_prime)
+                print("[GPU-SM] SpMV on %d device(s), dtype=%s" % (
+                    len(self._gpu_mv._devs), SM_prime.dtype), flush=True)
+            except Exception as _e:
+                print("[GPU-SM] SpMV unavailable (%s); using CPU" % _e, flush=True)
+                self._gpu_mv = None
         # Lazily-built CSR transposes. scipy's SM_prime.T is a CSC *view* that
         # does scatter-write in matvec; a real CSR transpose is read-sequential
         # and MKL-friendly. PHEASY_TWOLEVEL_CACHE_T=0 disables the cache (CV
@@ -983,10 +996,23 @@ class TwoLevelSM(LinearOperator):
     def _matvec(self, v):
         v = np.ascontiguousarray(v, dtype=self._dt)
         t = _sp_mv(self.NS, v)
+        if self._gpu_mv is not None:
+            try:
+                return self._gpu_mv.matvec(t)
+            except Exception as _e:
+                print("[GPU-SM] matvec failed (%s); disabling GPU, CPU fallback" % _e, flush=True)
+                self._gpu_mv = None
         return _sp_mv(self.SM_prime, np.ascontiguousarray(t, dtype=self._dt))
 
     def _rmatvec(self, u):
         u = np.ascontiguousarray(u, dtype=self._dt)
+        if self._gpu_mv is not None:
+            try:
+                t = self._gpu_mv.rmatvec(u)
+                return _sp_mv(self.NST, np.ascontiguousarray(t, dtype=self._dt))
+            except Exception as _e:
+                print("[GPU-SM] rmatvec failed (%s); disabling GPU, CPU fallback" % _e, flush=True)
+                self._gpu_mv = None
         t = _sp_mv(self.SM_primeT, u)
         return _sp_mv(self.NST, np.ascontiguousarray(t, dtype=self._dt))
 

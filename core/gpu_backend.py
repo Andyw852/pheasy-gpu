@@ -58,6 +58,7 @@ __all__ = [
     "GpuLassoCV",
     "GpuRidgeCV",
     "load_sensing_matrix",
+    "GpuSparseMV",
 ]
 
 _torch_mod = None
@@ -877,3 +878,107 @@ def load_sensing_matrix(sm_prime, ns_harm, ns_anharm, n_rows, dtype=np.float64):
         SM = torch.sparse.mm(spt, NSt)
     return _to_numpy(SM, dtype)
 
+
+# ---------------------------------------------------------------------------
+# GPU SpMV for the TwoLevelSM operator (SM_prime row-split across GPUs)
+# ---------------------------------------------------------------------------
+class GpuSparseMV(object):
+    """Row-split SM_prime (+ transpose) across GPUs for TwoLevelSM matvec/rmatvec.
+
+    The memory-heavy half of the TwoLevelSM is SM_prime (6.5-60 GB): matvec is
+    SM_prime @ t, rmatvec is SM_prime.T @ u, while NS@v / NS.T@t stay on the
+    CPU (small). Each device holds a row block of SM_prime (for matvec) and a
+    row block of SM_prime.T (== a column block of SM_prime, for rmatvec), so
+    peak VRAM = 2 x SM size / n_gpu. With 24 GB cards: a 60 GB f32 SM fits on
+    3 cards; the same SM in f64 needs 6.
+
+    Fallback is the CALLER's job: the TwoLevelSM keeps its CPU path and
+    disables the GPU mv if construction or a call raises.
+    """
+
+    def __init__(self, sm_prime, n_gpu=None, device_ids=None):
+        import numpy as np
+        t = _torch()
+        if t is None or not t.cuda.is_available():
+            raise RuntimeError("CUDA unavailable")
+        self._np = np
+        self._t = t
+        self._dt64 = t.float64 if sm_prime.dtype == np.float64 else t.float32
+        self._sm_bytes_val = int(sm_prime.data.nbytes + sm_prime.indices.nbytes)
+        N, M = sm_prime.shape
+        devs = self._pick_devices(device_ids, n_gpu)
+        if not devs:
+            raise RuntimeError("no usable CUDA device")
+        self._devs = devs
+        G = len(devs)
+        self._rs = np.linspace(0, N, G + 1).astype(np.int64)
+        self._cs = np.linspace(0, M, G + 1).astype(np.int64)
+        self._R = []
+        self._T = []
+        for i, d in enumerate(devs):
+            dev = t.device("cuda:%d" % d)
+            Ri = sm_prime[self._rs[i]:self._rs[i + 1]].tocsr()
+            Ti = sm_prime[:, self._cs[i]:self._cs[i + 1]].T.tocsr()
+            self._R.append(self._csr_to_torch(Ri, dev))
+            self._T.append(self._csr_to_torch(Ti, dev))
+
+    def _pick_devices(self, device_ids, n_gpu):
+        import os as _os
+        t = self._t
+        if device_ids is None:
+            raw = _os.environ.get("PHEASY_GPU_SM_DEVICES", "").strip()
+            device_ids = [int(x) for x in raw.split(",")] if raw else None
+        if device_ids is None:
+            device_ids = list(range(t.cuda.device_count()))
+        device_ids = [d for d in device_ids if 0 <= d < t.cuda.device_count()]
+        if not device_ids:
+            return []
+        if n_gpu is None:
+            raw = _os.environ.get("PHEASY_GPU_SM_NGPU", "").strip()
+            n_gpu = int(raw) if raw else None
+        if n_gpu is None or n_gpu <= 0:
+            # auto: 2x SM size (matrix + transpose) over ~20 GB usable/card
+            n_gpu = max(1, int(np.ceil(2.0 * self._sm_bytes_val / 20.0e9)))
+        n_gpu = min(n_gpu, len(device_ids))
+        return device_ids[:n_gpu]
+
+    def _csr_to_torch(self, m, dev):
+        t = self._t
+        crow = t.as_tensor(m.indptr, dtype=t.int32, device=dev)
+        ccol = t.as_tensor(m.indices, dtype=t.int32, device=dev)
+        cval = t.as_tensor(m.data, dtype=self._dt64, device=dev)
+        return t.sparse_csr_tensor(crow, ccol, cval, size=m.shape,
+                                   dtype=self._dt64, device=dev)
+
+    def matvec(self, x):
+        """SM_prime @ x -> (N,) numpy f64. x: (M,) numpy."""
+        t = self._t
+        np = self._np
+        x0 = np.ascontiguousarray(x, dtype=np.float64)
+        parts = []
+        for i, R in enumerate(self._R):
+            xi = t.as_tensor(x0, dtype=self._dt64, device=self._devs[i])
+            yi = t.sparse.mm(R, xi.unsqueeze(1)).flatten()
+            parts.append(yi.cpu().numpy().astype(np.float64))
+        return np.concatenate(parts)
+
+    def rmatvec(self, u):
+        """SM_prime.T @ u -> (M,) numpy f64. u: (N,) numpy."""
+        t = self._t
+        np = self._np
+        u0 = np.ascontiguousarray(u, dtype=np.float64)
+        parts = []
+        for i, T in enumerate(self._T):
+            ui = t.as_tensor(u0, dtype=self._dt64, device=self._devs[i])
+            ti = t.sparse.mm(T, ui.unsqueeze(1)).flatten()
+            parts.append(ti.cpu().numpy().astype(np.float64))
+        return np.concatenate(parts)
+
+    def close(self):
+        t = self._t
+        try:
+            for R, T in zip(self._R, self._T):
+                del R, T
+            t.cuda.empty_cache()
+        except Exception:
+            pass
