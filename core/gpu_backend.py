@@ -704,22 +704,55 @@ class GpuRidgeCV(object):
             print("[GPU] RIDGE CV fold-parallel on %d device(s); fold footprint "
                   "~%.2f GB" % (len(devs), footprint / 1e9), flush=True)
 
-        def _fold(k, dev):
-            tr, va = splits[k]
-            d = torch.device("cuda:%d" % dev)
-            At = torch.as_tensor(A64[tr], dtype=torch.float64, device=d)
-            yt = torch.as_tensor(y64[tr], dtype=torch.float64, device=d)
-            Ava = torch.as_tensor(A64[va], dtype=torch.float64, device=d)
-            yva = torch.as_tensor(y64[va], dtype=torch.float64, device=d)
-            U, S, Vh = torch.linalg.svd(At, full_matrices=False)
-            Uty = U.T @ yt
+        # [M2] pre-slice fold arrays in the PARENT: numpy fancy indexing
+        # (A64[tr]) holds the GIL, so doing it per-thread serialized the
+        # parallel SVD work. Cost: all folds' slices resident in host RAM
+        # (~cv x n_train x m x 8; c7 5-fold ~3 GB -- acceptable).
+        pre_sliced = [
+            (np.ascontiguousarray(A64[tr]), np.ascontiguousarray(y64[tr]),
+             np.ascontiguousarray(A64[va]), np.ascontiguousarray(y64[va]))
+            for tr, va in splits
+        ]
+
+        def _fold_cpu(k):
+            Atr, ytr, Ava, yva = pre_sliced[k]
+            U, S, Vh = np.linalg.svd(Atr, full_matrices=False)
+            Uty = U.T @ ytr
             AvV = Ava @ Vh.T                  # A_va @ V  (Vh = V^H; real -> V^T)
             col = np.empty(len(alphas), dtype=np.float64)
             for j, a in enumerate(alphas):
-                a = float(a)
-                pred = AvV @ ((S / (S * S + a)) * Uty)
-                col[j] = float(((pred - yva) ** 2).mean().item())
+                pred = AvV @ ((S / (S * S + float(a))) * Uty)
+                col[j] = float(((pred - yva) ** 2).mean())
             return col
+
+        def _fold(k, dev):
+            Atr, ytr, Ava, yva = pre_sliced[k]
+            # [M1] torch's CURRENT device is thread-local and inherits cuda:0;
+            # cuSOLVER handles/workspace follow the current device, so pin the
+            # thread to the fold's device (avoids wrong-device workspace).
+            # [M3] the VRAM guard is a snapshot; on a shared box another job can
+            # grab VRAM in between -- fall back to a CPU fold instead of failing
+            # the whole CV ("a slow fold beats a dead fit").
+            try:
+                with torch.cuda.device(dev):
+                    d = torch.device("cuda:%d" % dev)
+                    At = torch.as_tensor(Atr, dtype=torch.float64, device=d)
+                    yt = torch.as_tensor(ytr, dtype=torch.float64, device=d)
+                    Avat = torch.as_tensor(Ava, dtype=torch.float64, device=d)
+                    yvat = torch.as_tensor(yva, dtype=torch.float64, device=d)
+                    U, S, Vh = torch.linalg.svd(At, full_matrices=False)
+                    Uty = U.T @ yt
+                    AvV = Avat @ Vh.T         # A_va @ V  (Vh = V^H; real -> V^T)
+                    col = np.empty(len(alphas), dtype=np.float64)
+                    for j, a in enumerate(alphas):
+                        pred = AvV @ ((S / (S * S + float(a))) * Uty)
+                        col[j] = float(((pred - yvat) ** 2).mean().item())
+                    return col
+            except torch.cuda.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                print("[GPU] RIDGE CV fold %d OOM on cuda:%d; falling back to "
+                      "CPU (shared box?)" % (k, dev), flush=True)
+                return _fold_cpu(k)
 
         if len(devs) > 1:
             from concurrent.futures import ThreadPoolExecutor

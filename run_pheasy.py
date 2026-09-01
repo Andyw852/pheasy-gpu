@@ -55,6 +55,18 @@ def _build_sensing_matrix_sparse(CS_full, u):
         return _mat.tocsr().astype(_dt, copy=False)
     return _sp.csr_matrix(_mat.astype(_dt, copy=False))
 
+
+def _build_sensing_chunk(CS_full, u_chunk):
+    """Worker-side batch wrapper: build several configs in one task.
+
+    joblib re-pickles the task args per task, and CS_full's pickle is ~100 MB,
+    so a per-config task granularity made the parent's serial pickling the
+    wall-clock bottleneck -- measured 239 s for 8 configs vs ~121 s serial
+    (Parallel ~2x SLOWER). Batching configs into contiguous chunks pickles
+    CS_full once per worker instead of once per configuration.
+    """
+    return [_build_sensing_matrix_sparse(CS_full, u) for u in u_chunk]
+
 from pheasy_gpu.core.forces import read_interatomic_forces, read_interatomic_forces_aimd
 try:  # [PATCH sm-dtype]
     from .core.utilities import get_sm_dtype as _sm_dtype
@@ -410,11 +422,21 @@ class WorkFlow(object):
                             "- Parallel sensing matrix construction: {} workers.".format(_n_jobs)
                         )
                         try:
+                            # [FIX] joblib re-pickles task args per task; CS_full's
+                            # pickle is ~100 MB, so per-config granularity made the
+                            # parent's serial pickling dominate (Parallel measured
+                            # ~2x SLOWER than serial for 8 configs). Batch configs
+                            # into contiguous chunks: CS_full pickled once per
+                            # worker instead of once per configuration.
+                            _chunk_size = max(1, int(np.ceil(len(_u_list) / _n_jobs)))
+                            _chunks = [list(_u_list[i:i + _chunk_size])
+                                       for i in range(0, len(_u_list), _chunk_size)]
                             _results = Parallel(n_jobs=_n_jobs)(
-                                delayed(_build_sensing_matrix_sparse)(self.CS_full, _u)
-                                for _u in _u_list
+                                delayed(_build_sensing_chunk)(self.CS_full, _chunk)
+                                for _chunk in _chunks
                             )
-                            sensing_mat_list.extend(_results)
+                            for _res in _results:
+                                sensing_mat_list.extend(_res)
                         except Exception as _e:
                             logger.error(
                                 "- Parallel sensing-matrix workers failed (%s: %s). "
