@@ -567,7 +567,10 @@ class WorkFlow(object):
             print(f'[SM] vstack done in {_t_sm.time()-_t0:.1f}s: '
                   f'shape={self.SM_prime.shape}, nnz={self.SM_prime.nnz}, '
                   f'mem={_mem:.2f} GB (f32 sparse CSR)', flush=True)
-            spmat.save_npz(self.SensingMatrixFile, self.SM_prime)
+            # [FIX save-speed] compressed=npz runs zlib on 30+ GB of SM data;
+            # on a loaded shared box that takes hours. Store uncompressed
+            # (load_npz handles both; the fit re-materializes the same CSR).
+            spmat.save_npz(self.SensingMatrixFile, self.SM_prime, compressed=False)
 
             end_time_sub = datetime.datetime.now()
             time_cost = end_time_sub - start_time_sub
