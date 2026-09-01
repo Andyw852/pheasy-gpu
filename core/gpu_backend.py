@@ -950,17 +950,30 @@ class GpuSparseMV(object):
         return t.sparse_csr_tensor(crow, ccol, cval, size=m.shape,
                                    dtype=self._dt64, device=dev)
 
-    def matvec(self, x):
-        """SM_prime @ x -> (N,) numpy f64. x: (M,) numpy."""
+    def _mv_blocks(self, blocks, x0):
+        """blocks[i] @ x0 on each device; torch.sparse.mm on the big 699-SM
+        blocks segfaults after ~300 calls (CSR beta bug); R @ xi (the @
+        dispatch) is stable and periodic empty_cache releases the caching
+        allocator so the fit survives 10k+ calls."""
         t = self._t
         np = self._np
-        x0 = np.ascontiguousarray(x, dtype=np.float64)
         parts = []
-        for i, R in enumerate(self._R):
+        for i, B in enumerate(blocks):
             xi = t.as_tensor(x0, dtype=self._dt64, device=self._devs[i])
-            yi = t.sparse.mm(R, xi.unsqueeze(1)).flatten()
+            yi = B @ xi
             parts.append(yi.cpu().numpy().astype(np.float64))
+        self._n_calls = getattr(self, "_n_calls", 0) + 1
+        if self._n_calls % 50 == 0:
+            t.cuda.empty_cache()
         return np.concatenate(parts)
+
+    def matvec(self, x):
+        """SM_prime @ x -> (N,) numpy f64. x: (M,) numpy."""
+        return self._mv_blocks(self._R, np.ascontiguousarray(x, dtype=np.float64))
+
+    def rmatvec(self, u):
+        """SM_prime.T @ u -> (M,) numpy f64. u: (N,) numpy."""
+        return self._mv_blocks(self._T, np.ascontiguousarray(u, dtype=np.float64))
 
     def rmatvec(self, u):
         """SM_prime.T @ u -> (M,) numpy f64. u: (N,) numpy."""
