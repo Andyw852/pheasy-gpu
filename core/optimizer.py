@@ -41,12 +41,15 @@ def _sp_mv(M, v):
     side is reshaped to a column and raveled back. Falls back to scipy's plain
     matmul (and to the native matmul for non-sparse M) when unavailable.
     """
-    if _mkl_dot is not None and sp.issparse(M):
+    if _mkl_dot is not None and sp.issparse(M) and getattr(M, "_mkl_ok", True):
         try:
             out = _mkl_dot(M, np.ascontiguousarray(v).reshape(-1, 1), cast=False)
             return np.asarray(out).ravel()
-        except Exception:
-            pass
+        except Exception as e:
+            M._mkl_ok = False
+            print("[sp_mv] MKL unavailable for %s dtype=%s idx=%s (%s); "
+                  "falling back to scipy"
+                  % (M.shape, M.dtype, M.indices.dtype, e), flush=True)
     return M @ v
 
 
@@ -953,20 +956,26 @@ class TwoLevelSM(LinearOperator):
         self._dt = dt
         # Lazily-built CSR transposes. scipy's SM_prime.T is a CSC *view* that
         # does scatter-write in matvec; a real CSR transpose is read-sequential
-        # and MKL-friendly. Each instance (incl. row_slice children) owns its
-        # own cache, so slicing never reuses a stale transpose.
+        # and MKL-friendly. PHEASY_TWOLEVEL_CACHE_T=0 disables the cache (CV
+        # under tight memory) and reverts to the CSC view.
+        self._cache_T = os.environ.get("PHEASY_TWOLEVEL_CACHE_T", "1").lower() \
+            not in ("0", "false", "off")
         self._SMpT = None
         self._NST = None
         super().__init__(np.dtype(dt), (SM_prime.shape[0], NS.shape[1]))
 
     @property
     def SM_primeT(self):
+        if not self._cache_T:
+            return self.SM_prime.T
         if self._SMpT is None:
             self._SMpT = self.SM_prime.T.tocsr()
         return self._SMpT
 
     @property
     def NST(self):
+        if not self._cache_T:
+            return self.NS.T
         if self._NST is None:
             self._NST = self.NS.T.tocsr()
         return self._NST
@@ -991,8 +1000,16 @@ class TwoLevelSM(LinearOperator):
         This is O(nnz(SM_prime[rows])) per matvec instead of the full
         O(nnz(SM_prime)) that the generic _row_slice_op wrapper pays, so a
         K-fold CV costs ~1x the full problem rather than ~Kx.
+
+        NS is unchanged by slicing, so the child shares the parent's cached
+        NST (built once) instead of rebuilding a redundant copy per fold.
+        SM_primeT stays per-child because each fold slices different rows.
         """
-        return TwoLevelSM(self.SM_prime[rows], self.NS, dtype=self._dt)
+        child = TwoLevelSM(self.SM_prime[rows], self.NS, dtype=self._dt)
+        if self._cache_T:
+            self.NST                     # force-build the shared NS transpose
+            child._NST = self._NST
+        return child
 
     def to_dense(self):
         return _to_dense_f64(self)
