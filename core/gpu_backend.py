@@ -937,8 +937,11 @@ class GpuSparseMV(object):
             raw = _os.environ.get("PHEASY_GPU_SM_NGPU", "").strip()
             n_gpu = int(raw) if raw else None
         if n_gpu is None or n_gpu <= 0:
-            # auto: 2x SM size (matrix + transpose) over ~20 GB usable/card
-            n_gpu = max(1, int(np.ceil(2.0 * self._sm_bytes_val / 20.0e9)))
+            # auto: 2x SM size (matrix + transpose) over ~20 GB usable/card.
+            # [FIX torch-stability] multi-GPU CSR @ dense segfaults after ~300
+            # calls with 7 devices on the 699-SM blocks (540M nnz, wide T_i);
+            # 5 devices is verified stable (1000-iter LSMR), so cap there.
+            n_gpu = min(5, max(1, int(np.ceil(2.0 * self._sm_bytes_val / 20.0e9))))
         n_gpu = min(n_gpu, len(device_ids))
         return device_ids[:n_gpu]
 
