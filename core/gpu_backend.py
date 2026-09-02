@@ -948,12 +948,12 @@ class GpuSparseMV(object):
             # 7 on the Si fixture before raising the cap (R2).
             n_gpu = min(5, max(1, int(np.ceil(2.0 * self._sm_bytes_val / 20.0e9))))
         if device_ids is None:
-            raw = _os.environ.get("PHEASY_GPU_SM_DEVICES", "").strip()
-            device_ids = [int(x) for x in raw.split(",")] if raw else None
-        if device_ids is None:
             # [R1] like GpuRidgeCV._multi_gpu_devices: only cards with enough
-            # usable free VRAM (a busy shared card would OOM mid-fit).
-            _per_card = max(1, int(2.0 * self._sm_bytes_val / max(1, n_gpu)))
+            # usable free VRAM (a busy shared card caused silent crashes --
+            # the 7/5-card instability was card CONTENTION with vasp/gmx, not
+            # a torch bug: 9/9 pass on free cards). Absolute 1 GB floor so a
+            # small SM does not land on a busy card.
+            _per_card = max(1 << 30, int(2.0 * self._sm_bytes_val / max(1, n_gpu)))
             device_ids = _multi_gpu_devices(min_free_bytes=_per_card)
         device_ids = [d for d in device_ids if 0 <= d < t.cuda.device_count()]
         if not device_ids:
