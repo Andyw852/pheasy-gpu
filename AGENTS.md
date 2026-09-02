@@ -35,6 +35,17 @@ RIDGE. Local editable install runs under the `atomate2_p_a` conda env.
 - **JS template literals in run_code mangle `\n`** into real newlines when
   writing Python files — use `String.raw` or an array-join so Python string
   literals keep their escapes.
+- **Supercell atom order: ASE `repeat()` ≠ pheasy `create_supercell()`.**
+  pheasy orders atoms as per-primitive-atom blocks (all images of primitive
+  atom 0, then all of atom 1, ...), each block in the `ndindex(*dim[::-1])`
+  translation order; ASE's `Atoms.repeat()` interleaves per image. Displacement/
+  force data prepared with ASE's ordering therefore scrambles every atom except
+  the first (identical in both: the origin image). Symptom: the on-site IFC fits
+  (it involves only atom 0) but the fit residual is ~50% with per-config
+  correlation ~0.8 (not ~0.999). C60Mg2's box data is aligned (corr 0.9997); a
+  fresh Si test hit this (54% -> 0.13% after regenerating the data in the
+  pheasy order). Verify any new dataset with the per-config residual check
+  (compare `SM[cfg rows] @ coef` vs the cfg's forces).
 
 ## Data / tools
 

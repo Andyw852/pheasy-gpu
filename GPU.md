@@ -225,3 +225,20 @@ LASSO diff, add `PHEASY_GPU_LASSO=0` to both runs.
 * FP64 throughput on a consumer 3090 is ~1/64 of FP32, but the dense fits here
   are still 10-60x faster than the single-machine CPU LAPACK path.
 
+
+
+## Data preparation gotcha: supercell atom order
+
+pheasy's `create_supercell` orders supercell atoms as per-primitive-atom blocks
+(all images of primitive atom 0, then all of atom 1, ...), each block in the
+`ndindex(*dim[::-1])` translation order. ASE's `Atoms.repeat()` interleaves per
+image. Displacement/force data prepared with ASE's ordering scrambles every
+atom except the first (identical in both: the origin image).
+
+Symptom: the on-site IFC fits (it only involves atom 0) but the fit residual is
+~50% with per-config correlation ~0.8 instead of ~0.999. C60Mg2's box data is
+aligned (corr 0.9997); a fresh Si test hit this (54% -> 0.13% after
+regenerating the data in the pheasy order).
+
+Verify any new dataset with the per-config residual check
+(`SM[cfg rows] @ coef` vs the config's forces): corr < 0.99 is a red flag.
