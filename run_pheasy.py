@@ -1380,6 +1380,33 @@ class WorkFlow(object):
                 np.savez_compressed(self.ForceConstantArrayFile, Phi=Phi)
                 FC_model.set_force_constants(Phi)
 
+            # [fit-alignment] post-fit sanity: the model must reproduce the
+            # forces config-by-config. corr < 0.99 = atom-order mismatch
+            # (pheasy groups supercell atoms per primitive atom; ASE
+            # repeat() interleaves per image -- see AGENTS.md). Cheap.
+            try:
+                if spmat.issparse(SM_prime) and Phi is not None and FM is not None:
+                    _n3 = 3 * natoms
+                    _n_cfg = SM_prime.shape[0] // _n3
+                    _worst = 1.0
+                    for _k in np.linspace(0, _n_cfg - 1, min(5, _n_cfg)).astype(int):
+                        _r = slice(int(_k) * _n3, (int(_k) + 1) * _n3)
+                        _fp = SM_prime[_r] @ Phi
+                        _fa = FM[_r]
+                        _c = float(np.corrcoef(_fa, _fp)[0, 1])
+                        _worst = min(_worst, _c)
+                        if _c < 0.99:
+                            logger.warning("[fit] config %d corr=%.4f -- possible "
+                                          "supercell atom-order mismatch" % (_k, _c))
+                    if _worst < 0.99:
+                        logger.error("[fit] ALIGNMENT CHECK FAILED (worst corr=%.4f); "
+                                     "fit meaningless -- check the atom order" % _worst)
+                    else:
+                        logger.info("[fit] alignment check OK (worst corr=%.4f over %d "
+                                    "sampled configs)" % (_worst, min(5, _n_cfg)))
+            except Exception as _e:
+                logger.info("[fit] alignment check skipped: %s" % _e)
+
             # [FIX P22] phi.npz (written just above) already carries the full
             # IFC vector; fc*.hdf5 is only its expansion over atom triplets and
             # costs O(natoms^order) memory. Skip it for parameter sweeps.

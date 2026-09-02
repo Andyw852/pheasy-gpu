@@ -16,6 +16,15 @@ The displacement array may hold either
 The corresponding residual forces of the reference frame are subtracted from
 every configuration unless ``--no-subtract-residual`` is given.
 
+.. warning::
+   The input arrays MUST be in the SPOSCAR atom order. A pheasy-generated
+   SPOSCAR uses create_supercell order (per-primitive-atom blocks: all
+   images of primitive atom 0, then atom 1, ...); ASE Atoms.repeat()
+   interleaves per image instead, and data prepared that way silently
+   scrambles every atom but the first (the origin image). The fit then
+   looks sane for the on-site IFC yet carries a ~50% residual --
+   run_pheasy now prints a post-fit corr check that flags it (AGENTS.md).
+
 Usage
 -----
     python3 tools/prepare_dataset.py SPOSCAR dataset_disps.npy dataset_forces.npy --frac
@@ -50,6 +59,14 @@ def main():
 
     d = np.load(args.disps_npy)
     f = np.load(args.forces_npy)
+    # the atom count must match the SPOSCAR (order too -- see docstring)
+    try:
+        _n_spos = sum(int(x) for x in open(args.sposcar).read().splitlines()[6].split())
+        if _n_spos != d.shape[1]:
+            raise SystemExit("SPOSCAR has %d atoms but the dataset has %d; "
+                             "atom order/count must match the SPOSCAR" % (_n_spos, d.shape[1]))
+    except (IndexError, ValueError):
+        print("warning: could not parse the SPOSCAR atom count; skipping check")
     if d.shape != f.shape or d.ndim != 3 or d.shape[2] != 3:
         raise SystemExit("expected matching (ndata, natoms, 3) arrays, got "
                          "%s and %s" % (d.shape, f.shape))
