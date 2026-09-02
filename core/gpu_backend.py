@@ -889,8 +889,7 @@ class GpuSparseMV(object):
     SM_prime @ t, rmatvec is SM_prime.T @ u, while NS@v / NS.T@t stay on the
     CPU (small). Each device holds a row block of SM_prime (for matvec) and a
     row block of SM_prime.T (== a column block of SM_prime, for rmatvec), so
-    peak VRAM = 2 x SM size / n_gpu. With 24 GB cards: a 60 GB f32 SM fits on
-    3 cards; the same SM in f64 needs 6.
+    peak VRAM = 2 x SM size / n_gpu.
 
     Fallback is the CALLER's job: the TwoLevelSM keeps its CPU path and
     disables the GPU mv if construction or a call raises.
@@ -915,12 +914,17 @@ class GpuSparseMV(object):
         self._cs = np.linspace(0, M, G + 1).astype(np.int64)
         self._R = []
         self._T = []
+        # [B3] one transpose pass, then row-slice: column-slicing a CSR
+        # makes scipy convert to CSC per block (expensive on 540M-nnz).
+        smT = sm_prime.T.tocsr()
         for i, d in enumerate(devs):
             dev = t.device("cuda:%d" % d)
             Ri = sm_prime[self._rs[i]:self._rs[i + 1]].tocsr()
-            Ti = sm_prime[:, self._cs[i]:self._cs[i + 1]].T.tocsr()
+            Ti = smT[self._cs[i]:self._cs[i + 1]].tocsr()
             self._R.append(self._csr_to_torch(Ri, dev))
             self._T.append(self._csr_to_torch(Ti, dev))
+            del Ri, Ti
+        del smT
 
     def _pick_devices(self, device_ids, n_gpu):
         import os as _os
@@ -938,9 +942,9 @@ class GpuSparseMV(object):
             n_gpu = int(raw) if raw else None
         if n_gpu is None or n_gpu <= 0:
             # auto: 2x SM size (matrix + transpose) over ~20 GB usable/card.
-            # [FIX torch-stability] multi-GPU CSR @ dense segfaults after ~300
-            # calls with 7 devices on the 699-SM blocks (540M nnz, wide T_i);
-            # 5 devices is verified stable (1000-iter LSMR), so cap there.
+            # [FIX torch-stability] 7-device CSR @ dense segfaulted after ~300
+            # calls; B1 (rmatvec was still bare sparse.mm) is fixed, so retry
+            # 7; cap at 5 remains a safety net pending re-test.
             n_gpu = min(5, max(1, int(np.ceil(2.0 * self._sm_bytes_val / 20.0e9))))
         n_gpu = min(n_gpu, len(device_ids))
         return device_ids[:n_gpu]
@@ -954,17 +958,20 @@ class GpuSparseMV(object):
                                    dtype=self._dt64, device=dev)
 
     def _mv_blocks(self, blocks, x0):
-        """blocks[i] @ x0 on each device; torch.sparse.mm on the big 699-SM
-        blocks segfaults after ~300 calls (CSR beta bug); R @ xi (the @
-        dispatch) is stable and periodic empty_cache releases the caching
-        allocator so the fit survives 10k+ calls."""
+        """blocks[i] @ x0 on each device.
+
+        [B2] enqueue ALL devices first, then collect: yi.cpu() inside the loop
+        synced per block and serialized the cards. torch.sparse.mm segfaults on
+        the 540M-nnz blocks after ~300 calls; the R @ xi dispatch is stable and
+        periodic empty_cache releases the caching allocator for 10k+ calls.
+        """
         t = self._t
         np = self._np
-        parts = []
+        ys = []
         for i, B in enumerate(blocks):
             xi = t.as_tensor(x0, dtype=self._dt64, device=self._devs[i])
-            yi = B @ xi
-            parts.append(yi.cpu().numpy().astype(np.float64))
+            ys.append(B @ xi)
+        parts = [y.cpu().numpy().astype(np.float64) for y in ys]
         self._n_calls = getattr(self, "_n_calls", 0) + 1
         if self._n_calls % 50 == 0:
             t.cuda.empty_cache()
@@ -978,23 +985,12 @@ class GpuSparseMV(object):
         """SM_prime.T @ u -> (M,) numpy f64. u: (N,) numpy."""
         return self._mv_blocks(self._T, np.ascontiguousarray(u, dtype=np.float64))
 
-    def rmatvec(self, u):
-        """SM_prime.T @ u -> (M,) numpy f64. u: (N,) numpy."""
-        t = self._t
-        np = self._np
-        u0 = np.ascontiguousarray(u, dtype=np.float64)
-        parts = []
-        for i, T in enumerate(self._T):
-            ui = t.as_tensor(u0, dtype=self._dt64, device=self._devs[i])
-            ti = t.sparse.mm(T, ui.unsqueeze(1)).flatten()
-            parts.append(ti.cpu().numpy().astype(np.float64))
-        return np.concatenate(parts)
-
     def close(self):
+        """Release the GPU tensors (clear the lists, not just loop vars)."""
         t = self._t
         try:
-            for R, T in zip(self._R, self._T):
-                del R, T
+            self._R.clear()
+            self._T.clear()
             t.cuda.empty_cache()
         except Exception:
             pass
