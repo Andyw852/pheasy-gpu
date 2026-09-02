@@ -943,10 +943,12 @@ class GpuSparseMV(object):
             n_gpu = int(raw) if raw else None
         if n_gpu is None or n_gpu <= 0:
             # auto: 2x SM size (matrix + transpose) over ~20 GB usable/card.
-            # [FIX torch-stability] 7-device CSR @ dense segfaulted after ~300
-            # calls; B1 (rmatvec was still bare sparse.mm) is fixed -- retest
-            # 7 on the Si fixture before raising the cap (R2).
-            n_gpu = min(5, max(1, int(np.ceil(2.0 * self._sm_bytes_val / 20.0e9))))
+            # No device-count cap: the multi-card instability was card
+            # CONTENTION (sharing a busy vasp/gmx/af3 card SIGTERMs the run
+            # -- verified: C60Mg2 7g with the busy GPU 6 died exit 143, the
+            # same test on free cards 0-5 finished exit 0), not a torch bug.
+            # The free-VRAM filter below keeps us off busy cards.
+            n_gpu = max(1, int(np.ceil(2.0 * self._sm_bytes_val / 20.0e9)))
         if device_ids is None:
             # [R1] like GpuRidgeCV._multi_gpu_devices: only cards with enough
             # usable free VRAM (a busy shared card caused silent crashes --
