@@ -914,13 +914,15 @@ class GpuSparseMV(object):
         self._cs = np.linspace(0, M, G + 1).astype(np.int64)
         self._R = []
         self._T = []
-        # [B3] one transpose pass, then row-slice: column-slicing a CSR
-        # makes scipy convert to CSC per block (expensive on 540M-nnz).
-        smT = sm_prime.T.tocsr()
+        # [low-mem] per-block column slices instead of one full transpose:
+        # building smT = SM_prime.T.tocsr() transiently doubles the ~60 GB SM
+        # in host RAM and OOM-killed the 699-config fit at ~185 GB on the
+        # shared box (exit 137, three times). Column slices are ~97 s per
+        # 13275-col block (8 min total vs the transpose) but peak ~75 GB.
         for i, d in enumerate(devs):
             dev = t.device("cuda:%d" % d)
             Ri = sm_prime[self._rs[i]:self._rs[i + 1]].tocsr()
-            Ti = smT[self._cs[i]:self._cs[i + 1]].tocsr()
+            Ti = sm_prime[:, self._cs[i]:self._cs[i + 1]].T.tocsr()
             # [X2/M1] pin the thread-local current device while creating the
             # sparse tensors: cuSPARSE handles/workspace follow the current
             # device, and the allocator bookkeeping is per-current-device.
@@ -928,7 +930,6 @@ class GpuSparseMV(object):
                 self._R.append(self._csr_to_torch(Ri, dev))
                 self._T.append(self._csr_to_torch(Ti, dev))
             del Ri, Ti
-        del smT
 
     def _pick_devices(self, device_ids, n_gpu):
         import os as _os
