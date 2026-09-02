@@ -1405,7 +1405,8 @@ class WorkFlow(object):
                         logger.info("[fit] alignment check OK (worst corr=%.4f over %d "
                                     "sampled configs)" % (_worst, min(5, _n_cfg)))
             except Exception as _e:
-                logger.info("[fit] alignment check skipped: %s" % _e)
+                logger.warning("[fit] alignment check could NOT run (%s) -- "
+                              "atom order UNVERIFIED" % _e)
 
             # [FIX P22] phi.npz (written just above) already carries the full
             # IFC vector; fc*.hdf5 is only its expansion over atom triplets and

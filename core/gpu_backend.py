@@ -932,20 +932,28 @@ class GpuSparseMV(object):
         if device_ids is None:
             raw = _os.environ.get("PHEASY_GPU_SM_DEVICES", "").strip()
             device_ids = [int(x) for x in raw.split(",")] if raw else None
-        if device_ids is None:
-            device_ids = list(range(t.cuda.device_count()))
-        device_ids = [d for d in device_ids if 0 <= d < t.cuda.device_count()]
-        if not device_ids:
-            return []
+        # resolve n_gpu first so the per-card VRAM need is known before
+        # filtering the device list.
         if n_gpu is None:
             raw = _os.environ.get("PHEASY_GPU_SM_NGPU", "").strip()
             n_gpu = int(raw) if raw else None
         if n_gpu is None or n_gpu <= 0:
             # auto: 2x SM size (matrix + transpose) over ~20 GB usable/card.
             # [FIX torch-stability] 7-device CSR @ dense segfaulted after ~300
-            # calls; B1 (rmatvec was still bare sparse.mm) is fixed, so retry
-            # 7; cap at 5 remains a safety net pending re-test.
+            # calls; B1 (rmatvec was still bare sparse.mm) is fixed -- retest
+            # 7 on the Si fixture before raising the cap (R2).
             n_gpu = min(5, max(1, int(np.ceil(2.0 * self._sm_bytes_val / 20.0e9))))
+        if device_ids is None:
+            raw = _os.environ.get("PHEASY_GPU_SM_DEVICES", "").strip()
+            device_ids = [int(x) for x in raw.split(",")] if raw else None
+        if device_ids is None:
+            # [R1] like GpuRidgeCV._multi_gpu_devices: only cards with enough
+            # usable free VRAM (a busy shared card would OOM mid-fit).
+            _per_card = max(1, int(2.0 * self._sm_bytes_val / max(1, n_gpu)))
+            device_ids = _multi_gpu_devices(min_free_bytes=_per_card)
+        device_ids = [d for d in device_ids if 0 <= d < t.cuda.device_count()]
+        if not device_ids:
+            return []
         n_gpu = min(n_gpu, len(device_ids))
         return device_ids[:n_gpu]
 
