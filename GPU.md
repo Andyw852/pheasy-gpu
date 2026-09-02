@@ -242,3 +242,35 @@ regenerating the data in the pheasy order).
 
 Verify any new dataset with the per-config residual check
 (`SM[cfg rows] @ coef` vs the config's forces): corr < 0.99 is a red flag.
+
+
+## Methodology lessons (hard-won, 2026-09)
+
+* **Synthetic-data self-consistency is a blind spot.** `F = SM @ coef` is in
+  the column space BY CONSTRUCTION, so lstsq always recovers it to ~1e-15 --
+  it never tests the displacement/force READ-IN path (config order, atom
+  order, units). A real misalignment shows as "on-site IFC fits but the
+  residual is ~50% with per-config corr ~0.8" -- the supercell atom-order
+  trap above. The post-fit corr check in run_pheasy.py flags it on the first
+  fit (worst corr < 0.99 = warning; the check itself failing = UNVERIFIED).
+* **Three-way controlled experiment (serial / per-config / chunked) is the
+  only way to separate dispatch overhead from kernel cost.** Without it, the
+  COO build's 13.4x per-config would have been misread as 1.0x wall-clock (the
+  per-config joblib dispatch re-pickled CS_full per task and ate the win).
+* **An unconverged Krylov solve amplifies ~1e-14 matvec perturbations to
+  ~1e-3.** Truncated-iteration comparisons are meaningless; any ~1e-12-level
+  verification must first let LSMR converge (or use P2 Jacobi,
+  PHEASY_OLS_JACOBI=1).
+* **Reference-solution certification bounds.** A KKT residual certifies to
+  ~1e-9, but the coef error is only bounded to ~2.6e-4 -- do not quote
+  tighter agreement than the certification warrants.
+* **SIGTERM (exit 143) means someone ran kill -15, NOT GPU contention.** On
+  this shared box, another user's job (caier/zls gmx mdrun etc.) starting on
+  a card my process uses SIGTERMs it (device faults give Xid/segfaults
+  instead). Verified with a fully-detached (setsid) test: busy card died 143,
+  the free-card control finished exit 0. Use only free cards
+  (PHEASY_GPU_SM_DEVICES + the free-VRAM filter in _pick_devices).
+* **A 60 GB SM needs ~140 GB RSS to build the GPU blocks** (per-block column
+  slices) or ~185 GB with the full-transpose path -- the kernel OOM killer
+  (exit 137) strikes on the shared box unless the construction is memory-lean
+  (see GpuSparseMV __init__).
