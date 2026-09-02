@@ -346,6 +346,22 @@ class WorkFlow(object):
                 )
                 CS_full = ClusterSpace.read(self.ClusterSpaceFile)
                 CS_full.print_cluster_space_info()
+            else:
+                # [FIX] fresh system without a cached cluster-space file:
+                # generate it instead of crashing on the unbound CS_full.
+                logger.info(
+                    "Cluster space file not found; generating fresh "
+                    + f"up to {settings.MAX_ORDER}-order."
+                )
+                CS_generator = CSGenerator(
+                    self.nn_list,
+                    self.scell.symops,
+                    settings.MAX_ORDER,
+                    self.cutoffs,
+                    settings.NBODY,
+                )
+                CS_full = CS_generator.generate_represent_clusters_with_orbit()
+                CS_full.write(self.ClusterSpaceFile)
 
         self.CS_full = CS_full
 
