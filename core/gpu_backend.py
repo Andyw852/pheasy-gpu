@@ -921,8 +921,12 @@ class GpuSparseMV(object):
             dev = t.device("cuda:%d" % d)
             Ri = sm_prime[self._rs[i]:self._rs[i + 1]].tocsr()
             Ti = smT[self._cs[i]:self._cs[i + 1]].tocsr()
-            self._R.append(self._csr_to_torch(Ri, dev))
-            self._T.append(self._csr_to_torch(Ti, dev))
+            # [X2/M1] pin the thread-local current device while creating the
+            # sparse tensors: cuSPARSE handles/workspace follow the current
+            # device, and the allocator bookkeeping is per-current-device.
+            with t.cuda.device(d):
+                self._R.append(self._csr_to_torch(Ri, dev))
+                self._T.append(self._csr_to_torch(Ti, dev))
             del Ri, Ti
         del smT
 
@@ -972,14 +976,23 @@ class GpuSparseMV(object):
         synced per block and serialized the cards. torch.sparse.mm segfaults on
         the 540M-nnz blocks after ~300 calls; the R @ xi dispatch is stable and
         periodic empty_cache releases the caching allocator for 10k+ calls.
+        [X2/M1] pin the per-card current device during enqueue AND collect (the
+        allocator stream bookkeeping and cuSPARSE handles follow the current
+        device), and hold xi (and the result) alive until the collect: an
+        autograd-free result does not keep xi alive, so the next loop turn
+        would free xi while the device kernel may still be reading it.
         """
         t = self._t
         np = self._np
         ys = []
         for i, B in enumerate(blocks):
-            xi = t.as_tensor(x0, dtype=self._dt64, device=self._devs[i])
-            ys.append(B @ xi)
-        parts = [y.cpu().numpy().astype(np.float64) for y in ys]
+            with t.cuda.device(self._devs[i]):
+                xi = t.as_tensor(x0, dtype=self._dt64, device=self._devs[i])
+                ys.append((self._devs[i], B @ xi, xi))
+        parts = []
+        for _d, _y, _keep in ys:
+            with t.cuda.device(_d):
+                parts.append(_y.cpu().numpy().astype(np.float64))
         self._n_calls = getattr(self, "_n_calls", 0) + 1
         if self._n_calls % 50 == 0:
             t.cuda.empty_cache()

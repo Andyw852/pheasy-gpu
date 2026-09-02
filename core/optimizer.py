@@ -954,6 +954,17 @@ class TwoLevelSM(LinearOperator):
         self.NS = NS
         dt = dtype if dtype is not None else SM_prime.dtype
         self._dt = dt
+        # Lazily-built CSR transposes. scipy's SM_prime.T is a CSC *view* that
+        # does scatter-write in matvec; a real CSR transpose is read-sequential
+        # and MKL-friendly. PHEASY_TWOLEVEL_CACHE_T=0 disables the cache (CV
+        # under tight memory) and reverts to the CSC view.
+        # [X1] read the env default BEFORE the GPU branch: when GPU SpMV is
+        # active we force the cache off, and a mid-fit GPU failure falls back
+        # to _sp_mv on SM_primeT without materializing the 60.5 GB transpose.
+        self._cache_T = os.environ.get("PHEASY_TWOLEVEL_CACHE_T", "1").lower() \
+            not in ("0", "false", "off")
+        self._SMpT = None
+        self._NST = None
         # [GPU-SM] optional cuSPARSE SpMV for the SM_prime half (row-split
         # across PHEASY_GPU_SM_NGPU devices). NS stays on the CPU. Falls
         # back to the scipy path silently when unavailable.
@@ -964,20 +975,13 @@ class TwoLevelSM(LinearOperator):
                 self._gpu_mv = _gb.GpuSparseMV(SM_prime)
                 print("[GPU-SM] SpMV on %d device(s), dtype=%s" % (
                     len(self._gpu_mv._devs), SM_prime.dtype), flush=True)
-                # GPU rmatvec uses its own transpose blocks; do not also
-                # cache the 60.5 GB CPU transpose (SM_primeT stays a view).
+                # GPU rmatvec uses its own transpose blocks; do not cache the
+                # CPU transpose either (SM_primeT stays a view). Must come
+                # AFTER the env read above (X1).
                 self._cache_T = False
             except Exception as _e:
                 print("[GPU-SM] SpMV unavailable (%s); using CPU" % _e, flush=True)
                 self._gpu_mv = None
-        # Lazily-built CSR transposes. scipy's SM_prime.T is a CSC *view* that
-        # does scatter-write in matvec; a real CSR transpose is read-sequential
-        # and MKL-friendly. PHEASY_TWOLEVEL_CACHE_T=0 disables the cache (CV
-        # under tight memory) and reverts to the CSC view.
-        self._cache_T = os.environ.get("PHEASY_TWOLEVEL_CACHE_T", "1").lower() \
-            not in ("0", "false", "off")
-        self._SMpT = None
-        self._NST = None
         super().__init__(np.dtype(dt), (SM_prime.shape[0], NS.shape[1]))
 
     @property
