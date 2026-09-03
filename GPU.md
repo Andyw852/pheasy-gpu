@@ -274,3 +274,46 @@ Verify any new dataset with the per-config residual check
   slices) or ~185 GB with the full-transpose path -- the kernel OOM killer
   (exit 137) strikes on the shared box unless the construction is memory-lean
   (see GpuSparseMV __init__).
+
+## Null-space construction profile: order-3 translational invariance (C60Mg2, 2026-09)
+
+The `-c` null-space step was the largest remaining lever (~41 min on C60Mg2,
+699-config system). cProfile (full run under profiler 56.6 min) splits it:
+
+* **Order-3 translational invariance (TI): ~25 min (60%).** The pure-Python
+  loop in `build_translational_invariance` does |asr reps| x |orbits| x
+  orbit-size inner tests = 1192 x 2061 x ~32 = **77.6M `_diff_cluster`
+  calls**, ~70% of the phase in Counter machinery (`_diff_cluster` cum ~1600 s
+  of the 3398 s whole-run profile; 99.77% of inner tests are wasted).
+* **Order-3 ASR sparse elimination: ~13.6 min (33%).** 32184 constraint rows
+  over ns whose nnz grows 55k -> 4.5M.
+* Order-2 all phases ~1.3 min; isotropy ~26 s.
+
+**Fix (TI): inverted, hash-narrowed construction.** A rep (a,b) matches an
+image I iff the rep atom multiset is contained in I with exactly one extra
+atom, which is equivalent to the rep value-set being one of the <= order
+sub-multisets of I. So each image is narrowed by a hash (rep value-set -> asr
+index) to <= order candidates, and **every candidate is then confirmed by the
+original `_diff_cluster`** -- matches are exactly the old ones by construction
+(no false positives, no misses). Measured: block-level output bitwise-identical
+(subset max abs diff 0.0), full order-3 TI ~7-10 s vs ~25 min, whole `-c`
+41 min -> 15:44. Order-2 path untouched.
+
+**Validation: `max|C@ns|` is self-referential -- do not use it alone.** It
+uses the NEW constraint matrix C; a fast path that silently dropped rows would
+still pass at ~1e-15. The discriminating test is the old constraints against
+the new null space: capture the OLD TI blocks once (isolated run, ~10 min,
+`cons_old.pkl`), then check `max|C_old @ ns_new|` ~1e-15 plus `p`
+(n_free count). Measured on C60Mg2 order 3: `max|C_old @ ns_new| = 1.7e-15`,
+`p = 52283` (10252 + 42031) unchanged.
+
+**Elimination (13.6 min) is format-independent and deferred.** Standalone
+re-run with the real data: CSC 1008 s vs CSR 1028 s -- not a sparse
+format-conversion problem (the profile's 900 s of `csc_tocsr` lives in the
+old TI loop's per-match coo churn, removed by the fix). 24493 of the 32184
+rows (76%) are linearly dependent after earlier eliminations yet each pays a
+`row @ ns`; the 7691 real eliminations are rank-1 sparse updates on growing
+nnz, i.e. sparse rank-revealing -- speeding it up means a rewrite (sparse QR /
+SuiteSparseQR). Ceiling is ~17% of the whole 41+34+32 min pipeline and the
+risk is asymmetric (it is the one place a wrong change silently invalidates
+all produced fc2/fc3), so it stays a known bottleneck.
