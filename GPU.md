@@ -289,15 +289,31 @@ The `-c` null-space step was the largest remaining lever (~41 min on C60Mg2,
   over ns whose nnz grows 55k -> 4.5M.
 * Order-2 all phases ~1.3 min; isotropy ~26 s.
 
-**Fix (TI): inverted, hash-narrowed construction.** A rep (a,b) matches an
-image I iff the rep atom multiset is contained in I with exactly one extra
-atom, which is equivalent to the rep value-set being one of the <= order
-sub-multisets of I. So each image is narrowed by a hash (rep value-set -> asr
-index) to <= order candidates, and **every candidate is then confirmed by the
-original `_diff_cluster`** -- matches are exactly the old ones by construction
-(no false positives, no misses). Measured: block-level output bitwise-identical
-(subset max abs diff 0.0), full order-3 TI ~7-10 s vs ~25 min, whole `-c`
-41 min -> 15:44. Order-2 path untouched.
+**Fix (TI): inverted, hash-narrowed construction.** A rep L matches an image
+I iff the rep atom MULTISET is contained in I with exactly one extra atom,
+which is equivalent to L being one of the <= order sub-multisets of I. Each
+image is narrowed by a hash to <= order candidates, and **every candidate is
+then confirmed by the original `_diff_cluster`** -- matches are exactly the
+old ones by construction (no false positives, no misses).
+
+Hash keys are the canonical multiset form `tuple(sorted(...))` -- the same
+semantics as `_diff_cluster`'s Counter and the orbit dedup key. This matters
+beyond order 3: a `frozenset` key is injective only on 2-multisets (the
+order-2 reps that back order 3); from order 4 up, lower reps like
+(a,a,b)/(a,b,b) collide on {a,b} and an image like (a,a,b,b) would have its two
+different 3-sub-multisets merged by a frozenset `seen` set, silently dropping
+one rep. Multiset keys keep the fast path correct for every order >= 3.
+
+Measured (order 3, C60Mg2): cons output bitwise-identical to the old builder
+(max abs diff 0.0, full 1192-block comparison; nnz 153590 both), full order-3
+TI ~7-10 s vs ~25 min, whole `-c` 41 min -> 15:44. Order-2 path untouched.
+
+One intentional numeric difference vs the old builder: `np.nonzero` keeps only
+numerically non-zero entries, while the old COO accumulation could keep
+structural zeros. Currently irrelevant (eliminated/skipped counts and
+max|C_old @ ns_new| match), but if a future pivot search iterates stored
+entries instead of `toarray()`, the nnz difference would change pivot choice --
+worth remembering before touching `_eliminate_row`.
 
 **Validation: `max|C@ns|` is self-referential -- do not use it alone.** It
 uses the NEW constraint matrix C; a fast path that silently dropped rows would

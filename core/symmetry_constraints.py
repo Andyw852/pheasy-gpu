@@ -649,15 +649,26 @@ class SymmetryConstraints(object):
         # order 3 that is 1192 x 2061 x ~32 = 77.6M _diff_cluster calls
         # (Counter machinery), ~70% of the whole null-space wall time.
         #
-        # A rep (a,b) matches an image I iff the rep atom multiset is contained
-        # in I with exactly one extra atom, which is equivalent to the rep
-        # value-set being one of the <= order sub-multisets of I.  So the hash
-        # (rep value-set -> asr index) narrows each image to <= order
-        # candidates; every candidate is then confirmed by the ORIGINAL
-        # _diff_cluster, so the matched set is exactly the old one (no false
-        # positives, no misses).  Measured: bitwise-identical output (max abs
-        # diff 0.0 on A=25/A=150 subsets) and full order-3 build ~7-10 s
-        # instead of ~25 min.
+        # A rep L (a cluster of order-1 atoms) matches an image I iff the rep
+        # atom MULTISET is contained in I with exactly one extra atom, which is
+        # equivalent to L being one of the <= order sub-multisets of I.  So the
+        # hash narrows each image to <= order candidates; every candidate is
+        # then confirmed by the ORIGINAL _diff_cluster, so the matched set is
+        # exactly the old one (no false positives, no misses).
+        #
+        # Hash keys are the canonical multiset form tuple(sorted(...)), the
+        # same semantics as _diff_cluster's Counter and as the orbit dedup key
+        # (cluster_orbit uses tuple(sorted(idx))): injective for every order
+        # (a cluster IS its atom multiset).  A frozenset key would only be
+        # injective for order-2 lower reps ((a,a) and (a,b) both distinct under
+        # frozenset); from order-4 up, lower reps like (a,a,b)/(a,b,b) collide
+        # on {a,b}, and an image like (a,a,b,b) would have its two different
+        # 3-sub-multisets merged by a frozenset 'seen' set -- silently dropping
+        # one rep.  Multiset keys keep this correct for any order >= 3.
+        #
+        # Measured (order 3, C60Mg2): bitwise-identical output (max abs diff
+        # 0.0 on A=25/A=150 subsets) and full order-3 build ~7-10 s instead of
+        # ~25 min.
         # ------------------------------------------------------------------
         lower_orbits = clusters[order - 1]
         this_orbits = clusters[order]
@@ -666,10 +677,10 @@ class SymmetryConstraints(object):
         asr_reps = []
         for oi, orbit_low in enumerate(lower_orbits):
             rp = list(orbit_low[0].atom_index)
-            key = frozenset(rp)
+            key = tuple(sorted(rp))
             if key in rep_valueset:
                 raise ValueError(
-                    "duplicate order-{} rep value-set {}".format(order - 1, key)
+                    "duplicate order-{} rep multiset {}".format(order - 1, key)
                 )
             rep_valueset[key] = oi
             asr_reps.append(rp)
@@ -683,7 +694,7 @@ class SymmetryConstraints(object):
                 G = kron_product(getattr(cluster, rot_fmt), order).toarray()
                 seen = set()
                 for sub in itertools.combinations(range(order), order - 1):
-                    key = frozenset(I[j] for j in sub)
+                    key = tuple(sorted(I[j] for j in sub))
                     if key in seen:
                         continue
                     seen.add(key)
@@ -707,28 +718,45 @@ class SymmetryConstraints(object):
                         acc += prod
 
         # assemble per-asr sparse (ifc_num, ifc_num * n_orbits) with the same
-        # per-orbit column layout as the old hstack
+        # per-orbit column layout as the old hstack; bucket by rep once (no
+        # O(n_reps x n_blocks) rescan) and release each rep's dense blocks as
+        # it is assembled
+        by_r = {}
+        for (r2, oi), blk in contrib.items():
+            by_r.setdefault(r2, []).append((oi, blk))
+        del contrib
+        empty_shape = (ifc_num, ifc_num * n_orbits)
         for r in range(len(asr_reps)):
-            rows = np.empty((0,), dtype=np.int64)
-            cols = np.empty((0,), dtype=np.int64)
-            data = np.empty((0,), dtype=np.float64)
-            for (r2, oi), blk in contrib.items():
-                if r2 != r:
-                    continue
+            blks = by_r.get(r)
+            if not blks:
+                cons_list.append(spmat.coo_matrix(empty_shape).tocsr())
+                continue
+            rows = []
+            cols = []
+            data = []
+            for oi, blk in blks:
                 nz = np.nonzero(blk)
                 if nz[0].size == 0:
                     continue
-                rows = np.concatenate([rows, nz[0].astype(np.int64)])
-                cols = np.concatenate(
-                    [cols, (ifc_num * oi + nz[1]).astype(np.int64)]
+                rows.append(nz[0].astype(np.int64))
+                cols.append((ifc_num * oi + nz[1]).astype(np.int64))
+                data.append(blk[nz])
+            if rows:
+                cons_list.append(
+                    spmat.coo_matrix(
+                        (
+                            np.concatenate(data),
+                            (
+                                np.concatenate(rows),
+                                np.concatenate(cols),
+                            ),
+                        ),
+                        shape=empty_shape,
+                    ).tocsr()
                 )
-                data = np.concatenate([data, blk[nz]])
-            cons_list.append(
-                spmat.coo_matrix(
-                    (data, (rows, cols)),
-                    shape=(ifc_num, ifc_num * n_orbits),
-                ).tocsr()
-            )
+            else:
+                cons_list.append(spmat.coo_matrix(empty_shape).tocsr())
+            del by_r[r]
         return cons_list
 
     def build_rotational_invariance(self, clusters, ifc_lr=None):
