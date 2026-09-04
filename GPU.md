@@ -323,6 +323,16 @@ the new null space: capture the OLD TI blocks once (isolated run, ~10 min,
 (n_free count). Measured on C60Mg2 order 3: `max|C_old @ ns_new| = 1.7e-15`,
 `p = 52283` (10252 + 42031) unchanged.
 
+**Synthetic harmonic recovery is the strongest regression for the fit chain.**
+`dev/synth_harmonic_regression.py` generates forces with an INDEPENDENT real-space
+path (`F = -Phi @ u`, never `SM @ coef`, which is in the column space by
+construction) from a symmetry-consistent Phi2 truncated inside the cutoff, fits
+order-2 with pheasy, and asserts the recovered fc2 equals Phi to machine
+precision (measured rel 1.2e-15 on Si 4x4x4, 40 configs). It locks SM
+construction + indexing + force read-in + OLS + ASR-as-constraint + fc2 write
+in one shot. Run it before touching any of that chain (and on C60Mg2 after the
+c2=7.0 shell-band question is settled).
+
 **Elimination (13.6 min) is format-independent and deferred.** Standalone
 re-run with the real data: CSC 1008 s vs CSR 1028 s -- not a sparse
 format-conversion problem (the profile's 900 s of `csc_tocsr` lives in the
