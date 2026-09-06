@@ -799,7 +799,7 @@ def _ridge_solve(A, y, alpha, x0=None):
 
             def rmv_aug(u):
                 u = np.asarray(u, dtype=np.float64).ravel()
-                return (np.asarray(A.T @ u[: A.shape[0]], dtype=np.float64).ravel()
+                return (np.asarray(A.rmatvec(u[: A.shape[0]]), dtype=np.float64).ravel()
                         + sqrt_a * u[A.shape[0]:])
 
             op = LinearOperator((A.shape[0] + n, n), matvec=mv_aug,
@@ -845,15 +845,16 @@ def _solve_subset(A, y, row_idx, col_idx, ridge_alpha=0.0, qr=False,
             lsmr_maxiter if lsmr_maxiter is not None else 5000)))
         if ridge_alpha > 0:
             sqrt_a = float(np.sqrt(ridge_alpha))
+            base_op = op  # capture before reassignment below (closure safety)
 
             def mv_aug(v):
                 v = np.asarray(v, dtype=np.float64).ravel()
-                return np.concatenate([np.asarray(op @ v).ravel(), sqrt_a * v])
+                return np.concatenate([np.asarray(base_op @ v).ravel(), sqrt_a * v])
 
             def rmv_aug(u):
                 u = np.asarray(u, dtype=np.float64).ravel()
-                return (np.asarray(op.T @ u[: op.shape[0]]).ravel()
-                        + sqrt_a * u[op.shape[0]:])
+                return (np.asarray(base_op.rmatvec(u[: base_op.shape[0]])).ravel()
+                        + sqrt_a * u[base_op.shape[0]:])
 
             op = LinearOperator((op.shape[0] + n, n), matvec=mv_aug,
                                 rmatvec=rmv_aug, dtype=np.float64)
@@ -997,7 +998,8 @@ class TwoLevelSM(LinearOperator):
         if not self._cache_T:
             return self.NS.T
         if self._NST is None:
-            self._NST = self.NS.T.tocsr()
+            _nsT = self.NS.T
+            self._NST = _nsT.tocsr() if hasattr(_nsT, "tocsr") else _nsT
         return self._NST
 
     def _matvec(self, v):

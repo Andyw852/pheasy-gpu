@@ -3,7 +3,7 @@
 # Copyright (C) 2021-2023 Changpeng Lin
 # All rights reserved.
 
-__all__ = ["write_ifc3", "write_ifc4"]
+__all__ = ["write_ifc2", "write_ifc3", "write_ifc4"]
 
 import itertools
 from io import StringIO
@@ -12,6 +12,44 @@ import numpy as np
 
 from pheasy_gpu.basic_io import logger
 from pheasy_gpu.core.utilities import get_permutation_tensor
+
+
+def write_ifc2(Phi, scell, clusters):
+    """Write 2nd-order IFCs into ShengBTE format (FORCE_CONSTANTS_2ND).
+
+    ShengBTE fc2 format: first line = single integer natoms (supercell atom
+    count), then natoms x natoms blocks, each "i j" + 3x3 matrix (eV/A^2),
+    ALL pairs (i,j in 1..natoms), same ordering as phonopy FORCE_CONSTANTS
+    but with a single-column header instead of "natom natom".
+
+    Parameters
+    ----------
+    Phi : numpy.ndarray, shape (n_cluster, 3, 3)
+        Symmetry-independent 2nd-order IFCs.
+    scell : pheasy_gpu.Atoms
+        Supercell (needs ws_offsets for nothing here; only pmap/full pair).
+    clusters : list
+        Cluster space of 2nd order.
+    """
+    natoms = scell.get_global_number_of_atoms()
+    ifc2 = np.zeros((natoms, natoms, 3, 3))
+    for idx, orbit in enumerate(clusters):
+        for cluster in orbit[1:]:
+            ia, ib = cluster.atom_index
+            Gamma = cluster.get_crotation_tensor()
+            Phi_tmp = Gamma.dot(Phi[idx, :, :].flatten())
+            ifc2[ia, ib] = Phi_tmp.reshape((3, 3))
+            if ia != ib:
+                Rmat = get_permutation_tensor([ia, ib], [ib, ia]).reshape((9, 9))
+                ifc2[ib, ia] = Rmat.dot(Phi_tmp).reshape((3, 3))
+    with open("FORCE_CONSTANTS_2ND", "w") as fd:
+        fd.write(f"{natoms:>5d}\n")
+        for i, j in np.ndindex((natoms, natoms)):
+            fd.write(f"{i+1:5d}{j+1:5d}\n")
+            fd.write("".join(map(lambda x: f"{x:25.15f}", ifc2[i, j, 0])) + "\n")
+            fd.write("".join(map(lambda x: f"{x:25.15f}", ifc2[i, j, 1])) + "\n")
+            fd.write("".join(map(lambda x: f"{x:25.15f}", ifc2[i, j, 2])) + "\n")
+    logger.info("Wrote FORCE_CONSTANTS_2ND (ShengBTE, %d x %d)", natoms, natoms)
 
 
 def write_ifc3(Phi, scell, clusters):

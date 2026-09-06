@@ -278,11 +278,44 @@ class ForceConstants(object):
 
         """
         clusters = cluster_space.get_cluster_space(order)
+        # [PATCH shengbte-ws] ShengBTE fc3 导出需要 scell.ws_offsets (NeighborList)。
+        # 拟合主流程不保证已构建 → 幂等保障: 已设则跳过; 否则读 neighbor_list.pkl
+        # 或现场用 supercell 对称性构建。
+        scell = self._scell
+        try:
+            _ = scell.ws_offsets
+            _has_ws = True
+        except (AttributeError, NotImplementedError):
+            _has_ws = False
+        if not _has_ws:
+            import os as _os
+            from pheasy_gpu.structure.atoms import NeighborList
+            from pheasy_gpu.structure.symmetry import get_symmetry
+            nl_file = "neighbor_list.pkl"
+            nn_list = None
+            if _os.path.isfile(nl_file):
+                try:
+                    cand = NeighborList.read(nl_file)
+                    if list(cand.supercell) == list(getattr(scell, "supercell", [2, 2, 2])):
+                        nn_list = cand
+                except Exception:
+                    nn_list = None
+            if nn_list is None:
+                try:
+                    eq = get_symmetry(scell, symprec=1e-5).get("equivalent_atoms")
+                except Exception:
+                    eq = None
+                nn_list = NeighborList(scell, eq)
+            scell.set_wigner_seitz_offsets(nn_list.ws_offsets)
+            logger.info("Ensured scell ws_offsets for ShengBTE fc export.")
+
 
         if order == 2:
             phono23py.write_ifc2(
                 self._ifcs[2], self._scell, clusters, settings.HDF5, settings.FULL_IFC
             )
+            # [PATCH shengbte-fc2] ShengBTE 也读 2 阶: 头=单原子数格式的 FORCE_CONSTANTS_2ND
+            shengbte.write_ifc2(self._ifcs[2], self._scell, clusters)
             if settings.Q2R or settings.Q2R_XML:
                 qe_d3q.write_ifc2(
                     self._ifcs[2], self._scell, clusters, settings.NAC, settings.Q2R_XML
