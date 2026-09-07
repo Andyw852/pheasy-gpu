@@ -1,0 +1,6 @@
+test_compact_equals_reordered_full_slice_and_never_allocates_full (__main__.CompactFc3Test.test_compact_equals_reordered_full_slice_and_never_allocates_full) ... ok
+
+----------------------------------------------------------------------
+Ran 1 test in 0.006s
+
+OK

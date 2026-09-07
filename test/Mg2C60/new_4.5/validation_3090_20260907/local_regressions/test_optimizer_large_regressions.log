@@ -1,0 +1,23 @@
+test_gpu_construction_failure_does_not_cache_host_transpose (__main__.OptimizerLargeRegressions.test_gpu_construction_failure_does_not_cache_host_transpose) ... [GPU-SM] SpMV unavailable (simulated insufficient VRAM); using CPU
+ok
+test_gpu_runtime_failure_closes_backend_before_cpu_fallback (__main__.OptimizerLargeRegressions.test_gpu_runtime_failure_closes_backend_before_cpu_fallback) ... [GPU-SM] matvec failed (GPU lost); disabling GPU, CPU fallback
+[GPU-SM] rmatvec failed (GPU lost); disabling GPU, CPU fallback
+ok
+test_iterative_subsolvers_warn_on_iteration_limit (__main__.OptimizerLargeRegressions.test_iterative_subsolvers_warn_on_iteration_limit) ... ok
+test_jacobi_preconditioner_preserves_ridge_objective (__main__.OptimizerLargeRegressions.test_jacobi_preconditioner_preserves_ridge_objective) ... [OLS] Computing exact column norms for Jacobi scaling
+[OLS] Column norms ready: min=0.0778545 max=863.17; starting LSMR
+ok
+test_jacobi_solver_failure_is_not_retried_unscaled (__main__.OptimizerLargeRegressions.test_jacobi_solver_failure_is_not_retried_unscaled) ... [OLS] Computing exact column norms for Jacobi scaling
+[OLS] Column norms ready: min=1 max=1; starting LSMR
+ok
+test_ols_results_expose_convergence_and_do_not_reuse_stale_info (__main__.OptimizerLargeRegressions.test_ols_results_expose_convergence_and_do_not_reuse_stale_info) ... ok
+test_operator_ridge_subset_matches_dense_solution (__main__.OptimizerLargeRegressions.test_operator_ridge_subset_matches_dense_solution) ... ok
+test_rfe_evaluates_minimum_feature_candidate (__main__.OptimizerLargeRegressions.test_rfe_evaluates_minimum_feature_candidate) ... ok
+test_tsqr_matches_svd_for_tall_wide_and_deficient_inputs (__main__.OptimizerLargeRegressions.test_tsqr_matches_svd_for_tall_wide_and_deficient_inputs) ... ok
+test_twolevel_adjoint_and_subset_equal_materialized_product (__main__.OptimizerLargeRegressions.test_twolevel_adjoint_and_subset_equal_materialized_product) ... ok
+test_twolevel_column_norms_stream_products_with_cancellation (__main__.OptimizerLargeRegressions.test_twolevel_column_norms_stream_products_with_cancellation) ... ok
+
+----------------------------------------------------------------------
+Ran 11 tests in 0.047s
+
+OK

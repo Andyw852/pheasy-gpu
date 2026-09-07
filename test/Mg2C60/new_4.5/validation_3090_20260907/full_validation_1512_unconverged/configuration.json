@@ -1,0 +1,32 @@
+{
+  "mode": "full",
+  "data": "/home/wangchaoyue852/software/pheasy-gpu-validation/20260906_mg2c60/data",
+  "source": "/home/wangchaoyue852/software/pheasy-gpu-validation/20260906_mg2c60/src/pheasy_gpu/core/optimizer.py",
+  "torch_version": "2.6.0+cu124",
+  "cuda_visible_devices": "0,1,2,3,4,5",
+  "environment": {
+    "PHEASY_USE_GPU": "1",
+    "PHEASY_GPU_SM": "1",
+    "PHEASY_GPU_SM_NGPU": "6",
+    "PHEASY_GPU_SM_DEVICES": "0,1,2,3,4,5",
+    "PHEASY_GPU_DEVICE": "0",
+    "PHEASY_SM_DTYPE": "float64",
+    "PHEASY_OLS_TWOLEVEL": "1",
+    "PHEASY_TWOLEVEL_CACHE_T": "0",
+    "PHEASY_OLS_JACOBI": "0",
+    "PHEASY_OLS_RIDGE": "0",
+    "PHEASY_OLS_ATOL": "1e-8",
+    "PHEASY_OLS_BTOL": "1e-8",
+    "PHEASY_OLS_MAXITER": "10000",
+    "PHEASY_LSQR_ATOL": "1e-8",
+    "PHEASY_LSQR_BTOL": "1e-8",
+    "PHEASY_LSQR_MAXITER": "10000",
+    "PHEASY_RFE_TWOLEVEL": "1",
+    "PHEASY_RFE_N_JOBS": "1",
+    "PHEASY_TSQR_STEP": "0.5",
+    "PHEASY_TSQR_MIN_FEATURES": "13071",
+    "PHEASY_TSQR_CRITERION": "cv",
+    "PHEASY_CV_GROUP_SIZE": "1488",
+    "PHEASY_RFE_PATIENCE": "5"
+  }
+}

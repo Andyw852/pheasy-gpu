@@ -882,6 +882,42 @@ def load_sensing_matrix(sm_prime, ns_harm, ns_anharm, n_rows, dtype=np.float64):
 # ---------------------------------------------------------------------------
 # GPU SpMV for the TwoLevelSM operator (SM_prime row-split across GPUs)
 # ---------------------------------------------------------------------------
+def _check_cuda_csr_indices(matrix):
+    """Reject CSR blocks that cannot be represented by our int32 CUDA path.
+
+    Casting a large CSR indptr to int32 wraps silently.  Check before either
+    allocating a CUDA tensor or asking cuSPARSE to read the resulting indices.
+    This uses scalar CSR metadata, without scanning/copying a multi-GB array.
+    """
+    limit = np.iinfo(np.int32).max
+    if matrix.nnz > limit or max(matrix.shape, default=0) > limit:
+        raise ValueError(
+            "CUDA CSR block shape=%s nnz=%d exceeds the int32 index range; "
+            "use more GPU blocks or the CPU sparse path"
+            % (matrix.shape, matrix.nnz))
+
+
+def _cuda_csr_bytes(matrix, value_itemsize):
+    """Bytes of the actual CUDA CSR allocation, regardless of host dtype."""
+    return (int(matrix.nnz) * (int(value_itemsize) + 4)
+            + (int(matrix.shape[0]) + 1) * 4)
+
+
+def _cuda_spmv_block_budget(row_block, transpose_block, value_itemsize):
+    """Resident CSR pair, both SpMV vectors, and conservative workspace room.
+
+    Equal row/column ranges need not contain equal numbers of nonzeros.  The
+    device-selection average is only a hint; this actual block budget decides
+    whether a pair is safe to upload to its selected card.
+    """
+    resident = (_cuda_csr_bytes(row_block, value_itemsize)
+                + _cuda_csr_bytes(transpose_block, value_itemsize))
+    vectors = sum(sum(block.shape) for block in (row_block, transpose_block)) \
+        * int(value_itemsize)
+    workspace = max(256 << 20, (resident + vectors + 9) // 10)
+    return resident + vectors + workspace
+
+
 class GpuSparseMV(object):
     """Row-split SM_prime (+ transpose) across GPUs for TwoLevelSM matvec/rmatvec.
 
@@ -903,7 +939,8 @@ class GpuSparseMV(object):
         self._np = np
         self._t = t
         self._dt64 = t.float64 if sm_prime.dtype == np.float64 else t.float32
-        self._sm_bytes_val = int(sm_prime.data.nbytes + sm_prime.indices.nbytes)
+        self._value_itemsize = 8 if sm_prime.dtype == np.float64 else 4
+        self._sm_bytes_val = _cuda_csr_bytes(sm_prime, self._value_itemsize)
         N, M = sm_prime.shape
         devs = self._pick_devices(device_ids, n_gpu)
         if not devs:
@@ -919,17 +956,32 @@ class GpuSparseMV(object):
         # in host RAM and OOM-killed the 699-config fit at ~185 GB on the
         # shared box (exit 137, three times). Column slices are ~97 s per
         # 13275-col block (8 min total vs the transpose) but peak ~75 GB.
-        for i, d in enumerate(devs):
-            dev = t.device("cuda:%d" % d)
-            Ri = sm_prime[self._rs[i]:self._rs[i + 1]].tocsr()
-            Ti = sm_prime[:, self._cs[i]:self._cs[i + 1]].T.tocsr()
-            # [X2/M1] pin the thread-local current device while creating the
-            # sparse tensors: cuSPARSE handles/workspace follow the current
-            # device, and the allocator bookkeeping is per-current-device.
-            with t.cuda.device(d):
-                self._R.append(self._csr_to_torch(Ri, dev))
-                self._T.append(self._csr_to_torch(Ti, dev))
-            del Ri, Ti
+        try:
+            for i, d in enumerate(devs):
+                dev = t.device("cuda:%d" % d)
+                Ri = sm_prime[self._rs[i]:self._rs[i + 1]].tocsr()
+                _check_cuda_csr_indices(Ri)
+                Ti = sm_prime[:, self._cs[i]:self._cs[i + 1]].T.tocsr()
+                _check_cuda_csr_indices(Ti)
+                required = _cuda_spmv_block_budget(Ri, Ti, self._value_itemsize)
+                free = _device_free_bytes(d)
+                if free is not None and required > free:
+                    raise MemoryError(
+                        "CUDA device %d: actual CSR row/transpose blocks need "
+                        "%.2f GiB including workspace, only %.2f GiB usable; "
+                        "nonzeros may be unevenly distributed across devices. "
+                        "Use more/free GPUs or the CPU sparse path"
+                        % (d, required / 2**30, free / 2**30))
+                # [X2/M1] pin the thread-local current device while creating
+                # the sparse tensors: cuSPARSE handles/workspace follow it.
+                with t.cuda.device(d):
+                    self._R.append(self._csr_to_torch(Ri, dev))
+                    self._T.append(self._csr_to_torch(Ti, dev))
+                del Ri, Ti
+        except Exception:
+            # A failure on card k must release cards 0..k before CPU fallback.
+            self.close()
+            raise
 
     def _pick_devices(self, device_ids, n_gpu):
         import os as _os
@@ -957,13 +1009,17 @@ class GpuSparseMV(object):
             # small SM does not land on a busy card.
             _per_card = max(1 << 30, int(2.0 * self._sm_bytes_val / max(1, n_gpu)))
             device_ids = _multi_gpu_devices(min_free_bytes=_per_card)
-        device_ids = [d for d in device_ids if 0 <= d < t.cuda.device_count()]
+        # Duplicate IDs would place multiple blocks on one card and invalidate
+        # the per-card budget. Preserve the caller's order while deduplicating.
+        device_ids = list(dict.fromkeys(
+            d for d in device_ids if 0 <= d < t.cuda.device_count()))
         if not device_ids:
             return []
         n_gpu = min(n_gpu, len(device_ids))
         return device_ids[:n_gpu]
 
     def _csr_to_torch(self, m, dev):
+        _check_cuda_csr_indices(m)
         t = self._t
         crow = t.as_tensor(m.indptr, dtype=t.int32, device=dev)
         ccol = t.as_tensor(m.indices, dtype=t.int32, device=dev)

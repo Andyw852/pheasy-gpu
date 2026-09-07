@@ -63,10 +63,13 @@ def read_ifc2(scell, clusters, filename="FORCE_CONSTANTS", full=True):
                 logger.error("Unknown key for 2nd-order IFCs in {}.".format(filename))
                 raise RuntimeError
 
-            Phi_tmp = fd[key]
-            if Phi_tmp.shape != (natom, natoms) or Phi_tmp.shape != (natoms, natoms):
+            dataset = fd[key]
+            if dataset.shape not in ((natom, natoms, 3, 3), (natoms, natoms, 3, 3)):
                 logger.error("Two supercell configurations are not consistent.")
                 raise RuntimeError
+            # Detach the array while the HDF5 file is open. A Dataset handle
+            # cannot be used after leaving this context.
+            Phi_tmp = dataset[:]
 
     else:
         with open(filename, "r") as fd:
@@ -92,7 +95,6 @@ def read_ifc2(scell, clusters, filename="FORCE_CONSTANTS", full=True):
                 )
 
     if Phi_tmp.shape[0] == natoms and ndim != 1:
-        idx = np.arange(natoms, dtype="int")
         Phi_tmp = Phi_tmp[scell.pmap, :]
     if full:
         Phi = Phi_tmp
@@ -189,9 +191,9 @@ def write_ifc3(Phi, scell, clusters, full=False):
         Cluster space of 3rd-order force constants.
     full : bool, optional
         If True, the full force constant tensor with the shape
-        (natoms,natoms,3,3,3) is written, where natoms is the 
+        (natoms,natoms,natoms,3,3,3) is written, where natoms is the
         number of atoms in the supercell; otherwise, the shape
-        is (natom,natoms,3,3,3) where natom is the number of 
+        is (natom,natoms,natoms,3,3,3) where natom is the number of
         atoms in the unit cell.
 
     """
@@ -202,7 +204,11 @@ def write_ifc3(Phi, scell, clusters, full=False):
         raise ModuleNotFoundError
 
     natoms = scell.get_global_number_of_atoms()
-    ifc3 = np.zeros((natoms, natoms, natoms, 3, 3, 3))
+    # Compact output needs only the primitive representatives on its first
+    # axis. Allocating the full supercell tensor first defeats compact mode.
+    first_atoms = np.arange(natoms) if full else np.asarray(scell.pmap, dtype=int)
+    first_index = {int(atom): i for i, atom in enumerate(first_atoms)}
+    ifc3 = np.zeros((len(first_atoms), natoms, natoms, 3, 3, 3))
 
     for idx, orbit in enumerate(clusters):
         for cluster in orbit[1:]:
@@ -212,12 +218,12 @@ def write_ifc3(Phi, scell, clusters, full=False):
                 set(itertools.permutations(cluster.atom_index, 3))
             ):
                 ia, ib, ic = at_idx
+                if ia not in first_index:
+                    continue
                 Rmat = get_permutation_tensor(cluster.atom_index, list(at_idx)).reshape(
                     (27, 27)
                 )
-                ifc3[ia, ib, ic] = Rmat.dot(Phi_tmp).reshape((3, 3, 3))
-    if not full:
-        ifc3 = ifc3[scell.pmap, :, :, :, :, :]
+                ifc3[first_index[ia], ib, ic] = Rmat.dot(Phi_tmp).reshape((3, 3, 3))
 
     with h5py.File("fc3.hdf5", "w") as fd:
         fd.create_dataset("fc3", data=ifc3, compression="gzip")

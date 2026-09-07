@@ -1,0 +1,48 @@
+[2026-09-07 01:16:36,245] Start Pheasy.
+__________  ___ ______________   _____    ______________.___.
+\______   \/   |   \_   _____/  /  _  \  /   _____/\__  |   |
+ |     ___/    ~    \    __)_  /  /_\  \ \_____  \  /   |   |
+ |    |   \    Y    /        \/    |    \/        \ \____   |
+ |____|    \___|_  /_______  /\____|__  /_______  / / ______|
+                 \/        \/         \/        \/  \/  0.0.2
+[2026-09-07 01:16:36,253] System: C60Mg2
+[2026-09-07 01:16:36,253] Space group: C2/m (12), 4 symmetry operations found.
+[2026-09-07 01:16:36,253] Creating 2 x 2 x 2 supercell (496 atoms).
+[2026-09-07 01:16:36,339] Reading and generating cluster space from file, up to 3-order.
+[2026-09-07 01:16:40,371] Cutoff distance (A) for 2-order IFCs: 7.00
+[2026-09-07 01:16:40,372] Cutoff distance (A) for 3-order IFCs: 4.50
+[2026-09-07 01:16:40,372] Summary of cluster space:
+[2026-09-07 01:16:40,372] - HARM    | cluster number: 1192 | IFC number: 10728
+[2026-09-07 01:16:40,372] - ANHARM3 | cluster number: 2061 | IFC number: 55647
+[2026-09-07 01:16:40,372] Starting to construct sensing (displacement) matrix.
+[2026-09-07 01:16:40,372] Reading displaced configurations from file.
+[2026-09-07 01:16:45,956 - run_pheasy][WARNING] - PHEASY_N_JOBS=8 would need ~47.4 GB for the cluster-space copies + chunk results but only 41.9 GB is available; capping to 4 worker(s). (run_pheasy.py:114)
+[2026-09-07 01:16:45,965] - Parallel sensing matrix construction: 4 workers.
+[SM] streaming dense->sparse float64 conversion of 699 blocks...
+[SM] blocks converted in 0.0s, vstacking...
+[SM] vstack done in 121.1s: shape=(1040112, 66375), nnz=3780068976, mem=60.49 GB (float64 sparse CSR)
+[2026-09-07 02:02:36,338] Construction of sensing (displacement) matrix finished, time cost: 0:45:55.921667.
+[2026-09-07 02:02:48,528] Finalize Pheasy, total time cost: 0:46:12.285475.
+	Command being timed: "python -m pheasy_gpu.run_pheasy --dim 2 2 2 -w 3 --c2 7.0 --c3 4.5 --eps 0.001 -d --disp_file --ndata 699"
+	User time (seconds): 9511.48
+	System time (seconds): 502.85
+	Percent of CPU this job got: 356%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 46:51.86
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 107580524
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 78535
+	Minor (reclaiming a frame) page faults: 115351952
+	Voluntary context switches: 1074981
+	Involuntary context switches: 62769
+	Swaps: 0
+	File system inputs: 899080
+	File system outputs: 118144008
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0

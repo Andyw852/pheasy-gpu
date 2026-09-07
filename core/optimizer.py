@@ -11,6 +11,7 @@ References:
 """
 import contextlib
 import os
+import warnings
 
 import numpy as np
 import scipy.sparse as sp
@@ -185,6 +186,8 @@ def _is_linear_operator(A):
 
 def _col_norms(A):
     """Exact ||A[:, j]|| in float64."""
+    if isinstance(A, TwoLevelSM):
+        return A.col_norms()
     if sp.issparse(A):
         sq = np.asarray(A.multiply(A).sum(axis=0)).ravel()
         return np.sqrt(sq.astype(np.float64))
@@ -273,7 +276,28 @@ def _make_cv_splits(n_samples, cv, random_state=None, group_size=None):
     return list(kf.split(np.arange(n_samples)))
 
 
-def _solve_sparse_lsqr(A, y):
+def _iterative_solver_info(result, solver):
+    """Expose stopping diagnostics and warn when an iterative solve stops early."""
+    istop = int(result[1])
+    info = {"solver": solver, "istop": istop, "itn": int(result[2]),
+            "normr": float(result[3]),
+            "normar": float(result[7] if solver == "LSQR" else result[4]),
+            "conda": float(result[6]),
+            "converged": istop in (0, 1, 2, 4, 5)}
+    if not info["converged"]:
+        reason = ("iteration limit reached" if istop == 7 else
+                  "condition limit reached" if istop in (3, 6) else
+                  "unexpected stopping status")
+        warnings.warn(
+            "%s did not converge: %s (istop=%d, iterations=%d, "
+            "normr=%.6e, normar=%.6e). Check the fit residual and solver "
+            "tolerances/iteration limit before using these coefficients."
+            % (solver, reason, istop, info["itn"], info["normr"], info["normar"]),
+            RuntimeWarning, stacklevel=3)
+    return info
+
+
+def _solve_sparse_lsqr(A, y, info=None):
     """Iterative least squares (LSQR) for sparse / LinearOperator input.
 
     Only needs matvec / rmatvec, so peak memory is ~O(n_features) instead of
@@ -286,6 +310,9 @@ def _solve_sparse_lsqr(A, y):
     iter_lim = int(os.environ.get("PHEASY_LSQR_MAXITER", "5000"))
     y64 = np.asarray(y, dtype=np.float64).ravel()
     res = _sp_lsqr(A, y64, atol=atol, btol=btol, iter_lim=iter_lim)
+    diagnostics = _iterative_solver_info(res, "LSQR")
+    if info is not None:
+        info.update(diagnostics)
     return np.asarray(res[0], dtype=np.float64)
 
 
@@ -811,6 +838,7 @@ def _ridge_solve(A, y, alpha, x0=None):
         btol = float(os.environ.get("PHEASY_LSQR_BTOL", "1e-8"))
         maxiter = int(os.environ.get("PHEASY_LSQR_MAXITER", "5000"))
         res = _lsmr(op, y_aug, atol=atol, btol=btol, maxiter=maxiter, x0=x0)
+        _iterative_solver_info(res, "LSMR")
         return np.asarray(res[0], dtype=np.float64)
     if _gpu_dense(A):
         return np.asarray(_gpu().ridge_solve(_to_dense_f64(A), y64, alpha), dtype=np.float64)
@@ -856,10 +884,11 @@ def _solve_subset(A, y, row_idx, col_idx, ridge_alpha=0.0, qr=False,
                 return (np.asarray(base_op.rmatvec(u[: base_op.shape[0]])).ravel()
                         + sqrt_a * u[base_op.shape[0]:])
 
-            op = LinearOperator((op.shape[0] + n, n), matvec=mv_aug,
+            op = LinearOperator((base_op.shape[0] + n, n), matvec=mv_aug,
                                 rmatvec=rmv_aug, dtype=np.float64)
             y_sub = np.concatenate([y_sub, np.zeros(n)])
         res = _lsmr(op, y_sub, atol=atol, btol=btol, maxiter=maxiter)
+        _iterative_solver_info(res, "LSMR")
         return np.asarray(res[0], dtype=np.float64)
 
     A_sub = A[:, col_idx]
@@ -971,19 +1000,27 @@ class TwoLevelSM(LinearOperator):
         # back to the scipy path silently when unavailable.
         self._gpu_mv = None
         if os.environ.get("PHEASY_GPU_SM", "0").lower() in ("1", "true", "yes"):
+            # A GPU allocation failure must not trigger a second, potentially
+            # huge host CSR transpose allocation on the first CPU rmatvec.
+            self._cache_T = False
             try:
                 from pheasy_gpu.core import gpu_backend as _gb
                 self._gpu_mv = _gb.GpuSparseMV(SM_prime)
                 print("[GPU-SM] SpMV on %d device(s), dtype=%s" % (
                     len(self._gpu_mv._devs), SM_prime.dtype), flush=True)
-                # GPU rmatvec uses its own transpose blocks; do not cache the
-                # CPU transpose either (SM_primeT stays a view). Must come
-                # AFTER the env read above (X1).
-                self._cache_T = False
             except Exception as _e:
                 print("[GPU-SM] SpMV unavailable (%s); using CPU" % _e, flush=True)
-                self._gpu_mv = None
+                self._disable_gpu()
         super().__init__(np.dtype(dt), (SM_prime.shape[0], NS.shape[1]))
+
+    def _disable_gpu(self):
+        gpu_mv, self._gpu_mv = self._gpu_mv, None
+        self._cache_T = False
+        if gpu_mv is not None:
+            try:
+                gpu_mv.close()
+            except Exception as exc:
+                print("[GPU-SM] resource cleanup failed (%s)" % exc, flush=True)
 
     @property
     def SM_primeT(self):
@@ -1010,7 +1047,7 @@ class TwoLevelSM(LinearOperator):
                 return self._gpu_mv.matvec(t)
             except Exception as _e:
                 print("[GPU-SM] matvec failed (%s); disabling GPU, CPU fallback" % _e, flush=True)
-                self._gpu_mv = None
+                self._disable_gpu()
         return _sp_mv(self.SM_prime, np.ascontiguousarray(t, dtype=self._dt))
 
     def _rmatvec(self, u):
@@ -1021,13 +1058,54 @@ class TwoLevelSM(LinearOperator):
                 return _sp_mv(self.NST, np.ascontiguousarray(t, dtype=self._dt))
             except Exception as _e:
                 print("[GPU-SM] rmatvec failed (%s); disabling GPU, CPU fallback" % _e, flush=True)
-                self._gpu_mv = None
+                self._disable_gpu()
         t = _sp_mv(self.SM_primeT, u)
         return _sp_mv(self.NST, np.ascontiguousarray(t, dtype=self._dt))
 
-    def col_norms(self):
-        """Exact ||SM[:, j]|| (the true sensing-matrix column norms)."""
-        return _col_norms(self)
+    def col_norms(self, block_rows=None):
+        """Exact column norms from bounded row blocks of SM_prime @ NS.
+
+        The generic LinearOperator implementation needs one full SpMV per
+        column. A sparse row-block product computes all columns together and
+        discards each block after accumulating its squared entries in float64.
+        The default 64 MiB block budget allows 24 bytes per possible output
+        entry (float64 values, sparse indices, and the squaring temporary),
+        plus the sliced input block. NS is shared when already float64.
+        """
+        n_rows, n_cols = self.shape
+        squares = np.zeros(n_cols, dtype=np.float64)
+        if not n_rows or not n_cols:
+            return squares
+        budget = max(1, int(os.environ.get("PHEASY_COL_NORM_BLOCK_BYTES", "67108864")))
+        max_rows = max(1, budget // (24 * n_cols))
+        if block_rows is not None:
+            max_rows = min(max_rows, max(1, int(block_rows)))
+        ns64 = self.NS.astype(np.float64, copy=False)
+        prime = self.SM_prime
+        i0 = 0
+        while i0 < n_rows:
+            i1 = min(n_rows, i0 + max_rows)
+            if sp.isspmatrix_csr(prime):
+                # A very wide SM_prime may dominate the sliced input memory.
+                # Account for both its original and float64 working copy.
+                while i1 > i0 + 1:
+                    input_nnz = int(prime.indptr[i1] - prime.indptr[i0])
+                    if 24 * ((i1 - i0) * n_cols + input_nnz) <= budget:
+                        break
+                    i1 = i0 + max(1, (i1 - i0) // 2)
+            product = prime[i0:i1].astype(np.float64, copy=False) @ ns64
+            if sp.issparse(product):
+                product = product.tocsr()
+                product.sum_duplicates()
+                squares += np.bincount(product.indices,
+                                       weights=np.square(product.data),
+                                       minlength=n_cols)
+            else:
+                product = np.asarray(product, dtype=np.float64)
+                squares += np.einsum("ij,ij->j", product, product)
+            del product
+            i0 = i1
+        return np.sqrt(squares)
 
     def row_slice(self, rows):
         """[FIX P30] TwoLevelSM for A[rows, :] by slicing SM_prime only.
@@ -1954,7 +2032,9 @@ class _RFECVBase:
         while True:
             idx = np.where(active)[0]
             n_active = len(idx)
-            if n_active <= self.min_features:
+            # Keep the initial no-elimination fast path, but evaluate the
+            # minimum support reached by elimination before selecting a model.
+            if n_active <= self.min_features and round_num == 0:
                 break
 
             coef_active = solve(idx)
@@ -2168,9 +2248,8 @@ class Optimizer(object):
         preconditioner: solve (A D) z = y with D = diag(1/||A[:,j]||), then
         x = D z. Cuts the iteration count on ill-conditioned columns (Si
         617,818x col-span: 27 -> 13 iters, same residual). Cost: one col-norm
-        pass via X.col_norms() -- exact but O(n_cols) matvecs on a big
-        TwoLevelSM (C60Mg2 52283 cols is ~minutes-hours; the Si fixture or a
-        row-subset estimate is the cheap proxy). Off by default.
+        pass via X.col_norms() -- TwoLevelSM accumulates exact norms from
+        bounded sparse row-block products. Off by default.
         """
         atol = float(os.environ.get("PHEASY_OLS_ATOL", str(atol)))
         btol = float(os.environ.get("PHEASY_OLS_BTOL", str(btol)))
@@ -2180,23 +2259,42 @@ class Optimizer(object):
         damp = float(np.sqrt(ridge * n_samples)) if ridge > 0 else 0.0
         y_in = np.asarray(y, dtype=np.float64).ravel()
         if os.environ.get("PHEASY_OLS_JACOBI", "0").lower() in ("1", "true", "yes"):
-            try:
-                cn = (X.col_norms() if hasattr(X, "col_norms") else _col_norms(X))
-                cn = np.where(np.asarray(cn, dtype=np.float64) < 1e-30, 1.0, cn)
-                X_s = _scale_operator(X, cn)
-                result = _lsmr(X_s, y_in, damp=damp, atol=atol, btol=btol,
+            print("[OLS] Computing exact column norms for Jacobi scaling", flush=True)
+            cn = (X.col_norms() if hasattr(X, "col_norms") else _col_norms(X))
+            cn = np.where(np.asarray(cn, dtype=np.float64) < 1e-30, 1.0, cn)
+            print("[OLS] Column norms ready: min=%.6g max=%.6g; starting LSMR"
+                  % (cn.min(), cn.max()), flush=True)
+            X_s = _scale_operator(X, cn)
+            if damp > 0:
+                # x = z / cn: the ridge penalty must remain damp*||x||,
+                # hence the augmented block is damp*diag(1/cn), not I.
+                penalty = damp / cn
+
+                def mv_ridge(v):
+                    v = np.asarray(v, dtype=np.float64).ravel()
+                    return np.concatenate([np.asarray(X_s @ v).ravel(),
+                                           penalty * v])
+
+                def rmv_ridge(u):
+                    u = np.asarray(u, dtype=np.float64).ravel()
+                    return (np.asarray(X_s.T @ u[:n_samples]).ravel()
+                            + penalty * u[n_samples:])
+
+                aug = LinearOperator((n_samples + X.shape[1], X.shape[1]),
+                                     matvec=mv_ridge, rmatvec=rmv_ridge,
+                                     dtype=np.float64)
+                y_aug = np.concatenate([y_in, np.zeros(X.shape[1])])
+                result = _lsmr(aug, y_aug, atol=atol, btol=btol,
                                maxiter=maxiter)
-                coef = np.asarray(result[0], dtype=np.float64) / cn
-                self._ols_lsmr_info = {"istop": result[1], "itn": result[2],
-                                       "normr": result[3], "normar": result[4]}
-                return coef
-            except Exception as _e:
-                print("[OLS] Jacobi preconditioner failed (%s); unscaled LSMR"
-                      % _e, flush=True)
+            else:
+                result = _lsmr(X_s, y_in, atol=atol, btol=btol,
+                               maxiter=maxiter)
+            coef = np.asarray(result[0], dtype=np.float64) / cn
+            self._ols_lsmr_info = _iterative_solver_info(result, "LSMR")
+            return coef
         result = _lsmr(X, y_in, damp=damp, atol=atol, btol=btol, maxiter=maxiter)
         coef = np.asarray(result[0], dtype=np.float64)
-        self._ols_lsmr_info = {"istop": result[1], "itn": result[2],
-                               "normr": result[3], "normar": result[4]}
+        self._ols_lsmr_info = _iterative_solver_info(result, "LSMR")
         return coef
 
     def fit(self, A, F, weights=None):
@@ -2469,6 +2567,10 @@ class Optimizer(object):
                 self._model, "alpha_", self._results.get("alpha", 0.0)))
         elif method == "OLS":
             self._results["n_iter"] = getattr(self._model, "n_iter_", None)
+            if self._ols_lsmr_info is not None:
+                self._results["solver_info"] = dict(self._ols_lsmr_info)
+            else:
+                self._results.pop("solver_info", None)
 
         F_pred = np.asarray(self.predict(A)).ravel()
         eps = np.finfo(F64.dtype).eps
@@ -2486,11 +2588,16 @@ class Optimizer(object):
         return self
 
     def _fit_ols(self, A, F):
+        self._ols_lsmr_info = None
         if _is_linear_operator(A):
             # LSMR only needs matvec/rmatvec; the two-level operator stays sparse.
             coef = self._ols_lsmr(A, F)
             n_iter = self._ols_lsmr_info.get("itn")
             return coef, n_iter
+        if sp.issparse(A) and not _should_densify_sparse(A):
+            self._ols_lsmr_info = {}
+            coef = _solve_sparse_lsqr(A, F, info=self._ols_lsmr_info)
+            return coef, self._ols_lsmr_info["itn"]
         # dense, or a sparse container: _solve_lstsq densifies small/sparse-but-
         # dense matrices (fast SVD) and only uses iterative LSQR for genuinely
         # huge sparse matrices (FIX: previously everything sparse went to LSMR).

@@ -224,7 +224,7 @@ class WorkFlow(object):
                 )
                 raise ValueError
             scell.set_supercell(settings.DIM)
-            if settings.IS_MAGNEIC:  # in case of magnetic materials
+            if settings.IS_MAGNETIC:  # in case of magnetic materials
                 if len(settings.MAGMOM.shape) == 1:
                     smagmom = np.repeat(settings.MAGMOM, ndim)
                 else:
@@ -471,6 +471,7 @@ class WorkFlow(object):
                             )
                             for _res in _results:
                                 sensing_mat_list.extend(_res)
+                            del _results, _res
                         except Exception as _e:
                             logger.error(
                                 "- Parallel sensing-matrix workers failed (%s: %s). "
@@ -582,7 +583,7 @@ class WorkFlow(object):
                     + self.SM_prime.indptr.nbytes) / 1e9
             print(f'[SM] vstack done in {_t_sm.time()-_t0:.1f}s: '
                   f'shape={self.SM_prime.shape}, nnz={self.SM_prime.nnz}, '
-                  f'mem={_mem:.2f} GB (f32 sparse CSR)', flush=True)
+                                  f'mem={_mem:.2f} GB ({self.SM_prime.dtype} sparse CSR)', flush=True)
             # [FIX save-speed] compressed=npz runs zlib on 30+ GB of SM data;
             # on a loaded shared box that takes hours. Store uncompressed
             # (load_npz handles both; the fit re-materializes the same CSR).
@@ -960,12 +961,12 @@ class WorkFlow(object):
                         _ns = spmat.csr_matrix(_ns)
                     elif _ns.format not in ('csr', 'csc'):
                         _ns = _ns.tocsr()
-                    if _ns.dtype != _np_p.float32:
-                        _ns = _ns.astype(_np_p.float32)
+                    if _ns.dtype != _np_p.dtype(_sm_dtype()):
+                        _ns = _ns.astype(_sm_dtype())
                     if spmat.issparse(SM_prime) and SM_prime.format not in ('csr', 'csc'):
                         SM_prime = SM_prime.tocsr()
-                    if SM_prime.dtype != _np_p.float32:
-                        SM_prime = SM_prime.astype(_np_p.float32)
+                    if SM_prime.dtype != _np_p.dtype(_sm_dtype()):
+                        SM_prime = SM_prime.astype(_sm_dtype())
                     _sp_mem = _sp_mem_gb(SM_prime)
                     _ns_mem = _sp_mem_gb(_ns)
                     print(f'[OLS-sparse] SM = SM_prime @ NS_full  '
@@ -979,11 +980,11 @@ class WorkFlow(object):
                           f'mem={_ns_mem:.2f} GB', flush=True)
                     _t0 = _ts.time()
                     SM = SM_prime.dot(_ns).tocsr()
-                    if SM.dtype != _np_p.float32:
-                        SM = SM.astype(_np_p.float32)
+                    if SM.dtype != _np_p.dtype(_sm_dtype()):
+                        SM = SM.astype(_sm_dtype())
                     _mem = _sp_mem_gb(SM)
                     _density = SM.nnz / float(SM.shape[0] * SM.shape[1])
-                    _dense_eq = SM.shape[0] * SM.shape[1] * 4 / 1e9
+                    _dense_eq = SM.shape[0] * SM.shape[1] * SM.dtype.itemsize / 1e9
                     print(f'[OLS-sparse] result: shape={SM.shape} '
                           f'nnz={SM.nnz} density={_density:.2%} '
                           f'mem={_mem:.2f} GB  (dense would be '
@@ -1027,12 +1028,13 @@ class WorkFlow(object):
                     _is_lasso_family = (settings.MODEL.upper() in ('LASSO', 'ALASSO', 'RIDGE'))
                     _lasso_twolevel = _os_p.environ.get('PHEASY_LASSO_TWOLEVEL','0').lower() in ('1','true','yes')
                     _twolevel = ((_is_ols and _ols_twolevel)
-                                 or (_is_rfe and _rfe_twolevel)
+                                 or ((_is_rfe or _is_rfe_tsqr) and _rfe_twolevel)
                                  or (_is_lasso_family and _lasso_twolevel))
                     _use_sparse = (
-                        (not _is_rfe_tsqr)
+                        (not _is_rfe_tsqr or _rfe_twolevel)
                         and (
                             (_is_rfe and _rfe_sparse)
+                            or (_is_rfe_tsqr and _rfe_twolevel)
                             or (_is_lasso_family and (_lasso_sparse or _lasso_twolevel))
                             or (_is_ols and _ols_twolevel)
                         )
@@ -1043,16 +1045,20 @@ class WorkFlow(object):
                         _ns_sp = self.NS_full
                         if not _sp_p.issparse(_ns_sp):
                             _ns_sp = _sp_p.csr_matrix(_ns_sp)
-                        _ns_sp = _ns_sp.astype(_sm_dtype())     # [FIX P06]
+                        _ns_sp = _ns_sp.astype(_sm_dtype(), copy=False)
                         if not _sp_p.issparse(SM_prime):
                             SM_prime = _sp_p.csr_matrix(SM_prime)
-                        SM_prime = SM_prime.astype(_sm_dtype())
-                        print(f'[SM-sparse] ALASSO/LASSO sparse path: '
+                        SM_prime = SM_prime.astype(_sm_dtype(), copy=False)
+                        print(f'[SM-sparse] {_model_up} sparse path: '
                               f'{SM_prime.shape} x {_ns_sp.shape}', flush=True)
                         if _twolevel:
                             # [PATCH ols/rfe-twolevel] 不显式相乘, 包成 TwoLevelSM.
                             # 关键: 不 del SM_prime/_ns_sp, TwoLevelSM 要持有引用.
                             _tl_who = "OLS" if _is_ols else ("RFE" if _is_rfe else _model_up)
+                            if _is_rfe_tsqr:
+                                print('[SM-twolevel] RFE-OLS-TSQR uses iterative '
+                                      'LSMR for a matrix-free operator; dense QR '
+                                      'is not materialized.', flush=True)
                             from pheasy_gpu.core.optimizer import TwoLevelSM as _TwoLevelSM
                             # MKL matvec 要求 CSR/CSC (非 COO); NS_full 常为 COO -> 转 CSR.
                             if (not _sp_p.issparse(_ns_sp)) or _ns_sp.format not in ('csr','csc'):
@@ -1072,7 +1078,8 @@ class WorkFlow(object):
                             print(f'[SM-twolevel] {_tl_who} 两级 matvec (不生成 SM): '
                                   f'SM_prime{SM_prime.shape}({_smp_mem:.1f}GB) @ '
                                   f'NS{_ns_sp.shape}({_nsp_mem:.1f}GB), '
-                                  f'SM.shape={SM.shape}, 峰值~{_smp_mem+_nsp_mem:.1f}GB',
+                                  f'SM.shape={SM.shape}, 主机矩阵常驻~{_smp_mem+_nsp_mem:.1f}GB'
+                                  '（不含GPU分块构造临时内存）',
                                   flush=True)
                         else:
                             SM = SM_prime.dot(_ns_sp).tocsr()
@@ -1112,14 +1119,29 @@ class WorkFlow(object):
                             _src = getattr(self, 'SensingMatrixFile', 'sm_prime.npz')
                             try:
                                 _st = _os_p.stat(_src)
-                                _src_sig = [_src, int(_st.st_size), int(_st.st_mtime)]
+                                _src_sig = [_src, int(_st.st_size), int(_st.st_mtime_ns)]
                             except OSError:
                                 _src_sig = [_src, -1, -1]
+                            # Shape alone cannot detect a different null space.
+                            # Hash its sparse buffers (small compared with SM).
+                            import hashlib as _hashlib
+                            _ns_hash = _hashlib.sha256()
+                            _ns_cache = self.NS_full
+                            if _sp_p.issparse(_ns_cache):
+                                _ns_hash.update(_ns_cache.format.encode('ascii'))
+                                for _name in ('data', 'indices', 'indptr', 'row', 'col'):
+                                    _buf = getattr(_ns_cache, _name, None)
+                                    if _buf is not None:
+                                        _ns_hash.update(_np_p.ascontiguousarray(_buf).tobytes())
+                            else:
+                                _ns_hash.update(_np_p.ascontiguousarray(_ns_cache).tobytes())
                             return {
                                 'src': _src_sig,
                                 'smp_shape': list(SM_prime.shape),
                                 'smp_nnz': int(getattr(SM_prime, 'nnz', -1)),
                                 'ns_shape': list(self.NS_full.shape),
+                                'ns_sha256': _ns_hash.hexdigest(),
+                                'excluded_configs': sorted(ex_set),
                                 'dtype': _np_p.dtype(_sm_dtype()).name,
                                 'ndata': int(settings.NDATA),
                             }
@@ -1188,7 +1210,7 @@ class WorkFlow(object):
             # [FIX] 值级 dtype 一致性: 容器 dtype 相同还不够, 若 float64 容器的值
             # 经 float32 往返无损, 说明是遗漏的硬编码 astype(np.float32) 被上转掩盖.
             # 跳过 TwoLevelSM (LinearOperator, 无具体矩阵).
-            if hasattr(SM, 'dtype') and (_sp_p.issparse(SM) or isinstance(SM, _np_p.ndarray)):
+            if hasattr(SM, 'dtype') and (spmat.issparse(SM) or isinstance(SM, np.ndarray)):
                 assert_uniform_dtype(SM=SM, FM=FM)
 
             # Train interatomic force constants
@@ -1363,7 +1385,7 @@ class WorkFlow(object):
                 logger.info("- alpha_opt: {}".format(fit_results.get("alpha")))
             logger.info("- RMSE: {} eV/A".format(fit_metrics["rmse"]))
             logger.info("- Relative error: {}".format(optimizer.metrics["re"]))
-            logger.info("- Rank of coefficient matrix: {}".format(rank))
+            logger.info("- Number of coefficient columns: {} (numerical rank not estimated)".format(rank))
             logger.info("- Free IFC terms: {}".format(fit_results["coef"].shape[0]))
             logger.info(
                 "- Non-zero IFC terms: {}".format(np.count_nonzero(fit_results["coef"]))
@@ -1385,13 +1407,14 @@ class WorkFlow(object):
             # (pheasy groups supercell atoms per primitive atom; ASE
             # repeat() interleaves per image -- see AGENTS.md). Cheap.
             try:
-                if spmat.issparse(SM_prime) and Phi is not None and FM is not None:
+                if Phi is not None and FM is not None:
                     _n3 = 3 * natoms
-                    _n_cfg = SM_prime.shape[0] // _n3
+                    _n_cfg = SM.shape[0] // _n3
+                    _fit_prediction = np.asarray(optimizer.predict(SM)).ravel()
                     _worst = 1.0
                     for _k in np.linspace(0, _n_cfg - 1, min(5, _n_cfg)).astype(int):
                         _r = slice(int(_k) * _n3, (int(_k) + 1) * _n3)
-                        _fp = SM_prime[_r] @ Phi
+                        _fp = _fit_prediction[_r]
                         _fa = FM[_r]
                         _c = float(np.corrcoef(_fa, _fp)[0, 1])
                         _worst = min(_worst, _c)
@@ -1399,8 +1422,8 @@ class WorkFlow(object):
                             logger.warning("[fit] config %d corr=%.4f -- possible "
                                           "supercell atom-order mismatch" % (_k, _c))
                     if _worst < 0.99:
-                        logger.error("[fit] ALIGNMENT CHECK FAILED (worst corr=%.4f); "
-                                     "fit meaningless -- check the atom order" % _worst)
+                        logger.warning("[fit] low force correlation (worst corr=%.4f); "
+                                       "check atom order, data quality and model residuals" % _worst)
                     else:
                         logger.info("[fit] alignment check OK (worst corr=%.4f over %d "
                                     "sampled configs)" % (_worst, min(5, _n_cfg)))
@@ -1528,3 +1551,7 @@ def main():
     end_time = datetime.datetime.now()
     total_time = end_time - start_time
     logger.info("Finalize Pheasy, total time cost: {}.".format(total_time))
+
+
+if __name__ == "__main__":
+    main()

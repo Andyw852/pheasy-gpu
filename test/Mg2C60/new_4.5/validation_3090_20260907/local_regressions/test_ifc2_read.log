@@ -1,0 +1,7 @@
+test_full_compact_and_alternative_keys (__main__.ReadFc2Test.test_full_compact_and_alternative_keys) ... [2026-09-07 12:39:15,356 - phono23py][ERROR] Two supercell configurations are not consistent. (phono23py.py:68)
+ok
+
+----------------------------------------------------------------------
+Ran 1 test in 0.012s
+
+OK

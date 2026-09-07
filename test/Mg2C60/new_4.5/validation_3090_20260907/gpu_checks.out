@@ -1,0 +1,200 @@
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5
+[VALIDATE] dense/wellconditioned/OLS
+[VALIDATE] dense/wellconditioned/OLS PASS 0.31s
+[VALIDATE] dense/wellconditioned/RIDGE
+[CV] WARNING: alpha* 1.000e-06 sits at the grid MINIMUM; the RIDGE CV curve is still falling at the low end -- widening the grid only pushes alpha* toward OLS.
+[VALIDATE] dense/wellconditioned/RIDGE PASS 0.08s
+[VALIDATE] dense/wellconditioned/LASSO
+[CV] WARNING: alpha* 1.000e-06 sits at the grid MINIMUM; the CV curve is still falling at the low end, so widening the grid only pushes alpha* toward OLS. Treat this fit as effectively unregularized (compare with OLS/RFE).
+[CV] WARNING: alpha* 1.000e-06 sits at the grid MINIMUM; the CV curve is still falling at the low end, so widening the grid only pushes alpha* toward OLS. Treat this fit as effectively unregularized (compare with OLS/RFE).
+[VALIDATE] dense/wellconditioned/LASSO PASS 0.19s
+[VALIDATE] dense/wellconditioned/ALASSO
+[ALASSO] manual alpha grid [1.000e-06 .. 1.000e-02] used AS-IS; weighted KKT threshold 1.016e+00, auto grid would start at 7.513e-08. the ENTIRE grid lies below the weighted KKT threshold (1.016e+00): no grid point regularizes at all -- the GRID, not the data, pins alpha*. Drop --no-alpha_auto and use the weighted auto grid.
+[CV] WARNING: alpha* 1.000e-06 sits at the grid MINIMUM; the ENTIRE grid lies below the weighted KKT threshold (1.016e+00): no grid point regularizes at all -- the GRID, not the data, pins alpha*. Drop --no-alpha_auto and use the weighted auto grid.
+[ALASSO] manual alpha grid [1.000e-06 .. 1.000e-02] used AS-IS; weighted KKT threshold 1.016e+00, auto grid would start at 7.513e-08. the ENTIRE grid lies below the weighted KKT threshold (1.016e+00): no grid point regularizes at all -- the GRID, not the data, pins alpha*. Drop --no-alpha_auto and use the weighted auto grid.
+[CV] WARNING: alpha* 1.000e-06 sits at the grid MINIMUM; the ENTIRE grid lies below the weighted KKT threshold (1.016e+00): no grid point regularizes at all -- the GRID, not the data, pins alpha*. Drop --no-alpha_auto and use the weighted auto grid.
+[VALIDATE] dense/wellconditioned/ALASSO PASS 0.15s
+[VALIDATE] dense/wellconditioned/RFE
+[RFE] START n_features=18, step=0.50, cv=3, min_features=3, patience=2, solver=lstsq, ridge_alpha=0.00e+00
+[RFE] Round   0: n_active=   18  CV_RMSE=9.534781e-05 (+-3.00e-06)  nonzero=18
+[RFE] Round   1: n_active=    9  CV_RMSE=8.853376e-05 (+-1.24e-06)  nonzero=9
+[RFE] Round   2: n_active=    5  CV_RMSE=9.224891e-05 (+-1.82e-06)  nonzero=5
+[RFE] Round   3: n_active=    3  CV_RMSE=1.812048e-01 (+-7.07e-03)  nonzero=3
+[RFE] CV 连续 2 轮无改善, 提前停止.
+[RFE] argmin: n_active=9, CV=8.853376e-05
+[RFE] selected: n_active=9, CV=8.853376e-05 (+-1.24e-06)
+[RFE] START n_features=18, step=0.50, cv=3, min_features=3, patience=2, solver=lstsq, ridge_alpha=0.00e+00
+[RFE] Round   0: n_active=   18  CV_RMSE=9.534781e-05 (+-3.00e-06)  nonzero=18
+[RFE] Round   1: n_active=    9  CV_RMSE=8.853376e-05 (+-1.24e-06)  nonzero=9
+[RFE] Round   2: n_active=    5  CV_RMSE=9.224891e-05 (+-1.82e-06)  nonzero=5
+[RFE] Round   3: n_active=    3  CV_RMSE=1.812048e-01 (+-7.07e-03)  nonzero=3
+[RFE] CV 连续 2 轮无改善, 提前停止.
+[RFE] argmin: n_active=9, CV=8.853376e-05
+[RFE] selected: n_active=9, CV=8.853376e-05 (+-1.24e-06)
+[VALIDATE] dense/wellconditioned/RFE PASS 0.09s
+[VALIDATE] dense/wellconditioned/RFE-OLS-TSQR
+[RFE] START n_features=18, step=0.50, cv=3, min_features=3, patience=2, solver=qr, ridge_alpha=0.00e+00
+[RFE] Round   0: n_active=   18  CV_RMSE=9.534781e-05 (+-3.00e-06)  nonzero=18
+[RFE] Round   1: n_active=    9  CV_RMSE=8.853376e-05 (+-1.24e-06)  nonzero=9
+[RFE] Round   2: n_active=    5  CV_RMSE=9.224891e-05 (+-1.82e-06)  nonzero=5
+[RFE] Round   3: n_active=    3  CV_RMSE=1.812048e-01 (+-7.07e-03)  nonzero=3
+[RFE] CV 连续 2 轮无改善, 提前停止.
+[RFE] argmin: n_active=9, CV=8.853376e-05
+[RFE] selected: n_active=9, CV=8.853376e-05 (+-1.24e-06)
+[RFE] START n_features=18, step=0.50, cv=3, min_features=3, patience=2, solver=qr, ridge_alpha=0.00e+00
+[RFE] Round   0: n_active=   18  CV_RMSE=9.534781e-05 (+-3.00e-06)  nonzero=18
+[RFE] Round   1: n_active=    9  CV_RMSE=8.853376e-05 (+-1.24e-06)  nonzero=9
+[RFE] Round   2: n_active=    5  CV_RMSE=9.224891e-05 (+-1.82e-06)  nonzero=5
+[RFE] Round   3: n_active=    3  CV_RMSE=1.812048e-01 (+-7.07e-03)  nonzero=3
+[RFE] CV 连续 2 轮无改善, 提前停止.
+[RFE] argmin: n_active=9, CV=8.853376e-05
+[RFE] selected: n_active=9, CV=8.853376e-05 (+-1.24e-06)
+[VALIDATE] dense/wellconditioned/RFE-OLS-TSQR PASS 0.03s
+[VALIDATE] dense/rankdef/OLS
+[VALIDATE] dense/rankdef/OLS PASS 0.01s
+[VALIDATE] dense/rankdef/RIDGE
+[CV] WARNING: alpha* 1.000e-06 sits at the grid MINIMUM; the RIDGE CV curve is still falling at the low end -- widening the grid only pushes alpha* toward OLS.
+[VALIDATE] dense/rankdef/RIDGE PASS 0.02s
+[VALIDATE] dense/rankdef/LASSO
+[CV] WARNING: alpha* 1.000e-06 sits at the grid MINIMUM; the CV curve is still falling at the low end, so widening the grid only pushes alpha* toward OLS. Treat this fit as effectively unregularized (compare with OLS/RFE).
+[CV] WARNING: alpha* 1.000e-06 sits at the grid MINIMUM; the CV curve is still falling at the low end, so widening the grid only pushes alpha* toward OLS. Treat this fit as effectively unregularized (compare with OLS/RFE).
+[VALIDATE] dense/rankdef/LASSO PASS 0.13s
+[VALIDATE] dense/rankdef/ALASSO
+[ALASSO] manual alpha grid [1.000e-06 .. 1.000e-02] used AS-IS; weighted KKT threshold 5.929e-01, auto grid would start at 7.513e-08. the ENTIRE grid lies below the weighted KKT threshold (5.929e-01): no grid point regularizes at all -- the GRID, not the data, pins alpha*. Drop --no-alpha_auto and use the weighted auto grid.
+[CV] WARNING: alpha* 1.000e-06 sits at the grid MINIMUM; the ENTIRE grid lies below the weighted KKT threshold (5.929e-01): no grid point regularizes at all -- the GRID, not the data, pins alpha*. Drop --no-alpha_auto and use the weighted auto grid.
+[ALASSO] manual alpha grid [1.000e-06 .. 1.000e-02] used AS-IS; weighted KKT threshold 5.929e-01, auto grid would start at 7.513e-08. the ENTIRE grid lies below the weighted KKT threshold (5.929e-01): no grid point regularizes at all -- the GRID, not the data, pins alpha*. Drop --no-alpha_auto and use the weighted auto grid.
+[CV] WARNING: alpha* 1.000e-06 sits at the grid MINIMUM; the ENTIRE grid lies below the weighted KKT threshold (5.929e-01): no grid point regularizes at all -- the GRID, not the data, pins alpha*. Drop --no-alpha_auto and use the weighted auto grid.
+[VALIDATE] dense/rankdef/ALASSO PASS 0.12s
+[VALIDATE] dense/rankdef/RFE
+[RFE] START n_features=18, step=0.50, cv=3, min_features=3, patience=2, solver=lstsq, ridge_alpha=0.00e+00
+[RFE] Round   0: n_active=   18  CV_RMSE=1.174338e-04 (+-9.78e-06)  nonzero=18
+[RFE] Round   1: n_active=    9  CV_RMSE=1.073564e-04 (+-7.25e-06)  nonzero=9
+[RFE] Round   2: n_active=    5  CV_RMSE=1.822509e-01 (+-6.90e-03)  nonzero=5
+[RFE] Round   3: n_active=    3  CV_RMSE=1.812140e-01 (+-7.07e-03)  nonzero=3
+[RFE] CV 连续 2 轮无改善, 提前停止.
+[RFE] argmin: n_active=9, CV=1.073564e-04
+[RFE] selected: n_active=9, CV=1.073564e-04 (+-7.25e-06)
+[RFE] START n_features=18, step=0.50, cv=3, min_features=3, patience=2, solver=lstsq, ridge_alpha=0.00e+00
+[RFE] Round   0: n_active=   18  CV_RMSE=1.173876e-04 (+-9.75e-06)  nonzero=18
+[RFE] Round   1: n_active=    9  CV_RMSE=1.074687e-04 (+-7.33e-06)  nonzero=9
+[RFE] Round   2: n_active=    5  CV_RMSE=1.812140e-01 (+-7.07e-03)  nonzero=5
+[RFE] Round   3: n_active=    3  CV_RMSE=1.812140e-01 (+-7.07e-03)  nonzero=3
+[RFE] CV 连续 2 轮无改善, 提前停止.
+[RFE] argmin: n_active=9, CV=1.074687e-04
+[RFE] selected: n_active=9, CV=1.074687e-04 (+-7.33e-06)
+[VALIDATE] dense/rankdef/RFE PASS 0.06s
+[VALIDATE] dense/rankdef/RFE-OLS-TSQR
+[RFE] START n_features=18, step=0.50, cv=3, min_features=3, patience=2, solver=qr, ridge_alpha=0.00e+00
+[RFE] Round   0: n_active=   18  CV_RMSE=1.174338e-04 (+-9.78e-06)  nonzero=18
+[RFE] Round   1: n_active=    9  CV_RMSE=1.073564e-04 (+-7.25e-06)  nonzero=9
+[RFE] Round   2: n_active=    5  CV_RMSE=1.822509e-01 (+-6.90e-03)  nonzero=5
+[RFE] Round   3: n_active=    3  CV_RMSE=1.812140e-01 (+-7.07e-03)  nonzero=3
+[RFE] CV 连续 2 轮无改善, 提前停止.
+[RFE] argmin: n_active=9, CV=1.073564e-04
+[RFE] selected: n_active=9, CV=1.073564e-04 (+-7.25e-06)
+[RFE] START n_features=18, step=0.50, cv=3, min_features=3, patience=2, solver=qr, ridge_alpha=0.00e+00
+[RFE] Round   0: n_active=   18  CV_RMSE=1.173876e-04 (+-9.75e-06)  nonzero=18
+[RFE] Round   1: n_active=    9  CV_RMSE=1.074687e-04 (+-7.33e-06)  nonzero=9
+[RFE] Round   2: n_active=    5  CV_RMSE=1.812140e-01 (+-7.07e-03)  nonzero=5
+[RFE] Round   3: n_active=    3  CV_RMSE=1.812140e-01 (+-7.07e-03)  nonzero=3
+[RFE] CV 连续 2 轮无改善, 提前停止.
+[RFE] argmin: n_active=9, CV=1.074687e-04
+[RFE] selected: n_active=9, CV=1.074687e-04 (+-7.33e-06)
+[VALIDATE] dense/rankdef/RFE-OLS-TSQR PASS 0.06s
+[VALIDATE] twolevel/1_gpu
+[RFE] START n_features=24, step=0.50, cv=3, min_features=3, patience=2, solver=qr, ridge_alpha=0.00e+00
+[RFE] Round   0: n_active=   24  CV_RMSE=1.064684e-04 (+-1.15e-06)  nonzero=24
+[RFE] Round   1: n_active=   12  CV_RMSE=1.036934e-04 (+-1.45e-06)  nonzero=12
+[RFE] Round   2: n_active=    6  CV_RMSE=1.011332e-04 (+-3.15e-06)  nonzero=6
+[RFE] Round   3: n_active=    3  CV_RMSE=6.335423e-02 (+-1.44e-03)  nonzero=3
+[RFE] argmin: n_active=6, CV=1.011332e-04
+[RFE] selected: n_active=6, CV=1.011332e-04 (+-3.15e-06)
+/home/wangchaoyue852/software/pheasy-gpu-validation/20260906_mg2c60/src/pheasy_gpu/core/gpu_backend.py:1027: UserWarning: Sparse CSR tensor support is in beta state. If you miss a functionality in the sparse tensor support, please submit a feature request to https://github.com/pytorch/pytorch/issues. (Triggered internally at /pytorch/aten/src/ATen/SparseCsrTensorImpl.cpp:53.)
+  return t.sparse_csr_tensor(crow, ccol, cval, size=m.shape,
+[GPU-SM] SpMV on 1 device(s), dtype=float64
+[RFE] START n_features=24, step=0.50, cv=3, min_features=3, patience=2, solver=qr, ridge_alpha=0.00e+00
+[RFE] Round   0: n_active=   24  CV_RMSE=1.064684e-04 (+-1.15e-06)  nonzero=24
+[RFE] Round   1: n_active=   12  CV_RMSE=1.036934e-04 (+-1.45e-06)  nonzero=12
+[RFE] Round   2: n_active=    6  CV_RMSE=1.011332e-04 (+-3.15e-06)  nonzero=6
+[RFE] Round   3: n_active=    3  CV_RMSE=6.335423e-02 (+-1.44e-03)  nonzero=3
+[RFE] argmin: n_active=6, CV=1.011332e-04
+[RFE] selected: n_active=6, CV=1.011332e-04 (+-3.15e-06)
+[VALIDATE] twolevel/1_gpu PASS 0.74s
+[VALIDATE] twolevel/6_gpu
+[RFE] START n_features=24, step=0.50, cv=3, min_features=3, patience=2, solver=qr, ridge_alpha=0.00e+00
+[RFE] Round   0: n_active=   24  CV_RMSE=1.064684e-04 (+-1.15e-06)  nonzero=24
+[RFE] Round   1: n_active=   12  CV_RMSE=1.036934e-04 (+-1.45e-06)  nonzero=12
+[RFE] Round   2: n_active=    6  CV_RMSE=1.011332e-04 (+-3.15e-06)  nonzero=6
+[RFE] Round   3: n_active=    3  CV_RMSE=6.335423e-02 (+-1.44e-03)  nonzero=3
+[RFE] argmin: n_active=6, CV=1.011332e-04
+[RFE] selected: n_active=6, CV=1.011332e-04 (+-3.15e-06)
+[GPU-SM] SpMV on 6 device(s), dtype=float64
+[RFE] START n_features=24, step=0.50, cv=3, min_features=3, patience=2, solver=qr, ridge_alpha=0.00e+00
+[RFE] Round   0: n_active=   24  CV_RMSE=1.064684e-04 (+-1.15e-06)  nonzero=24
+[RFE] Round   1: n_active=   12  CV_RMSE=1.036934e-04 (+-1.45e-06)  nonzero=12
+[RFE] Round   2: n_active=    6  CV_RMSE=1.011332e-04 (+-3.15e-06)  nonzero=6
+[RFE] Round   3: n_active=    3  CV_RMSE=6.335423e-02 (+-1.44e-03)  nonzero=3
+[RFE] argmin: n_active=6, CV=1.011332e-04
+[RFE] selected: n_active=6, CV=1.011332e-04 (+-3.15e-06)
+[VALIDATE] twolevel/6_gpu PASS 2.47s
+{"passed": 14, "failed": 0}
+cluster: /home/wangchaoyue852/software/pheasy-gpu-validation/20260906_mg2c60/si_chain_gpu_v2/cluster.log
+constraints: /home/wangchaoyue852/software/pheasy-gpu-validation/20260906_mg2c60/si_chain_gpu_v2/constraints.log
+sensing: /home/wangchaoyue852/software/pheasy-gpu-validation/20260906_mg2c60/si_chain_gpu_v2/sensing.log
+fit: /home/wangchaoyue852/software/pheasy-gpu-validation/20260906_mg2c60/si_chain_gpu_v2/fit.log
+{
+  "checkout": "/home/wangchaoyue852/software/pheasy-gpu-validation/20260906_mg2c60/src/pheasy_gpu",
+  "python": "/home/wangchaoyue852/miniconda3/envs/wc/bin/python",
+  "workdir": "/home/wangchaoyue852/software/pheasy-gpu-validation/20260906_mg2c60/si_chain_gpu_v2",
+  "gpu_requested": true,
+  "gpu_calls": [
+    {
+      "function": "gpu_backend.lstsq",
+      "device": "cuda:0",
+      "max_memory_allocated": 8545792
+    }
+  ],
+  "natoms": 16,
+  "configs": 12,
+  "spring_eV_A2": 1.0,
+  "nearest_A": 2.351258971274751,
+  "cutoff_A": 2.4688219198384886,
+  "fc2_max_absolute_error": 1.7763568394002505e-15,
+  "fc2_max_relative_error": 4.440892098500626e-16,
+  "force_relative_error": 4.662468015754148e-16,
+  "asr_max_absolute_error": 0.0,
+  "stage_seconds": {
+    "cluster": 1.2087436249712482,
+    "constraints": 1.1759796540718526,
+    "sensing": 1.8619947080733255,
+    "fit": 3.582483814097941
+  },
+  "passed": true
+}
+cluster: /home/wangchaoyue852/software/pheasy-gpu-validation/20260906_mg2c60/si_chain_cpu_explicit/cluster.log
+constraints: /home/wangchaoyue852/software/pheasy-gpu-validation/20260906_mg2c60/si_chain_cpu_explicit/constraints.log
+sensing: /home/wangchaoyue852/software/pheasy-gpu-validation/20260906_mg2c60/si_chain_cpu_explicit/sensing.log
+fit: /home/wangchaoyue852/software/pheasy-gpu-validation/20260906_mg2c60/si_chain_cpu_explicit/fit.log
+{
+  "checkout": "/home/wangchaoyue852/software/pheasy-gpu-validation/20260906_mg2c60/src/pheasy_gpu",
+  "python": "/home/wangchaoyue852/miniconda3/envs/wc/bin/python",
+  "workdir": "/home/wangchaoyue852/software/pheasy-gpu-validation/20260906_mg2c60/si_chain_cpu_explicit",
+  "gpu_requested": false,
+  "gpu_calls": [],
+  "natoms": 16,
+  "configs": 12,
+  "spring_eV_A2": 1.0,
+  "nearest_A": 2.351258971274751,
+  "cutoff_A": 2.4688219198384886,
+  "fc2_max_absolute_error": 4.1136576344529934e-18,
+  "fc2_max_relative_error": 1.0284144086132484e-18,
+  "force_relative_error": 1.7462312464099878e-18,
+  "asr_max_absolute_error": 0.0,
+  "stage_seconds": {
+    "cluster": 1.2054093310143799,
+    "constraints": 1.182767731952481,
+    "sensing": 1.7718731219647452,
+    "fit": 1.2230871389620006
+  },
+  "passed": true
+}

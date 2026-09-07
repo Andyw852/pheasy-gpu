@@ -1,0 +1,23 @@
+{
+  "checkout": "/home/wangchao/software/pheasy-gpu",
+  "python": "/home/wangchao/miniconda3/envs/atomate2_p_a/bin/python",
+  "workdir": "/tmp/pheasy_si_chain_rhfu4a18",
+  "gpu_requested": false,
+  "gpu_calls": [],
+  "natoms": 16,
+  "configs": 12,
+  "spring_eV_A2": 1.0,
+  "nearest_A": 2.351258971274751,
+  "cutoff_A": 2.4688219198384886,
+  "fc2_max_absolute_error": 6.798699777552592e-17,
+  "fc2_max_relative_error": 1.699674944388148e-17,
+  "force_relative_error": 4.8524210542504036e-17,
+  "asr_max_absolute_error": 0.0,
+  "stage_seconds": {
+    "cluster": 1.7060121340000478,
+    "constraints": 1.2628070889986702,
+    "sensing": 1.894450184998277,
+    "fit": 1.4577951889987162
+  },
+  "passed": true
+}

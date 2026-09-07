@@ -1,0 +1,42 @@
+[2026-09-07 01:01:21,236] Start Pheasy.
+_///////  _//     _//_////////      _/         _// //  _//      _//
+_//    _//_//     _//_//           _/ //     _//    _// _//    _// 
+_//    _//_//     _//_//          _/  _//     _//        _// _//   
+_///////  _////// _//_//////     _//   _//      _//        _//     
+_//       _//     _//_//        _////// _//        _//     _//     
+_//       _//     _//_//       _//       _// _//    _//    _//     
+_//       _//     _//_////////_//         _//  _// //      _// 0.0.2
+[2026-09-07 01:01:21,242] System: C60Mg2
+[2026-09-07 01:01:21,242] Space group: C2/m (12), 4 symmetry operations found.
+[2026-09-07 01:01:21,242] Creating 2 x 2 x 2 supercell (496 atoms).
+[2026-09-07 01:01:26,496] Starting to generate cluster space up to 3-order.
+[2026-09-07 01:01:26,497] Cutoff distance (A) for 2-order IFCs: 7.00
+[2026-09-07 01:01:36,935] Cutoff distance (A) for 3-order IFCs: 4.50
+[2026-09-07 01:01:59,732] Summary of cluster space:
+[2026-09-07 01:01:59,732] - HARM    | cluster number: 1192 | IFC number: 10728
+[2026-09-07 01:01:59,732] - ANHARM3 | cluster number: 2061 | IFC number: 55647
+[2026-09-07 01:02:05,387] Cluster space generation finished, time cost: 0:00:38.890466.
+[2026-09-07 01:02:05,387] Finalize Pheasy, total time cost: 0:00:44.153538.
+	Command being timed: "python -m pheasy_gpu.run_pheasy --dim 2 2 2 -w 3 --c2 7.0 --c3 4.5 --eps 0.001 -s"
+	User time (seconds): 46.86
+	System time (seconds): 1.21
+	Percent of CPU this job got: 105%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:45.72
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 1132708
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 465066
+	Voluntary context switches: 309
+	Involuntary context switches: 181
+	Swaps: 0
+	File system inputs: 0
+	File system outputs: 205848
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0

@@ -1,0 +1,50 @@
+{
+  "seconds": 1153.836753767915,
+  "phase": "full_ols/fit",
+  "VmHWM_bytes": 89658318848,
+  "VmRSS_bytes": 62521532416,
+  "gpu": [
+    {
+      "device": 0,
+      "allocated": 12987864576,
+      "reserved": 13012828160,
+      "peak_allocated": 13003338240,
+      "peak_reserved": 13012828160
+    },
+    {
+      "device": 1,
+      "allocated": 15083953152,
+      "reserved": 15109980160,
+      "peak_allocated": 15102156800,
+      "peak_reserved": 15109980160
+    },
+    {
+      "device": 2,
+      "allocated": 15976340480,
+      "reserved": 16001269760,
+      "peak_allocated": 15995705344,
+      "peak_reserved": 16001269760
+    },
+    {
+      "device": 3,
+      "allocated": 15960394752,
+      "reserved": 15984492544,
+      "peak_allocated": 15979739136,
+      "peak_reserved": 15984492544
+    },
+    {
+      "device": 4,
+      "allocated": 15569577472,
+      "reserved": 15594422272,
+      "peak_allocated": 15588412928,
+      "peak_reserved": 15594422272
+    },
+    {
+      "device": 5,
+      "allocated": 15157891584,
+      "reserved": 15183380480,
+      "peak_allocated": 15176192000,
+      "peak_reserved": 15183380480
+    }
+  ]
+}

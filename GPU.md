@@ -2,8 +2,8 @@
 
 pheasy-gpu is a drop-in CUDA (PyTorch) backend for pheasy. It keeps the exact
 same control flow -- grouped cross-validation, alpha grids, standardization,
-relaxed-LASSO debias, recursive feature elimination -- and moves only the heavy
-dense linear algebra onto the GPU. The original pheasy is untouched; this is a
+relaxed-LASSO debias, recursive feature elimination -- and moves dense linear
+algebra and optional two-level sparse matrix-vector products onto GPUs. This is a
 separate package named `pheasy_gpu` so both can be installed side by side.
 
 ## What is accelerated
@@ -16,6 +16,7 @@ separate package named `pheasy_gpu` so both can be installed side by side.
 | ALASSO | ridge pilot + `LassoCV` on scaled cols | ridge pilot + FISTA with per-column weights |
 | RFE | `scipy.linalg.lstsq` per subset | rank-checked QR + `gels` per subset, SVD fallback |
 | SM loading | `sm_prime @ NS` (sparse) on CPU | `torch.sparse.mm` on GPU (**holdout_eval only**) |
+| TwoLevelSM | two sparse matvecs on CPU | `PHEASY_GPU_SM=1`: SM_prime/transpose split across GPUs; NS and LSMR iteration remain on CPU |
 
 **LASSO/ALASSO default to the GPU Gram-based FISTA.** FISTA solves the exact
 same convex problem as sklearn's coordinate descent and, once the per-iteration
@@ -52,8 +53,8 @@ support as RFE. Verified on n=8: ~72 s, nnz=2092.
 
 Activation (in priority order):
 
-1. `Optimizer(..., use_gpu=True/False)` -- explicit process-wide override
-   (last-created Optimizer wins; there is no per-instance isolation).
+1. `Optimizer(..., use_gpu=True/False)` -- override applied during that
+   instance's fit; the preceding backend mode is restored afterwards.
 2. `PHEASY_USE_GPU` env var: `0`/`off` forces CPU, `1`/`on` forces GPU,
    unset -> auto (GPU when `torch.cuda.is_available()`).
 
@@ -70,6 +71,61 @@ PHEASY_USE_GPU=0 python holdout_eval.py <data_dir> ...
 ```
 
 ## Tuning knobs
+
+### Large matrices and multiple GPUs
+
+After preparing the data and building the cluster space, null space, and
+`sm_prime.npz`, run inside a scheduler allocation with six visible GPUs:
+
+```bash
+PHEASY_USE_GPU=1 PHEASY_GPU_SM=1 PHEASY_GPU_SM_NGPU=6 \
+PHEASY_GPU_SM_DEVICES=0,1,2,3,4,5 PHEASY_TWOLEVEL_CACHE_T=0 \
+PHEASY_SM_DTYPE=float64 PHEASY_OLS_TWOLEVEL=1 \
+pheasy-gpu --dim 2 2 2 -w 3 --c2 7 --c3 4.5 -f --ndata 699 -l OLS --hdf5
+```
+
+Device numbers are relative to `CUDA_VISIBLE_DEVICES`. `PHEASY_USE_GPU`
+controls dense solves; `PHEASY_GPU_SM` separately enables the two-level sparse
+backend. The complete sparse matrix still resides in host RAM. GPUs store
+row blocks and transpose blocks; this does not pool their memory into a
+single dense allocation. Actual block budgets and int32 index limits are
+checked before upload. Ordinary fitting reports a CPU fallback if a GPU
+cannot be used; `dev/validate_large_fit.py` treats a fallback as a failed test.
+
+`RFE-OLS-TSQR` can use `PHEASY_RFE_TWOLEVEL=1` to avoid constructing the dense
+product. Its subset solves then use **LSMR**, not a distributed QR. Dense
+TSQR retains an O(p²) factor and is unsuitable when that factor and its
+workspace exceed RAM. Grouped RFE may require many complete iterative
+solves, so first measure a representative configuration subset.
+
+OLS exposes iterative stopping diagnostics in `Optimizer.results["solver_info"]`.
+LSQR/LSMR warn on iteration/condition limits. Check `converged` before accepting
+the coefficients. `PHEASY_OLS_MAXITER`, `PHEASY_OLS_ATOL`, and
+`PHEASY_OLS_BTOL` configure two-level OLS; RFE uses `PHEASY_LSQR_*`.
+Exact two-level column norms use bounded row products; their temporary budget
+defaults to 64 MiB (`PHEASY_COL_NORM_BLOCK_BYTES`).
+`PHEASY_OLS_JACOBI=1` uses these norms to scale columns before LSMR and
+returns coefficients in the original units. This can help when column scales
+differ substantially. It preserves the least-squares objective (and the
+original ridge penalty when enabled); for nonunique unregularized solutions,
+column scaling can change which minimum-residual coefficient vector is chosen.
+Explicitly requested preconditioning propagates preparation/solver errors
+instead of silently repeating the solve without scaling.
+
+For fractional-coordinate arrays whose atom order differs from SPOSCAR:
+
+```bash
+python tools/prepare_dataset.py SPOSCAR dataset_disps.npy dataset_forces.npy \
+    --frac --align-reference
+```
+
+This applies the same geometrically verified permutation to coordinates and
+forces, and writes `dataset_alignment.json`. The reference frame must describe
+the same structure as SPOSCAR. Compact fc3 output allocates only primitive
+representatives on its first atom axis; `--full_ifc` explicitly requests the
+larger complete tensor.
+
+### Dense solver controls
 
 * `PHEASY_GPU_DEVICE` -- CUDA device index (default `0` / first visible
   device); read fresh on every call (no caching).
@@ -175,8 +231,8 @@ binding constraint is FP64 compute (the SVD), not memory. Memory notes:
 * **The backend is uniformly float64.** A `PHEASY_GPU_DTYPE=float32` mode was
   removed because it only affected a few entry points and silently mixed
   precisions.
-* The dense SM (`n x p`) materialisation is inherent to the dense path; the
-  `TwoLevelSM` LinearOperator path (still CPU) avoids it for very large systems.
+* The dense SM (`n x p`) materialisation is inherent to the dense path;
+  `TwoLevelSM` avoids it and optionally distributes sparse matvecs over GPUs.
 
 ## Correctness check (recommended)
 
@@ -211,9 +267,8 @@ LASSO diff, add `PHEASY_GPU_LASSO=0` to both runs.
 
 ## Limitations
 
-* The two-level `TwoLevelSM` LinearOperator path (used by `run_pheasy` for very
-  large systems that never materialize the dense sensing matrix) still runs its
-  LSMR/FISTA matvecs on the CPU.
+* `TwoLevelSM` uses GPU sparse matvecs only when `PHEASY_GPU_SM=1`. The solver
+  iteration and the NS multiplication remain on the CPU.
 * **GPU SM loading is wired into `holdout_eval.py` only.** The `pheasy-gpu`
   CLI (`run_pheasy.py`) still assembles `SM_prime @ NS` with scipy on the CPU;
   the "SM load 1421s -> 28s" row above applies to `holdout_eval`, not to the

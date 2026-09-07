@@ -1,0 +1,23 @@
+{
+  "checkout": "/home/wangchaoyue852/software/pheasy-gpu-validation/20260906_mg2c60/src/pheasy_gpu",
+  "python": "/home/wangchaoyue852/miniconda3/envs/wc/bin/python",
+  "workdir": "/home/wangchaoyue852/software/pheasy-gpu-validation/20260906_mg2c60/si_chain_cpu_explicit",
+  "gpu_requested": false,
+  "gpu_calls": [],
+  "natoms": 16,
+  "configs": 12,
+  "spring_eV_A2": 1.0,
+  "nearest_A": 2.351258971274751,
+  "cutoff_A": 2.4688219198384886,
+  "fc2_max_absolute_error": 4.1136576344529934e-18,
+  "fc2_max_relative_error": 1.0284144086132484e-18,
+  "force_relative_error": 1.7462312464099878e-18,
+  "asr_max_absolute_error": 0.0,
+  "stage_seconds": {
+    "cluster": 1.2054093310143799,
+    "constraints": 1.182767731952481,
+    "sensing": 1.7718731219647452,
+    "fit": 1.2230871389620006
+  },
+  "passed": true
+}

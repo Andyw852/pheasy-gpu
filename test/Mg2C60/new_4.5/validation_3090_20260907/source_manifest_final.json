@@ -1,0 +1,27 @@
+{
+  "git_head": "87e60a8d06083b574d31880b7592b08d4d2ae857",
+  "source_sha256": {
+    "core/optimizer.py": "170811a21d40f48c207dc44496cddee242e456eee5da81c340e941ba1942b683",
+    "core/gpu_backend.py": "d14c34b5d59b289129c5605edca6254bc71d666e456a0ff7073128d6913eb105",
+    "interface/phono23py.py": "e561119e3b580797d5ca31b662cad2f6e877158d6c4809f270fa17ed393c619f",
+    "run_pheasy.py": "a2bd38fe9d3c5d2068b6d74b567a66a9eb1df8f5aca8962bdc497b7b72a81698",
+    "tools/prepare_dataset.py": "bf8b9e39720ab44b013cd4589574950e511b1c4a63290a6241c488c857986c6c",
+    "pheasy_fit.sh": "97f003214bfc186de487256f75e9762613187f07a22bc3b8635f00bbef078ca4",
+    "GPU.md": "41d23b551a84e2f71e12eded82226a8be52b9d427b20258bd0f9e319b374e668",
+    "dev/validate_large_fit.py": "7182dc6e1e5cb83927034d0e3ae975b16f5f2ebee3552239957e0da6e8b045a5",
+    "dev/validate_gpu_backends.py": "eeaa2541b56eda9b737f4aa4469663aa04d5c25eb72a92f8d8dc2ab92529b49f",
+    "dev/large_validation.sbatch": "625c4b333aaed6974983d073dac9a0aeaf57655896606a9fba2047d6627b61e9",
+    "dev/test_cli_harmonic_chain.py": "407b6126c884e7086528e4f14efe50fb00cd0fdfff0cfb39c076eafe5f22c515",
+    "dev/test_optimizer_large_regressions.py": "58a54537736aadd7dbd389d5d3ce7941feba4972c1b2e07a9e2233339babdbf0",
+    "dev/test_gpu_memory_regressions.py": "9d9b1707360afcf82dc39d56b9bf1eaaf0889b9a030383b3ce89dafabb3dba20",
+    "dev/test_dataset_preparation.py": "7db66a529ff4d629296fb4bfea6c15474bb4b0f862741b8a884636735b3ba247",
+    "dev/test_compact_fc3.py": "aeb32cc117c1c55ddac64d32bddb5f162ac181e96a8c42bb0c8547ae79845985",
+    "dev/test_ifc2_read.py": "e820ea492465453e32eca7412851afa11c3b669691a8a29cd5dcfb443083db6e"
+  },
+  "original_user_files_preserved": {
+    "interface/shengbte.py": "ef9df08d0b5ad2271e53439aa4c9ead0d2851b076a4093b087aeff200366ec27",
+    "structure/force_constants.py": "db7bd2449dafd6a149eafe0f15ab2ab874271fdde3218511e0ba5c4f9dc3d68b",
+    "gen_shengbte_control.py": "ac84553e31f9de7dbb9f401f45b479b82f5974789abdf6a0abbd72b5f2c339f8",
+    "dev/si_bench_chain_report.md": "76711319f86c575a87633265d264090454db01b76486871ea678a853e3e18f1f"
+  }
+}

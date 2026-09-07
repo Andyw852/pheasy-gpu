@@ -1,0 +1,99 @@
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5
+START 2026-09-07T06:14:37+08:00
+[2026-09-07 06:14:40,878] Start Pheasy.
+{_______  {__     {__{________      {_         {__ __  {__      {__
+{__    {__{__     {__{__           {_ __     {__    {__ {__    {__ 
+{__    {__{__     {__{__          {_  {__     {__        {__ {__   
+{_______  {______ {__{______     {__   {__      {__        {__     
+{__       {__     {__{__        {______ {__        {__     {__     
+{__       {__     {__{__       {__       {__ {__    {__    {__     
+{__       {__     {__{________{__         {__  {__ __      {__   0.0.2
+[2026-09-07 06:14:40,884] System: C60Mg2
+[2026-09-07 06:14:40,884] Space group: C2/m (12), 4 symmetry operations found.
+[2026-09-07 06:14:40,884] Creating 2 x 2 x 2 supercell (496 atoms).
+[2026-09-07 06:14:40,962] Reading and generating cluster space from file, up to 3-order.
+[2026-09-07 06:14:45,180] Cutoff distance (A) for 2-order IFCs: 7.00
+[2026-09-07 06:14:45,180] Cutoff distance (A) for 3-order IFCs: 4.50
+[2026-09-07 06:14:45,180] Summary of cluster space:
+[2026-09-07 06:14:45,180] - HARM    | cluster number: 1192 | IFC number: 10728
+[2026-09-07 06:14:45,180] - ANHARM3 | cluster number: 2061 | IFC number: 55647
+[2026-09-07 06:14:45,180] Reconstructing null space of symmetry constraints from file.
+[2026-09-07 06:14:45,610] Summary of IFCs:
+[2026-09-07 06:14:45,610] - HARM    | IFC number: 10728 | Free IFC number: 10252
+[2026-09-07 06:14:45,610] - ANHARM3 | IFC number: 55647 | Free IFC number: 42031
+[2026-09-07 06:14:45,610] Total number of free IFCs: 52283
+[2026-09-07 06:14:45,611] Reconstructing sensing (displacement) matrix from file.
+[2026-09-07 06:18:59,040] Starting to fit interatomic force constants.
+[2026-09-07 06:18:59,043] SM_prime kept sparse float64 CSR: shape=(1040112, 66375), nnz=3780068976, mem=60.49 GB
+[2026-09-07 06:18:59,043 - run_pheasy][WARNING] - SM_prime is 60.5 GB in float64. Set PHEASY_SM_DTYPE=float32 to halve it (all matrices stay consistent). (run_pheasy.py:647)
+[2026-09-07 06:18:59,043] Reading interatomic forces, 699 configurations.
+[SM-sparse] ALASSO/LASSO sparse path: (1040112, 66375) x (66375, 52283)
+/home/wangchaoyue852/software/pheasy-gpu-validation/20260906_mg2c60/src/pheasy_gpu/core/gpu_backend.py:1027: UserWarning: Sparse CSR tensor support is in beta state. If you miss a functionality in the sparse tensor support, please submit a feature request to https://github.com/pytorch/pytorch/issues. (Triggered internally at /pytorch/aten/src/ATen/SparseCsrTensorImpl.cpp:53.)
+  return t.sparse_csr_tensor(crow, ccol, cval, size=m.shape,
+[GPU-SM] SpMV on 6 device(s), dtype=float64
+[SM-twolevel] OLS 两级 matvec (不生成 SM): SM_prime(1040112, 66375)(60.5GB) @ NS(66375, 52283)(0.1GB), SM.shape=(1040112, 52283), 峰值~60.5GB
+[2026-09-07 06:25:21,877] Fitting force constants via the ordinary least-square.
+/home/wangchaoyue852/software/pheasy-gpu-validation/20260906_mg2c60/src/pheasy_gpu/core/optimizer.py:2297: RuntimeWarning: LSMR did not converge: iteration limit reached (istop=7, iterations=10000, normr=1.512586e+01, normar=2.533018e-02). Check the fit residual and solver tolerances/iteration limit before using these coefficients.
+  self._ols_lsmr_info = _iterative_solver_info(result, "LSMR")
+[SOLVER] {"solver": "LSMR", "istop": 7, "itn": 10000, "normr": 15.125860170010712, "normar": 0.025330180138956465, "conda": 502.297495307997, "converged": false}
+Traceback (most recent call last):
+  File "/home/wangchaoyue852/software/pheasy-gpu-validation/20260906_mg2c60/src/pheasy_gpu/dev/validate_large_fit.py", line 286, in <module>
+    main()
+    ~~~~^^
+  File "/home/wangchaoyue852/software/pheasy-gpu-validation/20260906_mg2c60/src/pheasy_gpu/dev/validate_large_fit.py", line 278, in main
+    results = (full if args.mode == 'full' else holdout)(data, output, devices, monitor)
+  File "/home/wangchaoyue852/software/pheasy-gpu-validation/20260906_mg2c60/src/pheasy_gpu/dev/validate_large_fit.py", line 195, in full
+    cli_main()
+    ~~~~~~~~^^
+  File "/home/wangchaoyue852/software/pheasy-gpu-validation/20260906_mg2c60/src/pheasy_gpu/run_pheasy.py", line 1545, in main
+    workflow.run_fit_force_constants()  # fit interatomic force constants
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^
+  File "/home/wangchaoyue852/software/pheasy-gpu-validation/20260906_mg2c60/src/pheasy_gpu/run_pheasy.py", line 1325, in run_fit_force_constants
+    optimizer.fit(SM, FM)
+    ~~~~~~~~~~~~~^^^^^^^^
+  File "/home/wangchaoyue852/software/pheasy-gpu-validation/20260906_mg2c60/src/pheasy_gpu/dev/validate_large_fit.py", line 185, in instrumented
+    summary.update(audited_fit(optimizer, operator, forces, original_fit,
+                   ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                              devices, output, 'full_ols', monitor))
+                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/wangchaoyue852/software/pheasy-gpu-validation/20260906_mg2c60/src/pheasy_gpu/dev/validate_large_fit.py", line 122, in audited_fit
+    original_fit(optimizer, operator, forces)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/wangchaoyue852/software/pheasy-gpu-validation/20260906_mg2c60/src/pheasy_gpu/core/optimizer.py", line 2318, in fit
+    return self._fit_impl(A, F, weights)
+           ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^
+  File "/home/wangchaoyue852/software/pheasy-gpu-validation/20260906_mg2c60/src/pheasy_gpu/core/optimizer.py", line 2347, in _fit_impl
+    coef, n_iter = self._fit_ols(A, F64)
+                   ~~~~~~~~~~~~~^^^^^^^^
+  File "/home/wangchaoyue852/software/pheasy-gpu-validation/20260906_mg2c60/src/pheasy_gpu/core/optimizer.py", line 2594, in _fit_ols
+    coef = self._ols_lsmr(A, F)
+  File "/home/wangchaoyue852/software/pheasy-gpu-validation/20260906_mg2c60/src/pheasy_gpu/core/optimizer.py", line 2297, in _ols_lsmr
+    self._ols_lsmr_info = _iterative_solver_info(result, "LSMR")
+                          ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^
+  File "/home/wangchaoyue852/software/pheasy-gpu-validation/20260906_mg2c60/src/pheasy_gpu/dev/validate_large_fit.py", line 117, in record_info
+    raise AssertionError('unconverged ' + repr(info))
+AssertionError: unconverged {'solver': 'LSMR', 'istop': 7, 'itn': 10000, 'normr': 15.125860170010712, 'normar': 0.025330180138956465, 'conda': 502.297495307997, 'converged': False}
+Command exited with non-zero status 1
+	Command being timed: "python src/pheasy_gpu/dev/validate_large_fit.py full data --output full_validation"
+	User time (seconds): 5116.28
+	System time (seconds): 358.40
+	Percent of CPU this job got: 472%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 19:19.20
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 87556952
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 3
+	Minor (reclaiming a frame) page faults: 30892079
+	Voluntary context switches: 300361
+	Involuntary context switches: 10952
+	Swaps: 0
+	File system inputs: 238984
+	File system outputs: 13496
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 1

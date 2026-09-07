@@ -50,6 +50,7 @@
 #  └─────────────────────────────────────────────────────────────────────┘
 #
 #  其它常用环境变量：
+#    PHEASY_EXECUTABLE=      拟合程序路径 (默认 pheasy-gpu)
 #    PHEASY_LASSO_DEBIAS=0   关闭 LASSO/ALASSO 去偏
 #    PHEASY_RFE_STEP=0.05    RFE 每轮删除比例
 #    PHEASY_RFE_MIN_FEATURES RFE 最小保留特征数
@@ -80,6 +81,14 @@
 #    bash pheasy_fit.sh FIT_METHOD=RIDGE  C3_CUTOFF=5.2 MU_MIN=-6 MU_MAX=-2
 # =============================================================================
 set -uo pipefail
+
+# This distribution installs pheasy-gpu; a co-installed upstream pheasy
+# command would silently run a different package.
+PHEASY_EXECUTABLE="${PHEASY_EXECUTABLE:-pheasy-gpu}"
+if ! command -v "$PHEASY_EXECUTABLE" >/dev/null 2>&1; then
+  echo "找不到 $PHEASY_EXECUTABLE；请安装 pheasy-gpu 或设置 PHEASY_EXECUTABLE 为程序路径。" >&2
+  exit 2
+fi
 
 # ===== 默认参数 (命令行 KEY=VAL 可覆盖) =====
 FIT_METHOD="OLS"
@@ -237,14 +246,14 @@ echo "拟合: $FIT_METHOD | 阶次 $FIT_ORDER | c2=$C2_CUTOFF c3=$C3_CUTOFF c4=$
 
 if [ ! -f cs.pkl ]; then
   echo "[1/4] cluster space"
-  pheasy --dim $DIM $W_FLAG -s $C_FLAG --eps $NULL_SPACE_EPS || exit 1
+  "$PHEASY_EXECUTABLE" --dim $DIM $W_FLAG -s $C_FLAG --eps $NULL_SPACE_EPS || exit 1
 else
   echo "[1/4] cluster space 跳过 (cs.pkl)"
 fi
 
 if [ ! -f ns_harm.npz ]; then
   echo "[2/4] null space"
-  pheasy --dim $DIM $W_FLAG -c $C_FLAG --eps $NULL_SPACE_EPS || exit 1
+  "$PHEASY_EXECUTABLE" --dim $DIM $W_FLAG -c $C_FLAG --eps $NULL_SPACE_EPS || exit 1
 else
   echo "[2/4] null space 跳过 (ns_harm.npz)"
 fi
@@ -252,7 +261,7 @@ printf '%s' "$_stamp_struct" > .pheasy_stamp_struct
 
 if [ ! -f sm_prime.npz ]; then
   echo "[3/4] sensing matrix (按全部 $SM_NDATA 个构型建表, 供任意 NDATA<=$SM_NDATA 复用)"
-  pheasy --dim $DIM $W_FLAG -d $C_FLAG --ndata $SM_NDATA --disp_file --eps $NULL_SPACE_EPS || exit 1
+  "$PHEASY_EXECUTABLE" --dim $DIM $W_FLAG -d $C_FLAG --ndata $SM_NDATA --disp_file --eps $NULL_SPACE_EPS || exit 1
 else
   echo "[3/4] sensing matrix 跳过 (sm_prime.npz, 建表构型数 $SM_NDATA)"
 fi
@@ -272,7 +281,7 @@ if [[ "$FIT_METHOD" =~ ^(LASSO|ALASSO)$ ]]; then
 elif [ "$FIT_METHOD" = "RIDGE" ]; then
   FIT_FLAGS="$FIT_FLAGS --mu_min $MU_MIN --mu_max $MU_MAX --nmu $NMU"
 fi
-pheasy --dim $DIM $W_FLAG -f $C_FLAG --ndata $NDATA --eps $NULL_SPACE_EPS $FIT_FLAGS || exit 1
+"$PHEASY_EXECUTABLE" --dim $DIM $W_FLAG -f $C_FLAG --ndata $NDATA --eps $NULL_SPACE_EPS $FIT_FLAGS || exit 1
 
 echo "完成"
 python3 -c "

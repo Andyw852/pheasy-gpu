@@ -1,0 +1,11 @@
+test_budget_uses_actual_nonzeros_and_cuda_index_dtype (__main__.GpuMemoryRegressions.test_budget_uses_actual_nonzeros_and_cuda_index_dtype) ... ok
+test_later_card_failure_releases_earlier_uploads (__main__.GpuMemoryRegressions.test_later_card_failure_releases_earlier_uploads) ... ok
+test_multiple_gpu_blocks_match_cpu_and_do_not_repeat_devices (__main__.GpuMemoryRegressions.test_multiple_gpu_blocks_match_cpu_and_do_not_repeat_devices) ... ok
+test_oversized_column_dimension_is_rejected (__main__.GpuMemoryRegressions.test_oversized_column_dimension_is_rejected) ... ok
+test_oversized_nnz_is_rejected_before_tensor_allocation (__main__.GpuMemoryRegressions.test_oversized_nnz_is_rejected_before_tensor_allocation) ... ok
+test_skewed_blocks_fail_before_upload (__main__.GpuMemoryRegressions.test_skewed_blocks_fail_before_upload) ... ok
+
+----------------------------------------------------------------------
+Ran 6 tests in 0.007s
+
+OK

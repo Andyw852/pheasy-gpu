@@ -1,0 +1,22 @@
+[
+  {
+    "test": "test_optimizer_large_regressions",
+    "returncode": 0
+  },
+  {
+    "test": "test_gpu_memory_regressions",
+    "returncode": 0
+  },
+  {
+    "test": "test_dataset_preparation",
+    "returncode": 0
+  },
+  {
+    "test": "test_compact_fc3",
+    "returncode": 0
+  },
+  {
+    "test": "test_ifc2_read",
+    "returncode": 0
+  }
+]
