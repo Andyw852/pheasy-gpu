@@ -268,7 +268,7 @@ fi
 printf '%s' "$_stamp_data" > .pheasy_stamp_data
 
 echo "[4/4] fit ($FIT_METHOD, ndata=$NDATA)"
-FIT_FLAGS="--full_ifc -l $FIT_METHOD --hdf5"
+FIT_FLAGS="-l $FIT_METHOD --hdf5"
 # --std 对 LASSO / ALASSO / RIDGE 都生效。RIDGE 尤其需要：列范数跨度可达 1e2，
 # 不标准化等于对不同项施加差百倍的 L2 惩罚。
 if [ "$STANDARDIZE" = "true" ] && [[ "$FIT_METHOD" =~ ^(LASSO|ALASSO|RIDGE)$ ]]; then

@@ -7,6 +7,7 @@ Run under a scheduler allocation, with this checkout on PYTHONPATH:
 No full sensing-matrix product is materialized or saved by this driver.
 """
 import argparse
+import inspect
 import gc
 import json
 import os
@@ -107,6 +108,9 @@ def audited_fit(optimizer, operator, forces, original_fit, devices, output, labe
     start = time.monotonic()
     records = []
     original_info = om._iterative_solver_info
+    original_fista = om._fista_lasso
+    fista_signature = inspect.signature(original_fista)
+    calls_before = getattr(backend, "_n_calls", 0)
 
     def record_info(result, solver):
         info = original_info(result, solver)
@@ -117,11 +121,28 @@ def audited_fit(optimizer, operator, forces, original_fit, devices, output, labe
             raise AssertionError('unconverged ' + repr(info))
         return info
 
+    def record_fista(*args, **kwargs):
+        bound = fista_signature.bind(*args, **kwargs)
+        bound.apply_defaults()
+        if bound.arguments['_info'] is None:
+            bound.arguments['_info'] = {}
+        coef = original_fista(*bound.args, **bound.kwargs)
+        info = dict(solver='FISTA', **bound.arguments['_info'],
+                    alpha=float(bound.arguments['alpha']), tol=float(bound.arguments['tol']))
+        records.append(info)
+        write_json(output / (label + '_solvers.json'), records)
+        print('[SOLVER]', json.dumps(info), flush=True)
+        if not info.get('converged', False):
+            raise AssertionError('FISTA lacks stationarity: ' + repr(info))
+        return coef
+
+    om._fista_lasso = record_fista
     om._iterative_solver_info = record_info
     try:
         original_fit(optimizer, operator, forces)
     finally:
         om._iterative_solver_info = original_info
+        om._fista_lasso = original_fista
     fit_seconds = time.monotonic() - start
     require_gpu(operator, devices)
     if not records or not all(item['converged'] for item in records):
@@ -136,7 +157,7 @@ def audited_fit(optimizer, operator, forces, original_fit, devices, output, labe
     if error > 1e-10:
         raise AssertionError('real CPU/GPU force prediction mismatch: %g' % error)
     result = dict(label=label, shape=operator.shape, matrix_dtype=str(operator.dtype),
-                  devices=devices, gpu_spmv_calls=backend._n_calls,
+                  devices=devices, gpu_spmv_calls=backend._n_calls - calls_before,
                   fit_seconds=fit_seconds, solver_records=records,
                   nonzero=int(np.count_nonzero(coefficient)),
                   cpu_gpu_prediction_relative_error=error,
@@ -202,7 +223,7 @@ def full(data, output, devices, monitor):
     return summary
 
 
-def holdout(data, output, devices, monitor):
+def holdout(data, output, devices, monitor, methods=None, nalpha=5, tol=1e-6, max_iter=50000):
     monitor.phase = 'holdout/load'
     selected = np.random.default_rng(20260907).permutation(699)[:100]
     train_ids, test_ids = np.sort(selected[:80]), np.sort(selected[80:])
@@ -223,15 +244,30 @@ def holdout(data, output, devices, monitor):
     require_gpu(operator, devices)
     results = {}
     try:
-        for method, label in [('OLS', 'holdout_ols'), ('RFE-OLS-TSQR', 'holdout_rfe')]:
+        for method in (methods or ['OLS', 'RFE-OLS-TSQR']):
+            label = 'holdout_' + ('rfe' if method == 'RFE-OLS-TSQR' else 'rfe_plain' if method == 'RFE' else method.lower())
+            regularized = method in ('LASSO', 'ALASSO', 'RIDGE')
             optimizer = om.Optimizer(method, cv=3, rand_seed=20260907, use_gpu=True,
-                                     standardize=False)
+                                     nalpha=nalpha, tol=tol, max_iter=max_iter,
+                                     standardize=regularized)
             result = audited_fit(optimizer, operator, y_train, om.Optimizer.fit,
                                  devices, output, label, monitor, config_ids=train_ids)
             test_prediction = testing @ (ns @ optimizer.results['coef'])
             result['holdout'] = force_metrics(test_prediction, y_test, 1488, test_ids)
+            if "pre_debias_coef" in optimizer.results:
+                before = np.asarray(optimizer.results["pre_debias_coef"])
+                after = np.asarray(optimizer.results["coef"])
+                if np.any(after[before == 0] != 0):
+                    raise AssertionError("debias introduced features outside selected support")
+                np.save(output / (label + "_pre_debias_coef.npy"), before)
+                result["pre_debias"] = dict(
+                    nonzero=int(np.count_nonzero(before)),
+                    metrics=force_metrics(operator @ before, y_train, 1488, train_ids),
+                    holdout=force_metrics(testing @ (ns @ before), y_test, 1488, test_ids))
+                require_gpu(operator, devices)
             result['method'] = method
-            result['algorithm'] = 'LSMR on TwoLevelSM'
+            result['algorithm'] = 'FISTA on TwoLevelSM' if method in ('LASSO', 'ALASSO') else 'iterative least squares on TwoLevelSM'
+            result['selected_alpha'] = optimizer.results.get('alpha')
             write_json(output / (label + '.json'), result)
             results[label] = result
     finally:
@@ -246,13 +282,17 @@ def main():
     parser.add_argument('data', type=Path)
     parser.add_argument('--output', required=True, type=Path)
     parser.add_argument('--devices', default='0,1,2,3,4,5')
+    parser.add_argument('--methods', nargs='+', choices=['OLS', 'RFE-OLS-TSQR', 'RFE', 'LASSO', 'ALASSO', 'RIDGE'])
+    parser.add_argument('--nalpha', type=int, default=5)
+    parser.add_argument('--tol', type=float, default=1e-6)
+    parser.add_argument('--max-iter', type=int, default=50000)
     args = parser.parse_args()
     data, output = args.data.resolve(), args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
     devices = [int(d) for d in args.devices.split(',')]
-    assert len(devices) == 6 and len(set(devices)) == 6
+    assert 1 <= len(devices) <= 6 and len(set(devices)) == len(devices)
     assert torch.cuda.is_available() and max(devices) < torch.cuda.device_count()
-    defaults = dict(PHEASY_USE_GPU='1', PHEASY_GPU_SM='1', PHEASY_GPU_SM_NGPU='6',
+    defaults = dict(PHEASY_USE_GPU='1', PHEASY_GPU_SM='1', PHEASY_GPU_SM_NGPU=str(len(devices)),
                     PHEASY_GPU_SM_DEVICES=args.devices, PHEASY_GPU_DEVICE=str(devices[0]),
                     PHEASY_SM_DTYPE='float64', PHEASY_OLS_TWOLEVEL='1',
                     PHEASY_TWOLEVEL_CACHE_T='0', PHEASY_OLS_JACOBI='1',
@@ -260,15 +300,17 @@ def main():
                     PHEASY_OLS_RIDGE='0', PHEASY_OLS_ATOL='1e-8', PHEASY_OLS_BTOL='1e-8',
                     PHEASY_OLS_MAXITER='50000', PHEASY_LSQR_ATOL='1e-8',
                     PHEASY_LSQR_BTOL='1e-8', PHEASY_LSQR_MAXITER='50000',
-                    PHEASY_RFE_TWOLEVEL='1', PHEASY_RFE_N_JOBS='1', PHEASY_TSQR_STEP='0.5',
+                    PHEASY_RFE_TWOLEVEL='1', PHEASY_RFE_JACOBI='1',
+                    PHEASY_RFE_N_JOBS='1', PHEASY_TSQR_STEP='0.5',
                     PHEASY_TSQR_MIN_FEATURES='13071', PHEASY_TSQR_CRITERION='cv',
                     PHEASY_CV_GROUP_SIZE='1488', PHEASY_RFE_PATIENCE='5')
     for key, value in defaults.items():
         os.environ.setdefault(key, value)
     write_json(output / 'configuration.json', dict(mode=args.mode, data=str(data),
+                methods=args.methods, nalpha=args.nalpha, tol=args.tol, max_iter=args.max_iter,
                 source=str(Path(om.__file__).resolve()), torch_version=torch.__version__,
                 cuda_visible_devices=os.environ.get('CUDA_VISIBLE_DEVICES'),
-                environment={key: os.environ[key] for key in defaults}))
+                environment={key: value for key, value in os.environ.items() if key.startswith("PHEASY_")}))
     for device in devices:
         with torch.cuda.device(device):
             probe = torch.empty(0, device=device)
@@ -276,7 +318,8 @@ def main():
             torch.cuda.reset_peak_memory_stats(device)
     with Monitor(output, devices) as monitor:
         try:
-            results = (full if args.mode == 'full' else holdout)(data, output, devices, monitor)
+            results = (full(data, output, devices, monitor) if args.mode == 'full' else
+                       holdout(data, output, devices, monitor, args.methods, args.nalpha, args.tol, args.max_iter))
             write_json(output / 'result.json', dict(status='PASS', results=results))
         except Exception:
             write_json(output / 'result.json', dict(status='FAIL', traceback=traceback.format_exc()))

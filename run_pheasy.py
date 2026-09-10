@@ -1295,7 +1295,8 @@ class WorkFlow(object):
             if settings.MODEL.upper() == "LASSO":
                 from pheasy_gpu.core.optimizer import _lasso_backend
                 _be = _lasso_backend(SM)
-                _label = {"gpu": "FISTA (GPU Gram)",
+                _label = {"gpu_resident": "FISTA (GPU-resident sparse)",
+                          "gpu": "FISTA (GPU Gram)",
                           "iterative": "FISTA (CPU)",
                           "dense": "coordinate descent"}.get(_be, _be)
                 logger.info("Fitting force constants via %s LASSO." % _label)

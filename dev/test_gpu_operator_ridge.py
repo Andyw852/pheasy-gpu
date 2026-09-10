@@ -7,6 +7,74 @@ import scipy.sparse as sp
 from core import optimizer as opt
 
 class TestOperatorRidgeGPU(unittest.TestCase):
+    def test_cgls_scalar_reads_scale_as_one_per_iteration(self):
+        import torch
+        import warnings
+        from core import gpu_backend as gb
+        if not torch.cuda.is_available(): self.skipTest("CUDA required")
+        class Operator:
+            def matvec(self, x): return self.diagonal * x
+            def rmatvec(self, y): return self.diagonal * y
+            def norm_estimate(self): return 20.
+        A = Operator()
+        A.torch, A.device, A.shape = torch, torch.device("cuda:0"), (20, 20)
+        A.diagonal = torch.arange(1, 21, dtype=torch.float64, device=A.device)
+        original = torch.Tensor.item
+        counts = []
+        for cap in (2, 5):
+            reads = []
+            def counted(tensor, *args):
+                reads.append(tensor.device.type)
+                return original(tensor, *args)
+            with patch.object(torch.Tensor, "item", counted), warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                _, info = gb._iterative_lstsq_tensor(A, torch.ones(20, device=A.device),
+                                                   atol=0., btol=0., maxiter=cap)
+            self.assertEqual(info["n_iter"], cap)
+            self.assertFalse(info["converged"])
+            counts.append(reads.count("cuda"))
+        self.assertEqual(counts[1] - counts[0], 5 - 2)
+
+    def test_subset_norm_cache_is_local_to_view(self):
+        import torch
+        from core import gpu_backend as gb
+        if not torch.cuda.is_available(): self.skipTest("CUDA required")
+        with patch.dict(os.environ, {"PHEASY_GPU": "1"}):
+            base = gb.GpuCSRResidentOperator(sp.diags([1., 10., 100.], format="csr"))
+            try:
+                base._norma = 999.
+                a = gb.GpuSubsetOperator(base, [0])
+                b = gb.GpuSubsetOperator(base, [1])
+                with patch.object(gb, "_operator_norm_estimate", wraps=gb._operator_norm_estimate) as estimate:
+                    self.assertAlmostEqual(a.norm_estimate(), 1.)
+                    self.assertAlmostEqual(a.norm_estimate(), 1.)
+                    self.assertAlmostEqual(b.norm_estimate(), 10.)
+                    self.assertEqual(estimate.call_count, 2)
+            finally:
+                base.close()
+
+    def test_augmented_norm_cache_is_local_to_alpha(self):
+        import torch
+        from core import gpu_backend as gb
+        if not torch.cuda.is_available(): self.skipTest("CUDA required")
+        with patch.dict(os.environ, {"PHEASY_GPU": "1"}):
+            base = gb.GpuCSRResidentOperator(sp.eye(3, format="csr") * 2.)
+            seen = []
+            solve = gb._iterative_lstsq_tensor
+            def inspect(A, y, *args):
+                first = A.norm_estimate()
+                with patch.object(gb, "_operator_norm_estimate", side_effect=AssertionError("cache missed")):
+                    self.assertEqual(A.norm_estimate(), first)
+                seen.append(first)
+                return solve(A, y, *args)
+            try:
+                with patch.object(gb, "_iterative_lstsq_tensor", side_effect=inspect):
+                    for alpha in (1., 12.):
+                        gb._iterative_ridge_tensor(base, np.ones(3), alpha)
+                np.testing.assert_allclose(seen, np.sqrt([5., 16.]), rtol=1e-12)
+            finally:
+                base.close()
+
     def test_cgls_stopping_is_invariant_to_joint_scaling(self):
         import torch
         from core import gpu_backend as gb

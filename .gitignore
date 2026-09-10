@@ -25,3 +25,7 @@ test/*/phi.npz
 
 # local-only agent notes with real GPU-box identifiers (never commit)
 AGENTS.local.md
+
+cs.log
+tmp/
+test/dsh-session-*/

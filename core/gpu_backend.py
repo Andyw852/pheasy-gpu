@@ -1443,6 +1443,12 @@ class GpuSubsetOperator:
                 raise ValueError("subset column scales must be finite, nonnegative, and match active columns")
             self.column_scale = torch.where(scale < 1e-30, torch.ones_like(scale), scale)
 
+    def norm_estimate(self, iters=10):
+        """Cache only this fixed subset; never reuse the base operator norm."""
+        if getattr(self, "_norma", None) is None:
+            self._norma = _operator_norm_estimate(self, iters)
+        return self._norma
+
     def matvec(self, x):
         full = x.new_zeros(self.base.shape[1])
         full.index_add_(0, self.columns, x / self.column_scale)
@@ -1510,6 +1516,10 @@ def _iterative_ridge_tensor(A, y, alpha, atol=1e-8, btol=1e-8, maxiter=5000, row
             self.shape = (A.shape[0] + A.shape[1], A.shape[1])
             self.torch = torch
             self.device = dev
+        def norm_estimate(self, iters=10):
+            if getattr(self, "_norma", None) is None:
+                self._norma = _operator_norm_estimate(self, iters)
+            return self._norma
         def matvec(self, x):
             return torch.cat((A.matvec(x) * mask, sa * x))
         def rmatvec(self, z):
@@ -1559,11 +1569,13 @@ def _iterative_lstsq_tensor(A, y, atol=1e-8, btol=1e-8, maxiter=5000):
     normal_norm = torch.linalg.vector_norm(s)
     residual_norm = torch.linalg.vector_norm(r)
     norma = A.norm_estimate() if hasattr(A, "norm_estimate") else _operator_norm_estimate(A)
-    def meets_tolerance():
+    def tolerance_tensor():
         normx = torch.linalg.vector_norm(x)
         finite = torch.isfinite(normal_norm) & torch.isfinite(residual_norm) & torch.isfinite(rhs_norm) & torch.isfinite(normx)
-        return bool((finite & bool(np.isfinite(norma)) & ((normal_norm <= atol * norma * residual_norm)
-                    | (residual_norm <= btol * rhs_norm + atol * norma * normx))).item())
+        return finite & bool(np.isfinite(norma)) & ((normal_norm <= atol * norma * residual_norm)
+                    | (residual_norm <= btol * rhs_norm + atol * norma * normx))
+    def meets_tolerance():
+        return bool(tolerance_tensor().item())
     converged = meets_tolerance()
     n_iter = 0
     residual_norm = torch.linalg.vector_norm(r)
@@ -1573,21 +1585,30 @@ def _iterative_lstsq_tensor(A, y, atol=1e-8, btol=1e-8, maxiter=5000):
             break
         q = A.matvec(p)
         denom = torch.dot(q, q)
-        if bool((~torch.isfinite(denom) | (denom <= 0)).item()):
-            stop_reason = "invalid_search_direction"
-            break
-        step = gamma / denom
-        x = x + step * p
-        r = r - step * q
+        invalid_direction = ~torch.isfinite(denom) | (denom <= 0)
+        # Keep the last valid iterate on device if the direction breaks down.
+        # Selecting the whole candidate also handles 0 * inf without host branching.
+        step = gamma / torch.where(invalid_direction, torch.ones_like(denom), denom)
+        x = torch.where(invalid_direction, x, x + step * p)
+        r = torch.where(invalid_direction, r, r - step * q)
         s_new = A.rmatvec(r)
         gamma_new = torch.dot(s_new, s_new)
         residual_norm = torch.linalg.vector_norm(r)
         normal_norm = torch.linalg.vector_norm(s_new)
         n_iter = it + 1
-        converged = meets_tolerance()
+        # One scalar transfer for all predicates; preserve failure precedence.
+        invalid_gradient = ~torch.isfinite(gamma_new) | (gamma <= 0)
+        status = int((tolerance_tensor().to(torch.int32)
+                      + 2 * invalid_gradient.to(torch.int32)
+                      + 4 * invalid_direction.to(torch.int32)).item())
+        if status & 4:
+            n_iter = it
+            stop_reason = "invalid_search_direction"
+            break
+        converged = bool(status & 1)
         if converged:
             break
-        if bool((~torch.isfinite(gamma_new) | (gamma <= 0)).item()):
+        if status & 2:
             stop_reason = "invalid_gradient_recurrence"
             break
         p = s_new + (gamma_new / gamma) * p
@@ -1599,11 +1620,13 @@ def _iterative_lstsq_tensor(A, y, atol=1e-8, btol=1e-8, maxiter=5000):
     residual_norm = torch.linalg.vector_norm(true_r)
     normal_norm = torch.linalg.vector_norm(A.rmatvec(true_r))
     converged = meets_tolerance()
-    if recurrence_converged and not converged:
+    if converged:
+        stop_reason = "converged" if recurrence_converged else "converged_on_true_residual"
+    elif recurrence_converged:
         stop_reason = "true_residual_check_failed"
     info = {"solver": "GPU CGLS", "itn": n_iter, "n_iter": n_iter,
             "residual_certificate": "recomputed_y_minus_Ax",
-            "stop_reason": "converged" if converged else stop_reason,
+            "stop_reason": stop_reason,
             "norma": float(norma), "norma_estimator": "spectral_power_10",
             "normb": float(rhs_norm.item()), "normx": float(torch.linalg.vector_norm(x).item()),
             "criterion": "normar<=atol*norma*normr or normr<=btol*normb+atol*norma*normx",
@@ -1871,6 +1894,7 @@ class GpuTwoLevelLassoCV(GpuLassoCV):
                 replica = GpuTwoLevelOperator(A, device_id=dev)
                 owned.append(replica)
                 replica.scale = op.scale.to(dev).clone()
+                replica._norma = None
                 resources.append((replica, yt.to(dev), L.to(dev)))
         self.cv_devices_ = [str(dev) for dev in devices]
         print("[gpu_resident] dynamic CV devices=%s folds=%d primary=%s" %

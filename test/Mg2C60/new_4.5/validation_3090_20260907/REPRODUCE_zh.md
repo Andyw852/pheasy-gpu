@@ -53,6 +53,40 @@ RFE 数据划分：NumPy `default_rng(20260907).permutation(699)[:100]`，前 80
 RFE-OLS-TSQR 在 TwoLevelSM 上实际使用 LSMR。它不执行全量 TSQR 分解。
 真正的分块 TSQR 与 SVD 对照单独见本地回归测试。
 
+## 续接仅运行 holdout（作业 1515）
+
+全量 OLS 和导出已经通过时，不要再次执行上面的 full+holdout 模板。
+本次用户明确授权该独立软件验证绕过 tf 使用 SLURM；该例外不代表其它任务可绕过 tf。
+
+实际提交脚本保存在仓库根目录 `tmp/resume_3090_evidence/holdout_jacobi_resume_01.sbatch`。
+它使用已有验证驱动，先运行 optimizer 回归、再运行六卡 GPU 检查，最后只运行 holdout。
+用原子 mkdir 拒绝覆盖已存在结果目录，日志包含作业号，保留源码 SHA256。
+**不要原样重提该脚本**：1515 已成功完成，脚本中的结果目录已经包含最终结果。
+
+在另一次已获授权的独立六卡分配内，使用新的结果目录，核心命令为：
+
+```bash
+export PYTHONPATH=/absolute/path/to/isolated/src
+export PHEASY_RFE_JACOBI=1
+python /absolute/path/to/isolated/src/pheasy_gpu/dev/validate_large_fit.py \
+    holdout /absolute/path/to/prebuilt/data --output /absolute/path/to/new/holdout
+```
+
+`PHEASY_OLS_JACOBI` 与 `PHEASY_RFE_JACOBI` 是两个不同开关。后者只对 RFE
+算子子求解做右缩放，复用训练池列范数（不是每折重新计算），还原原单位系数后排名
+和预测。独立 20 构型不参与缩放或拟合。秩亏时缩放可改变非唯一解，应比较独立预测。
+
+1515 的 `configuration.json` 已确认 float64、六卡、两个 Jacobi 开关均为 1、
+atol/btol=1e-8、最多 50000 次迭代；`split.json` 与 1513 的 80/20 划分逐项相同，
+100 个构型互不重复且索引均在 [0,699) 范围。
+
+续接证据位于仓库根 `tmp/resume_3090_evidence/`：
+- `source_1515.sha256`、`configuration_1515.json`、`split_audit_1515.json`；
+- `gpu_checks_jacobi_1515.json`：修复后的六卡小矩阵验证 16/16；
+- `exports/`：从服务器取回的压缩 phi/fc2/fc3 及本地逐块回读报告；
+- `per_config_summary.json`：旧 OLS 的逐构型误差摘要（P95 使用最近秩定义，
+  upper_median 是排序后下标 floor(n/2) 的值，偶数样本不取两个中值平均）。
+
 ## 小规模测试
 
 以下测试不需要材料数据：

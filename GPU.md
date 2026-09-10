@@ -106,6 +106,34 @@ certify small coefficient errors on ill-conditioned systems. Existing hardware
 timings predate this repair unless explicitly noted. Synthetic scaling and CPU
 LSMR comparisons do not replace the requested Si real-data acceptance.
 
+Subset and augmented operators cache their own norm estimate, never the base
+operator estimate. This avoids repeated queries on the same object; a newly
+constructed RFE subset or new Ridge alpha still incurs an independent estimate.
+No across-alpha speedup is claimed. Replica scale assignment explicitly clears
+the replica cache. Final verification alone accepting a fit is reported as
+`converged_on_true_residual`. The follow-up cache regressions and actual two-card
+CV test passed on RTX 3090 (18 tests); this does not establish a throughput gain.
+The subsequent CGLS change combines direction validity, convergence and gradient
+validity into one scalar status transfer per iteration. Invalid directions keep
+the previous iterate using CUDA masks. Checks still occur every iteration, not
+every ten iterations. The scalar-read regression and resident solver/dual-card
+tests passed on RTX 3090 (56 tests); wall-clock benefit is not yet measured.
+
+Full C60Mg2 column-norm audit (699 displaced configurations, 496 atoms, cutoffs
+7.0/4.5 Angstrom): the unscaled cached effective operator has shape
+1,040,112 x 52,283. All rows were used. Float64 column norms range from
+0.0356650027857755 to 3.7195257256162937, a max/min span of 104.2906332563;
+zero/nonfinite counts are both zero. The diagonal of A.T A therefore has a span
+of about 1.0877e4, not 104.29. This is neither a condition-number estimate nor a
+Jacobi speedup measurement; it does not establish the previously quoted 12%
+iteration saving on full data. The 60.49 GB sparse prime factor exceeds one
+24 GiB RTX 3090, so this audit used the existing bounded CPU column-norm method
+on the GPU host (1846.85 seconds for norms, 1985.31 seconds including loading).
+It is not a CUDA timing. Detailed local evidence is retained in
+`tmp/full_c60mg2_norms_summary_20260910.json` and
+`tmp/full_c60mg2_norms_20260910.jsonl`. The separate 99,792 x 20,125 cache was
+not used for this full-data measurement.
+
 `PHEASY_GPU_LASSO_RESIDENT=1` enables CUDA-resident LASSO and ALASSO: adaptive pilot, weights, weighted FISTA, CV, refit, and KKT run on CUDA.
 `PHEASY_GPU_TSQR=1` enables bounded binary-tree TSQR for oversized dense tall full-rank systems; CPU TSQR remains the default. `PHEASY_GPU_RIDGE_RESIDENT=1` enables augmented GPU CGLS for TwoLevel/operator Ridge, with CPU metrics and fallback. Dense RFE subset solves/predictions use CUDA when memory allows, while RFE orchestration, support selection, and postprocessing remain CPU. `PHEASY_GPU_RFE_RANKING=1` opts into CUDA importance sorting; with resident RFE it also computes importance from CUDA coefficients (`gpu_importance_rounds`); otherwise importance calculation remains CPU. Column norms are prepared on CPU and support updates remain CPU. Tied/nonfinite importance falls back to NumPy to preserve its exact ordering. Metadata reports `gpu_ranking_rounds`. This is not a resident RFE loop or a demonstrated speedup. For public OLS, the same `PHEASY_GPU_TSQR=1` flag also enables sparse/TwoLevel streamed TSQR, with `PHEASY_TSQR_BLOCK_ROWS` (default 40000, at least the column count). CPU code assembles and expands each bounded row block; CUDA performs QR, tree reduction and triangular solve. Memory/rank failures fall back to matrix-free LSQR/LSMR with `fallback_reason`; operator ridge/Jacobi options retain their existing path. RFE sparse/TwoLevel residency uses the separate `PHEASY_GPU_RFE_RESIDENT=1` CGLS path, not streamed TSQR. TSQR still requires an O(n_columns^2) dense R factor and workspace.
 
