@@ -1,10 +1,13 @@
 """GPU (CUDA via PyTorch) backend for pheasy's dense linear algebra.
 
 Drop-in GPU replacements for the dense CPU primitives in core/optimizer.py.
-Every public function takes NumPy arrays and returns NumPy arrays, so the
+Dense convenience functions take and return NumPy arrays, so the
 optimizer's control flow (CV grouping, alpha grids, standardization, debias,
 RFE elimination) is unchanged -- only the heavy dense linear algebra moves to
-the GPU.
+the GPU. The opt-in GpuTwoLevelOperator/GpuTwoLevelLassoCV path instead
+keeps both sparse factors and all iterative vectors resident on CUDA; its
+normalization, grouped CV, FISTA and KKT math never round-trip host vectors.
+Only setup, returned results and the separate optional debias/metrics are host-side.
 
 Activation (in priority order):
 
@@ -23,6 +26,11 @@ Tuning knobs:
 
 * PHEASY_GPU_DEVICE -- CUDA device index (default 0 / first visible device);
   read fresh on every device() call (no caching).
+* Resident LASSO: PHEASY_GPU_DEVICES="2,3,1" explicitly enables dynamic
+  fold scheduling (first device is primary); PHEASY_GPU_NGPU caps the list or,
+  alone, selects that many visible cards starting with PHEASY_GPU_DEVICE.
+  Unset both for the original single-GPU behavior. IDs are CUDA-visible logical
+  indices; each card must fit the full resident factors, not a row shard.
 
 Design notes
 ------------
@@ -51,6 +59,7 @@ __all__ = [
     "device",
     "lstsq",
     "qr_solve",
+    "gpu_tsqr",
     "ridge_solve",
     "gram",
     "top_eigval",
@@ -59,6 +68,10 @@ __all__ = [
     "GpuRidgeCV",
     "load_sensing_matrix",
     "GpuSparseMV",
+    "GpuTwoLevelOperator",
+    "GpuTwoLevelLassoCV",
+    "iterative_lstsq",
+    "iterative_ridge",
 ]
 
 _torch_mod = None
@@ -276,6 +289,104 @@ def lstsq(A, y):
     return _to_numpy(coef, np.float64)
 
 
+
+
+def gpu_tsqr(A, y, block_rows=40000, diag_floor=1e-12):
+    """Opt-in float64 binary-tree TSQR with bounded host row blocks.
+
+    Sparse/TwoLevel block assembly is CPU-side; QR and tree reduction are CUDA.
+    The complete sensing matrix is never explicitly densified.
+
+    Returns (coef, diagnostics). Only tall full-rank systems use TSQR; callers
+    retain SVD semantics for wide or rank-deficient inputs.
+    """
+    import torch
+    import scipy.sparse as sp
+    twolevel = hasattr(A, "SM_prime") and hasattr(A, "NS")
+    sparse = sp.issparse(A)
+    if not (isinstance(A, np.ndarray) or sparse or twolevel):
+        raise TypeError("gpu_tsqr requires ndarray, scipy sparse, or TwoLevelSM")
+    input_kind = "twolevel" if twolevel else "sparse" if sparse else "dense"
+    y = np.asarray(y, dtype=np.float64).ravel()
+    if A.ndim != 2 or y.size != A.shape[0] or not np.isfinite(y).all():
+        raise ValueError("gpu_tsqr requires finite 2-D A and matching finite y")
+    m, n = A.shape
+    if m == 0 or n == 0:
+        raise ValueError("gpu_tsqr requires nonempty dimensions")
+    if not np.isfinite(diag_floor) or diag_floor < 0 or int(block_rows) <= 0:
+        raise ValueError("invalid TSQR block_rows or diag_floor")
+    if m < n:
+        raise np.linalg.LinAlgError("gpu_tsqr requires a tall matrix")
+    block_rows = max(int(block_rows), n)
+    if not enabled() or not available():
+        raise RuntimeError("GPU TSQR requires enabled CUDA")
+    fraction = float(os.environ.get("PHEASY_GPU_MEM_FRACTION", "0.8"))
+    if not 0 < fraction <= 1:
+        raise ValueError("PHEASY_GPU_MEM_FRACTION must be in (0, 1]")
+    blocks = (m + block_rows - 1) // block_rows
+    # Conservative estimate: current block/Q, merge workspaces, tree and margin.
+    estimated_peak = 8 * (4 * min(m, block_rows) * (n + 1) +
+                          (blocks.bit_length() + 16) * n * (n + 1)) + 64 * 1024**2
+    if estimated_peak > available_memory_bytes() * fraction:
+        raise MemoryError("GPU TSQR estimated workspace exceeds memory budget")
+    # Normalize only after the workspace gate; never expand whole factors.
+    if sparse:
+        A = A.tocsr(copy=False)
+    prime = ns = None
+    if twolevel:
+        prime = A.SM_prime.tocsr(copy=False) if sp.issparse(A.SM_prime) else A.SM_prime
+        ns = A.NS.astype(np.float64, copy=False)
+    stack = []
+    xb = yb = q = r = z = ro = zo = rn = zn = diag = coef = None
+    try:
+        for start in range(0, m, block_rows):
+            if twolevel:
+                block = prime[start:start + block_rows].astype(np.float64, copy=False) @ ns
+            else:
+                block = A[start:start + block_rows]
+            if sp.issparse(block):
+                block = block.toarray()
+            block = np.asarray(block, dtype=np.float64)
+            if not np.isfinite(block).all():
+                raise ValueError("gpu_tsqr requires finite A")
+            xb = _to_torch(block, torch.float64)
+            del block
+            yb = _to_torch(y[start:start + block_rows], torch.float64)
+            q, r = torch.linalg.qr(xb, mode="reduced")
+            z = q.T @ yb
+            level = 0
+            while stack and stack[-1][0] == level:
+                _, ro, zo = stack.pop()
+                q, r = torch.linalg.qr(torch.cat((ro, r), dim=0), mode="reduced")
+                z = q.T @ torch.cat((zo, z), dim=0)
+                level += 1
+            stack.append((level, r, z))
+            del xb, yb, q
+        while len(stack) > 1:
+            _, ro, zo = stack.pop(0)
+            _, rn, zn = stack.pop(0)
+            q, r = torch.linalg.qr(torch.cat((ro, rn), dim=0), mode="reduced")
+            z = q.T @ torch.cat((zo, zn), dim=0)
+            stack.insert(0, (0, r, z))
+            del q
+        r, z = stack[0][1], stack[0][2]
+        diag = r.diagonal().abs()
+        dmax = float(diag.max().item()) if diag.numel() else 0.0
+        rank_safe = bool(dmax > 0 and float(diag.min().item()) > diag_floor * max(dmax, 1.0))
+        if not rank_safe:
+            raise np.linalg.LinAlgError("gpu_tsqr detected rank deficiency")
+        coef = torch.linalg.solve_triangular(r, z[:, None], upper=True).flatten()
+        if not bool(torch.isfinite(coef).all().item()):
+            raise np.linalg.LinAlgError("GPU TSQR produced nonfinite coefficients")
+        device_name = str(coef.device)
+        return _to_numpy(coef, np.float64), {"backend":"gpu_" + input_kind + "_tsqr", "solver":"TSQR", "solver_kind":"direct", "block_assembly":"cpu", "device":device_name, "dtype":"float64", "block_rows":block_rows, "rank_safe":True, "n_blocks":blocks, "estimated_peak_bytes":estimated_peak}
+    finally:
+        stack.clear()
+        xb = yb = q = r = z = ro = zo = rn = zn = diag = coef = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
 def qr_solve(A, y):
     """QR least squares with an SVD fallback for rank-deficient / wide systems.
 
@@ -290,9 +401,23 @@ def qr_solve(A, y):
     y = np.asarray(y, dtype=np.float64).ravel()
     At = _to_torch(A, torch.float64)
     yt = _to_torch(y, torch.float64).reshape(-1)
+    return _to_numpy(_qr_solve_tensor(At, yt), np.float64)
+
+
+def _qr_solve_tensor(At, yt):
+    """Solve from resident float64 tensors; return coefficients on the same device."""
+    import torch
     m, n = At.shape
+
+    def svd_fallback():
+        # Reuse the uploaded inputs for rank-deficient/wide subsets.
+        U, S, Vh = torch.linalg.svd(At, full_matrices=False)
+        cutoff = max(m, n) * torch.finfo(torch.float64).eps * S.max()
+        inv = torch.where(S > cutoff, S.reciprocal(), torch.zeros_like(S))
+        return Vh.T @ (inv * (U.T @ yt))
+
     if m < n:
-        return lstsq(A, y)          # underdetermined -> min-norm SVD
+        return svd_fallback()          # underdetermined -> min-norm SVD
     try:
         _R = torch.linalg.qr(At, mode="r")
         # mode="r" returns only R, but the container differs across torch
@@ -300,19 +425,21 @@ def qr_solve(A, y):
         R = _R.R if hasattr(_R, "R") else (_R[-1] if isinstance(_R, tuple) else _R)
         diag = R.diagonal().abs()
         if diag.numel() == 0:
-            return lstsq(A, y)
+            return svd_fallback()
         dmax = float(diag.max().item())
         if dmax == 0.0:
-            return lstsq(A, y)
+            return svd_fallback()
         tol = torch.finfo(torch.float64).eps * max(m, n) * dmax
         if float(diag.min().item()) <= tol:
-            return lstsq(A, y)      # rank deficient -> SVD
+            return svd_fallback()      # rank deficient -> SVD
         coef = torch.linalg.lstsq(At, yt, driver="gels").solution
+    except (torch.cuda.OutOfMemoryError, MemoryError):
+        raise
     except Exception:
-        return lstsq(A, y)
+        return svd_fallback()
     if not bool(torch.isfinite(coef).all()):
-        return lstsq(A, y)
-    return _to_numpy(coef, np.float64)
+        return svd_fallback()
+    return coef
 
 
 def ridge_solve(A, y, alpha):
@@ -324,6 +451,14 @@ def ridge_solve(A, y, alpha):
     y = np.asarray(y, dtype=np.float64).ravel()
     At = _to_torch(A, torch.float64)
     yt = _to_torch(y, torch.float64).reshape(-1)
+    return _to_numpy(_ridge_solve_tensor(At, yt, alpha), np.float64)
+
+
+def _ridge_solve_tensor(At, yt, alpha):
+    """Positive-alpha Ridge using resident inputs and resident output."""
+    import torch
+    if not np.isfinite(alpha) or alpha <= 0:
+        raise ValueError("resident Ridge requires finite positive alpha")
     n = At.shape[1]
     G = At.T @ At
     b = At.T @ yt
@@ -331,9 +466,11 @@ def ridge_solve(A, y, alpha):
     try:
         L = torch.linalg.cholesky(Gp)
         x = torch.cholesky_solve(b.reshape(-1, 1), L).reshape(-1)
+    except (torch.cuda.OutOfMemoryError, MemoryError):
+        raise
     except Exception:
         x = torch.linalg.solve(Gp, b)
-    return _to_numpy(x, np.float64)
+    return x
 
 
 def gram(A, y=None):
@@ -399,7 +536,7 @@ def _soft_threshold_t(x, thr):
 
 
 def _fista_gram(Gt, bt, alpha, x0=None, max_iter=3000, tol=1e-7,
-                lipschitz=None, penalty_weights=None, n_samples=None):
+                lipschitz=None, penalty_weights=None, n_samples=None, _info=None):
     """FISTA LASSO on the precomputed Gram: min 0.5||Ax-y||^2 + alpha sum w|x|.
 
     Mirrors optimizer._fista_lasso (Gram path) on GPU tensors (same fixed point).
@@ -430,6 +567,15 @@ def _fista_gram(Gt, bt, alpha, x0=None, max_iter=3000, tol=1e-7,
             cutoff = rcond * S.max()
             Sinv = torch.where(S > cutoff, 1.0 / S, torch.zeros_like(S))
             coef = Vh.T @ (Sinv * (U.T @ bt))
+        scale = torch.clamp(bt.abs().max(), min=torch.finfo(bt.dtype).tiny)
+        kkt = float(((Gt @ coef - bt).abs().max() / scale).item())
+        converged = bool(np.isfinite(kkt) and kkt <= tol)
+        if _info is not None:
+            _info.update(n_iter=0, converged=converged, kkt_relative=kkt)
+        if not converged:
+            import warnings
+            warnings.warn("FISTA zero-alpha least-squares result lacks stationarity: relative KKT=%g" % kkt,
+                          RuntimeWarning, stacklevel=2)
         return coef, 0
 
     if lipschitz is None:
@@ -442,6 +588,17 @@ def _fista_gram(Gt, bt, alpha, x0=None, max_iter=3000, tol=1e-7,
     else:
         thr_vec = thr
 
+    penalty = thr_vec / step
+    kkt_scale = torch.clamp(bt.abs().max(), min=torch.finfo(bt.dtype).tiny)
+
+    def kkt_relative(coef):
+        gradient = Gt @ coef - bt
+        violation = torch.where(coef != 0, (gradient + penalty * coef.sign()).abs(),
+                                torch.clamp(gradient.abs() - penalty, min=0.0))
+        return float((violation.max() / kkt_scale).item())
+
+    converged = False
+    kkt = float("inf")
     z = x.clone()
     t = 1.0
     x_prev = x.clone()
@@ -473,8 +630,20 @@ def _fista_gram(Gt, bt, alpha, x0=None, max_iter=3000, tol=1e-7,
             dx = (x - x_prev).norm()
             xn = torch.clamp(x.norm(), min=1.0)
             if bool((dx <= tol * xn).item()):
-                break
+                kkt = kkt_relative(x)
+                if np.isfinite(kkt) and kkt <= tol:
+                    converged = True
+                    break
             x_prev = x.clone()
+    if not converged:
+        kkt = kkt_relative(x)
+        converged = bool(np.isfinite(kkt) and kkt <= tol)
+    if _info is not None:
+        _info.update(n_iter=n_iter, converged=converged, kkt_relative=kkt)
+    if not converged:
+        import warnings
+        warnings.warn("FISTA did not converge: iterations=%d, relative KKT=%g, tol=%g"
+                      % (n_iter, kkt, tol), RuntimeWarning, stacklevel=2)
     return x, n_iter
 
 
@@ -638,16 +807,19 @@ class GpuLassoCV(object):
                       % float(self.alphas[0]), flush=True)
 
         self.alpha_ = float(self.alphas[best_i])
+        final_info = {}
         coef_t, nfin = _fista_gram(G_full, b_full, self.alpha_, x0=best_x,
-                                   max_iter=min(self.max_iter, 5000),
-                                   tol=max(float(self.tol), 1e-7),
+                                   max_iter=self.max_iter,
+                                   tol=float(self.tol),
                                    lipschitz=lip_full, penalty_weights=pw,
-                                   n_samples=n_samples)
+                                   n_samples=n_samples, _info=final_info)
         self.coef_ = _to_numpy(coef_t, np.float64)
         self.intercept_ = 0.0
         self.alphas_ = self.alphas
         self.mse_path_ = mse_path
         self.n_iter_ = int(nfin)
+        self.regularized_solver_info_ = dict(final_info, solver="GPU FISTA",
+                                            stage="regularized_refit_before_debias", tol=float(self.tol))
         self.n_features_in_ = m
         return self
 
@@ -803,6 +975,12 @@ class GpuRidgeCV(object):
                                np.float64)
         self.intercept_ = 0.0
         self.mse_path_ = mse_path
+        self.regularized_solver_info_ = {
+            "solver": "GPU Ridge SVD", "backend": "gpu_dense",
+            "device": str(device()), "dtype": "float64",
+            "stage": "regularized_refit_before_metrics"
+        }
+        self.n_features_in_ = m
         return self
 
     def predict(self, A):
@@ -938,6 +1116,11 @@ class GpuSparseMV(object):
             raise RuntimeError("CUDA unavailable")
         self._np = np
         self._t = t
+        # GPU sparse kernels are asynchronous; extra PyTorch CPU worker
+        # threads only contend with joblib's fold workers and slow host/device
+        # synchronization on large matrices. Keep one dispatcher thread.
+        if os.environ.get("PHEASY_GPU_SM_TORCH_THREADS", "1").lower() not in ("0", "false", "off"):
+            t.set_num_threads(1)
         self._dt64 = t.float64 if sm_prime.dtype == np.float64 else t.float32
         self._value_itemsize = 8 if sm_prime.dtype == np.float64 else 4
         self._sm_bytes_val = _cuda_csr_bytes(sm_prime, self._value_itemsize)
@@ -1073,3 +1256,658 @@ class GpuSparseMV(object):
             t.cuda.empty_cache()
         except Exception:
             pass
+
+
+class GpuTwoLevelOperator:
+    """CUDA-resident float64 SM_prime @ NS, without a product or Gram matrix.
+
+    Both factors and their CSR transposes live on one device. Allocation or
+    unsupported sparse-kernel errors propagate: this backend NEVER falls back.
+    Dense NS is supported; sparse NS is never densified. CV uses row masks so
+    folds do not duplicate the factors. Only setup uploads and public result
+    downloads cross the host boundary.
+    """
+    def __init__(self, A, device_id=None, extra_workspace_bytes=0):
+        import scipy.sparse as sp
+        if not enabled() or not available():
+            raise RuntimeError("Resident two-level LASSO requires enabled CUDA; no CPU fallback")
+        input_scale = getattr(A, "_twolevel_scale", None)
+        A = getattr(A, "_twolevel_base", A)
+        if not hasattr(A, "SM_prime") or not hasattr(A, "NS"):
+            raise TypeError("GpuTwoLevelOperator requires TwoLevelSM")
+        self.torch = torch = _torch()
+        self.device = device() if device_id is None else torch.device(device_id)
+        self.shape = A.shape
+        if not sp.issparse(A.SM_prime):
+            raise TypeError("Resident two-level SM_prime must be scipy sparse")
+        fraction = float(os.environ.get("PHEASY_GPU_MEM_FRACTION", "0.8"))
+        if not 0 < fraction <= 1:
+            raise ValueError("PHEASY_GPU_MEM_FRACTION must be in (0, 1]")
+        factor_bytes = 0
+        for matrix in (A.SM_prime, A.NS):
+            if sp.issparse(matrix):
+                factor_bytes += 32 * int(matrix.nnz) + 8 * (sum(matrix.shape) + 2)
+            else:
+                factor_bytes += 8 * int(np.prod(matrix.shape))
+        workspace = max(1, int(os.environ.get("PHEASY_GPU_NORM_WORKSPACE_MB", "64"))) * 1024**2
+        # Extra factor-sized allowance covers CSR transpose conversion scratch;
+        # vector margin covers FISTA, masked folds, target and power iteration.
+        if not np.isfinite(extra_workspace_bytes) or extra_workspace_bytes < 0 or int(extra_workspace_bytes) != extra_workspace_bytes:
+            raise ValueError("extra_workspace_bytes must be a nonnegative integer")
+        self.estimated_peak_bytes = 2 * factor_bytes + workspace + 8 * 32 * sum(A.shape) + int(extra_workspace_bytes)
+        free = _device_free_bytes(self.device)
+        if free is None and torch.device(self.device).type == "cuda":
+            raise RuntimeError("Cannot query resident CUDA memory budget; refusing unchecked upload")
+        if free is not None and self.estimated_peak_bytes > free * fraction:
+            raise MemoryError("Resident two-level GPU estimate %d bytes exceeds budget %d bytes; no CPU fallback" %
+                              (self.estimated_peak_bytes, int(free * fraction)))
+
+        def upload(matrix):
+            if not sp.issparse(matrix):
+                return torch.as_tensor(np.asarray(matrix), dtype=torch.float64, device=self.device)
+            csr = matrix.tocsr(copy=True)
+            csr.sum_duplicates()
+            csr.sort_indices()
+            # int64 avoids truncation on genuinely large factors.
+            return torch.sparse_csr_tensor(
+                torch.as_tensor(csr.indptr, dtype=torch.int64, device=self.device),
+                torch.as_tensor(csr.indices, dtype=torch.int64, device=self.device),
+                torch.as_tensor(csr.data, dtype=torch.float64, device=self.device),
+                size=csr.shape, device=self.device, check_invariants=True)
+
+        try:
+            self.prime = upload(A.SM_prime)
+            self.ns = upload(A.NS)
+            # Convert on device rather than allocating giant host CSR transposes.
+            self.prime_t = self.prime.transpose(0, 1).to_sparse_csr()
+            self.ns_t = (self.ns.T if self.ns.layout == torch.strided else
+                         self.ns.transpose(0, 1).to_sparse_csr())
+            self.scale = torch.ones(A.shape[1], dtype=torch.float64, device=self.device)
+            self.input_scale = (torch.ones_like(self.scale) if input_scale is None else
+                                torch.as_tensor(input_scale, dtype=torch.float64, device=self.device))
+            if not bool((torch.isfinite(self.input_scale) & (self.input_scale != 0)).all().item()):
+                raise ValueError("two-level column scales must be finite and nonzero")
+        except Exception:
+            self.close()
+            raise
+
+    def close(self):
+        """Release owned factor tensors, including partially initialized state."""
+        for name in ("prime", "ns", "prime_t", "ns_t", "scale", "input_scale"):
+            if hasattr(self, name):
+                setattr(self, name, None)
+
+
+    def _mm(self, matrix, vector):
+        if matrix.layout == self.torch.strided:
+            return matrix @ vector
+        if vector.ndim == 1:
+            return self.torch.sparse.mm(matrix, vector[:, None]).flatten()
+        return self.torch.sparse.mm(matrix, vector)
+
+    def matvec(self, vector):
+        return self._mm(self.prime, self._mm(self.ns, vector / (self.scale * self.input_scale)))
+
+    def rmatvec(self, vector):
+        return self._mm(self.ns_t, self._mm(self.prime_t, vector)) / (self.scale * self.input_scale)
+
+    def normalize(self):
+        """Exact full-data unit-L2 normalization, as in Optimizer.standardize.
+
+        Bounded column blocks avoid sparse-sparse products and never allocate
+        the full sensing matrix. Workspace is O(block*(n + mid + p)).
+        """
+        torch = self.torch
+        n, p = self.shape
+        budget = int(os.environ.get("PHEASY_GPU_NORM_WORKSPACE_MB", "64")) * 1024**2
+        if budget <= 0:
+            raise ValueError("PHEASY_GPU_NORM_WORKSPACE_MB must be positive")
+        block = max(1, min(64, budget // max(8 * (n + self.ns.shape[0] + p) * 2, 1)))
+        norms = torch.empty_like(self.scale)
+        for start in range(0, p, block):
+            count = min(block, p - start)
+            basis = torch.zeros((p, count), dtype=torch.float64, device=self.device)
+            idx = torch.arange(count, device=self.device)
+            basis[start + idx, idx] = 1
+            cols = self._mm(self.prime, self._mm(self.ns, basis / self.input_scale[:, None]))
+            norms[start:start + count] = torch.linalg.vector_norm(cols, dim=0)
+        self.scale = torch.where(norms < 1e-30, torch.ones_like(norms), norms)
+        return self.scale
+
+    def lipschitz(self):
+        """Power estimate; FISTA backtracking certifies every accepted step."""
+        torch = self.torch
+        gen = torch.Generator(device=self.device).manual_seed(0)
+        v = torch.randn(self.shape[1], generator=gen, dtype=torch.float64, device=self.device)
+        for _ in range(40):
+            v = self.rmatvec(self.matvec(v))
+            v = v / torch.clamp(v.norm(), min=1e-30)
+        return torch.clamp(torch.dot(v, self.rmatvec(self.matvec(v))) * 1.05, min=1e-12)
+
+
+class GpuCSRResidentOperator(GpuTwoLevelOperator):
+    """Single-device CSR adapter reusing TwoLevel upload/budget/lifetime handling.
+
+    A sparse identity provides setup compatibility; matvec bypasses it.
+    """
+
+    def __init__(self, matrix, device_id=None, extra_workspace_bytes=0):
+        import scipy.sparse as sp
+        from types import SimpleNamespace
+        if not sp.issparse(matrix):
+            raise TypeError("GpuCSRResidentOperator requires scipy sparse input")
+        factors = SimpleNamespace(SM_prime=matrix, NS=sp.eye(matrix.shape[1], format="csr"), shape=matrix.shape)
+        super().__init__(factors, device_id=device_id, extra_workspace_bytes=extra_workspace_bytes)
+
+    def matvec(self, vector):
+        return self._mm(self.prime, vector / (self.scale * self.input_scale))
+
+    def rmatvec(self, vector):
+        return self._mm(self.prime_t, vector) / (self.scale * self.input_scale)
+
+
+class GpuSubsetOperator:
+    """Row/column view sharing resident factors; workspace contains vectors only."""
+
+    def __init__(self, base, columns, rows=None, column_scale=None):
+        self.base, self.torch, self.device = base, base.torch, base.device
+        torch = self.torch
+        def index_tensor(values):
+            raw = torch.as_tensor(values, device=self.device)
+            if raw.numel() and (raw.is_floating_point() or raw.is_complex() or raw.dtype == torch.bool):
+                raise ValueError("subset indices must have integer dtype")
+            return raw.to(dtype=torch.long).clone()
+        self.columns = index_tensor(columns)
+        self.rows = None if rows is None else index_tensor(rows)
+        for indices, bound in ((self.columns, base.shape[1]), (self.rows, base.shape[0])):
+            if indices is not None and (indices.ndim != 1 or bool(((indices < 0) | (indices >= bound)).any().item())):
+                raise ValueError("subset indices must be one-dimensional and in bounds")
+        self.shape = (base.shape[0] if self.rows is None else self.rows.numel(), self.columns.numel())
+        self.column_scale = torch.ones(self.shape[1], dtype=torch.float64, device=self.device)
+        if column_scale is not None:
+            scale = torch.as_tensor(column_scale, dtype=torch.float64, device=self.device)
+            if scale.shape != self.column_scale.shape or not bool((torch.isfinite(scale) & (scale >= 0)).all().item()):
+                raise ValueError("subset column scales must be finite, nonnegative, and match active columns")
+            self.column_scale = torch.where(scale < 1e-30, torch.ones_like(scale), scale)
+
+    def matvec(self, x):
+        full = x.new_zeros(self.base.shape[1])
+        full.index_add_(0, self.columns, x / self.column_scale)
+        result = self.base.matvec(full)
+        return result if self.rows is None else result.index_select(0, self.rows)
+
+    def rmatvec(self, y):
+        if self.rows is not None:
+            full = y.new_zeros(self.base.shape[0])
+            full.index_add_(0, self.rows, y)
+            y = full
+        return self.base.rmatvec(y).index_select(0, self.columns) / self.column_scale
+
+
+def solve_resident_subset(base, target, columns, rows=None, column_scale=None,
+                          ridge_alpha=0.0, atol=1e-8, btol=1e-8, maxiter=5000):
+    """Return physical CUDA subset coefficients; reject unconverged elimination fits.
+
+    target is the full row-space vector; column_scale is in active-column order.
+    """
+    if not np.isfinite(ridge_alpha) or ridge_alpha < 0:
+        raise ValueError("Ridge alpha must be finite and nonnegative")
+    view = GpuSubsetOperator(base, columns, rows, column_scale)
+    y = base.torch.as_tensor(target, dtype=base.torch.float64, device=base.device).reshape(-1)
+    if y.numel() != base.shape[0]:
+        raise ValueError("subset target must match full operator row count")
+    if view.rows is not None:
+        y = y.index_select(0, view.rows)
+    if ridge_alpha > 0:
+        coef, info = _iterative_ridge_tensor(view, y, ridge_alpha, atol, btol, maxiter,
+                                             penalty_scale=view.column_scale)
+    else:
+        coef, info = _iterative_lstsq_tensor(view, y, atol, btol, maxiter)
+    info = dict(info, n_samples=view.shape[0], n_features=view.shape[1],
+                fit_scope="full" if rows is None else "fold", ridge_alpha=float(ridge_alpha))
+    if not info["converged"]:
+        raise RuntimeError("Resident subset solve did not converge: " + repr(info))
+    return coef / view.column_scale, info
+
+
+def iterative_ridge(A, y, alpha, atol=1e-8, btol=1e-8, maxiter=5000, rows=None):
+    """Solve ridge on a CUDA-resident operator, returning NumPy coefficients."""
+    x, info = _iterative_ridge_tensor(A, y, alpha, atol, btol, maxiter, rows)
+    return x.detach().cpu().numpy(), info
+
+
+def _iterative_ridge_tensor(A, y, alpha, atol=1e-8, btol=1e-8, maxiter=5000, rows=None, penalty_scale=None):
+    """Augmented CGLS with CUDA coefficient output."""
+    torch = A.torch
+    dev = A.device
+    y = torch.as_tensor(y, dtype=torch.float64, device=dev).reshape(-1)
+    mask = torch.ones(A.shape[0], dtype=torch.float64, device=dev)
+    if rows is not None:
+        mask.zero_(); mask[torch.as_tensor(rows, dtype=torch.long, device=dev)] = 1
+    if not np.isfinite(alpha) or alpha < 0:
+        raise ValueError("Ridge alpha must be finite and nonnegative")
+    sa = float(np.sqrt(alpha))
+    if penalty_scale is not None:
+        scale = torch.as_tensor(penalty_scale, dtype=torch.float64, device=dev)
+        if scale.shape != (A.shape[1],) or not bool((torch.isfinite(scale) & (scale > 0)).all().item()):
+            raise ValueError("penalty_scale must be finite positive and match coefficient count")
+        sa = sa / scale
+    class Augmented:
+        def __init__(self):
+            self.shape = (A.shape[0] + A.shape[1], A.shape[1])
+            self.torch = torch
+            self.device = dev
+        def matvec(self, x):
+            return torch.cat((A.matvec(x) * mask, sa * x))
+        def rmatvec(self, z):
+            return A.rmatvec(z[:A.shape[0]] * mask) + sa * z[A.shape[0]:]
+    return _iterative_lstsq_tensor(Augmented(), torch.cat((y * mask, y.new_zeros(A.shape[1]))), atol, btol, maxiter)
+
+
+def iterative_lstsq(A, y, atol=1e-8, btol=1e-8, maxiter=5000):
+    """Solve min_x ||A x-y|| with GPU-resident CGLS, returning NumPy coefficients."""
+    x, info = _iterative_lstsq_tensor(A, y, atol, btol, maxiter)
+    return x.detach().cpu().numpy(), info
+
+
+def _iterative_lstsq_tensor(A, y, atol=1e-8, btol=1e-8, maxiter=5000):
+    """CGLS core returning CUDA coefficients and the same convergence diagnostics."""
+    torch = getattr(A, "torch", None)
+    device = getattr(A, "device", None)
+    if torch is None or device is None or torch.device(device).type != "cuda":
+        raise RuntimeError("GPU iterative least-squares requires a CUDA operator")
+    y = torch.as_tensor(y, dtype=torch.float64, device=device).reshape(-1)
+    if y.numel() != A.shape[0]:
+        raise ValueError("least-squares target length does not match operator")
+    if not bool(torch.isfinite(y).all().item()):
+        raise ValueError("least-squares target must be finite")
+    if (not np.isfinite(atol) or not np.isfinite(btol) or atol < 0 or btol < 0
+            or not np.isfinite(maxiter) or maxiter <= 0 or int(maxiter) != maxiter):
+        raise ValueError("atol/btol must be finite nonnegative and maxiter a finite positive integer")
+    x = torch.zeros(A.shape[1], dtype=y.dtype, device=device)
+    r = y.clone()
+    s = A.rmatvec(r)
+    p = s.clone()
+    gamma = torch.dot(s, s)
+    rhs_norm = torch.linalg.vector_norm(y).clamp_min(torch.finfo(y.dtype).tiny)
+    normal_norm = torch.linalg.vector_norm(s)
+    converged = bool((torch.isfinite(normal_norm) & torch.isfinite(rhs_norm) & (normal_norm <= atol * rhs_norm)).item())
+    n_iter = 0
+    residual_norm = torch.linalg.vector_norm(r)
+    stop_reason = "iteration_limit"
+    for it in range(int(maxiter)):
+        if converged:
+            break
+        q = A.matvec(p)
+        denom = torch.dot(q, q)
+        if bool((~torch.isfinite(denom) | (denom <= 0)).item()):
+            stop_reason = "invalid_search_direction"
+            break
+        step = gamma / denom
+        x = x + step * p
+        r = r - step * q
+        s_new = A.rmatvec(r)
+        gamma_new = torch.dot(s_new, s_new)
+        residual_norm = torch.linalg.vector_norm(r)
+        normal_norm = torch.linalg.vector_norm(s_new)
+        n_iter = it + 1
+        converged = bool((torch.isfinite(normal_norm) & torch.isfinite(residual_norm) & torch.isfinite(rhs_norm)
+                          & ((normal_norm <= atol * rhs_norm) | (residual_norm <= btol * rhs_norm))).item())
+        if converged:
+            break
+        if bool((~torch.isfinite(gamma_new) | (gamma <= 0)).item()):
+            stop_reason = "invalid_gradient_recurrence"
+            break
+        p = s_new + (gamma_new / gamma) * p
+        s = s_new
+        gamma = gamma_new
+    info = {"solver": "GPU CGLS", "itn": n_iter, "n_iter": n_iter,
+            "stop_reason": "converged" if converged else stop_reason,
+            "normr": float(residual_norm.item()), "normar": float(normal_norm.item()),
+            "converged": bool(converged), "device": str(device),
+            "backend": "gpu_resident_iterative", "atol": float(atol),
+            "btol": float(btol), "maxiter": int(maxiter)}
+    if not converged:
+        import warnings
+        warnings.warn("GPU CGLS did not converge: reason=%s, iterations=%d, normr=%g, normar=%g" %
+                      (info["stop_reason"], n_iter, info["normr"], info["normar"]), RuntimeWarning, stacklevel=2)
+    return x, info
+
+
+def _fista_twolevel(A, y, alpha, x0, max_iter, tol, lipschitz, rows=None, penalty_weights=None, n_samples=None):
+    """Device FISTA, adaptive restart and exact L1 KKT certificate.
+
+    No NumPy or vector host transfers in the iteration loop. Scalar syncs are
+    limited to backtracking acceptance and a KKT check every 20 iterations.
+    Masked residuals give the exact training objective without fold CSR copies.
+    """
+    torch = A.torch
+    n = A.shape[0] if rows is None else rows.numel()
+    if alpha < 0 or not np.isfinite(alpha):
+        raise ValueError("LASSO alpha must be finite and nonnegative")
+    mask = torch.ones_like(y) if rows is None else torch.zeros_like(y)
+    if rows is not None:
+        mask[rows] = 1
+    rhs = A.rmatvec(y * mask)
+    scale = torch.clamp(rhs.abs().max(), min=torch.finfo(y.dtype).tiny)
+    penalty = alpha * (n if n_samples is None else n_samples)
+    if penalty_weights is None:
+        penalty_vec = torch.full((A.shape[1],), penalty, dtype=y.dtype, device=y.device)
+    else:
+        # Keep adaptive weights resident when provided as a CUDA tensor.
+        if isinstance(penalty_weights, torch.Tensor):
+            penalty_vec = penalty * penalty_weights.to(device=y.device, dtype=y.dtype)
+        else:
+            penalty_vec = penalty * torch.as_tensor(np.asarray(penalty_weights), dtype=y.dtype, device=y.device)
+        if penalty_vec.numel() != A.shape[1] or not bool(torch.isfinite(penalty_vec).all().item()) or bool((penalty_vec < 0).any().item()):
+            raise ValueError("penalty_weights must be finite and nonnegative with one value per feature")
+    x = torch.zeros(A.shape[1], dtype=y.dtype, device=y.device) if x0 is None else x0.clone()
+    z = x.clone()
+    momentum = torch.ones((), dtype=y.dtype, device=y.device)
+    L = lipschitz.clone()
+
+    def kkt(coef):
+        gradient = A.rmatvec((A.matvec(coef) - y) * mask)
+        violation = torch.where(coef != 0, (gradient + penalty_vec * coef.sign()).abs(),
+                                torch.clamp(gradient.abs() - penalty_vec, min=0))
+        return violation.max() / scale
+
+    converged = False
+    n_iter = 0
+    for it in range(int(max_iter)):
+        n_iter = it + 1
+        residual = (A.matvec(z) - y) * mask
+        grad = A.rmatvec(residual)
+        # Rayleigh power estimates are not safe upper bounds; certify the local
+        # quadratic majorizer rather than accepting a potentially unstable step.
+        for attempt in range(60):
+            candidate = z - grad / L
+            x_new = candidate.sign() * torch.clamp(candidate.abs() - penalty_vec / L, min=0)
+            delta = x_new - z
+            Adelta = A.matvec(delta) * mask
+            if bool((Adelta.square().sum() <= L * delta.square().sum() * (1 + 1e-12)).item()):
+                break
+            L = L * 2
+        else:
+            raise RuntimeError("Resident FISTA backtracking failed; nonfinite data or operator")
+        restart = torch.dot(z - x_new, x_new - x) > 0
+        next_momentum = (1 + torch.sqrt(1 + 4 * momentum.square())) / 2
+        z = torch.where(restart, x_new, x_new + ((momentum - 1) / next_momentum) * (x_new - x))
+        momentum = torch.where(restart, torch.ones_like(momentum), next_momentum)
+        x = x_new
+        if n_iter % 20 == 0:
+            certificate = kkt(x)
+            if bool((torch.isfinite(certificate) & (certificate <= tol)).item()):
+                converged = True
+                break
+    certificate = kkt(x)
+    value = float(certificate.item())
+    converged = bool(np.isfinite(value) and value <= tol)
+    info = dict(n_iter=n_iter, converged=converged, kkt_relative=value)
+    if not converged:
+        import warnings
+        warnings.warn("Resident FISTA did not converge: iterations=%d, relative KKT=%g, tol=%g" %
+                      (n_iter, value, tol), RuntimeWarning, stacklevel=2)
+    return x, info
+
+
+def _resident_cv_devices():
+    """Explicit opt-in; IDs are logical indices after CUDA_VISIBLE_DEVICES.
+
+    DEVICES order defines the primary (first) device. NGPU truncates that list,
+    or selects the primary PHEASY_GPU_DEVICE followed by other visible devices.
+    With neither control set, retain the existing single-device behavior.
+    Invalid explicit requests fail before factor allocation, even if an invalid
+    ID would later be excluded by NGPU or the fold-count cap. Selected active
+    devices are never filtered by free memory: an upload/preflight/kernel error
+    aborts the fit, without retrying on another device or falling back to CPU.
+    """
+    raw = os.environ.get("PHEASY_GPU_DEVICES", "").strip()
+    count = os.environ.get("PHEASY_GPU_NGPU", "").strip()
+    if not raw and not count:
+        return [device()]
+    n = _torch().cuda.device_count()
+    try:
+        ids = [int(v.strip()) for v in raw.split(",")] if raw else None
+        limit = int(count) if count else None
+    except ValueError as exc:
+        raise ValueError("PHEASY_GPU_DEVICES and PHEASY_GPU_NGPU must contain integer IDs/counts") from exc
+    if ids is not None and (len(set(ids)) != len(ids) or any(d < 0 or d >= n for d in ids)):
+        raise ValueError("PHEASY_GPU_DEVICES must contain unique visible CUDA device IDs")
+    if ids is None:
+        first = _torch().device(device()).index
+        if first is None or not 0 <= first < n:
+            raise ValueError("PHEASY_GPU_DEVICE must name a visible CUDA device")
+        ids = [first] + [d for d in range(n) if d != first]
+    if limit is not None:
+        if not 1 <= limit <= len(ids):
+            raise ValueError("PHEASY_GPU_NGPU must be positive and not exceed selected visible devices")
+        ids = ids[:limit]
+    return [_torch().device("cuda:%d" % d) for d in ids]
+
+
+def _resident_device_context(dev):
+    from contextlib import nullcontext
+    torch = _torch()
+    return torch.cuda.device(dev) if torch.device(dev).type == "cuda" else nullcontext()
+
+
+def _dynamic_fold_map(resources, folds, solve):
+    """One long-lived dispatcher per device, claiming the next fold immediately.
+
+    Return in fold order, not completion order. No static chunks or batch
+    barriers. Join all workers on failure before the caller releases resources.
+    Threads share resident tensors; never use a process pool or fork CUDA.
+    This scheduling seam is CPU-testable and does not mutate process GPU mode.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    from queue import Queue, Empty
+    from threading import Event
+    queue = Queue()
+    for k, fold in enumerate(folds):
+        queue.put((k, fold))
+    results = [None] * len(folds)
+    failed = Event()
+
+    def run(resource):
+        while not failed.is_set():
+            try:
+                k, fold = queue.get_nowait()
+            except Empty:
+                return
+            try:
+                results[k] = solve(resource, k, fold)
+            except BaseException:
+                failed.set()
+                raise
+
+    if len(resources) == 1:
+        run(resources[0])  # preserve synchronous single-GPU execution
+    else:
+        with ThreadPoolExecutor(max_workers=len(resources)) as pool:
+            futures = [pool.submit(run, resource) for resource in resources]
+            for future in futures:
+                future.result()
+    return results
+
+
+class GpuTwoLevelLassoCV(GpuLassoCV):
+    """Opt-in two-level sparse resident CV; outputs physical coefficients.
+
+    One CUDA device by default; opt-in dynamic folds via PHEASY_GPU_DEVICES
+    and/or PHEASY_GPU_NGPU. Each card holds full factors; refit uses the first
+    selected device. Float64, no intercept/sample weights. CPU grouped split
+    construction is shared with the existing solver; all fold gradients,
+    predictions, MSE reductions, normalization and alpha selection use Torch.
+    Full-data normalization (not per-fold normalization), n_train*alpha penalty,
+    descending warm starts, and smallest-alpha exact tie-break are preserved.
+    PHEASY_LASSO_TIE_RTOL affects flat-tail diagnostics only.
+    """
+    def __init__(self, *args, standardize=False, adaptive=False, gamma=1.0,
+                 init_alpha=1e-3, eps=1e-8, nalpha=None, decades=4.0,
+                 alpha_auto=True, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.standardize = standardize
+        self.adaptive = bool(adaptive)
+        self.gamma = float(gamma)
+        self.init_alpha = float(init_alpha)
+        self.eps = float(eps)
+        self.nalpha = int(nalpha) if nalpha else len(self.alphas)
+        self.decades = float(decades)
+        self.alpha_auto = bool(alpha_auto)
+        self.penalty_weights_ = None
+
+    def fit(self, A, y, sample_weight=None):
+        if not enabled() or not available():
+            raise RuntimeError("Resident two-level LASSO requires enabled CUDA; no CPU fallback")
+        devices = _resident_cv_devices()
+        owned = []
+        try:
+            with _resident_device_context(devices[0]):
+                return self._fit_resident(A, y, devices, owned, sample_weight)
+        finally:
+            for operator in owned:
+                operator.close()
+
+    def _fit_resident(self, A, y, devices, owned, sample_weight):
+        import time
+        from .optimizer import _make_cv_splits
+        started = time.monotonic()
+        if sample_weight is not None or self.fit_intercept:
+            raise NotImplementedError("Resident GPU ALASSO does not support sample weights or intercept")
+        if self.alphas.size == 0 or not np.isfinite(self.alphas).all() or (self.alphas < 0).any():
+            raise ValueError("alphas must be nonempty, finite and nonnegative")
+        if self.max_iter < 1 or self.tol <= 0:
+            raise ValueError("max_iter and tol must be positive")
+        print("[gpu_resident] uploading factors shape=%s; CUDA required, no CPU fallback" % (A.shape,), flush=True)
+        op = GpuTwoLevelOperator(A, device_id=devices[0])
+        owned.append(op)
+        print("[gpu_resident] factors ready device=%s dtype=float64 estimated_peak_bytes=%d elapsed=%.2fs" %
+              (op.device, op.estimated_peak_bytes, time.monotonic() - started), flush=True)
+        torch = op.torch
+        yt = torch.as_tensor(np.asarray(y).ravel(), dtype=torch.float64, device=op.device)
+        if yt.numel() != A.shape[0] or not bool(torch.isfinite(yt).all().item()):
+            raise ValueError("target shape or finite values invalid")
+        if self.standardize:
+            print("[gpu_resident] exact normalization started", flush=True)
+            op.normalize()
+            print("[gpu_resident] normalization done elapsed=%.2fs" % (time.monotonic() - started), flush=True)
+        print("[gpu_resident] Lipschitz estimate started", flush=True)
+        L = op.lipschitz()
+        print("[gpu_resident] Lipschitz estimate ready elapsed=%.2fs" % (time.monotonic() - started), flush=True)
+        penalty_weights = None
+        pilot_info = None
+        if self.adaptive:
+            pilot, pilot_info = iterative_lstsq(op, yt, atol=min(self.tol, 1e-8), btol=min(self.tol, 1e-8), maxiter=self.max_iter)
+            pilot = torch.as_tensor(pilot, dtype=torch.float64, device=op.device)
+            penalty_weights_t = torch.pow(pilot.abs() + self.eps, -self.gamma)
+            if not bool(torch.isfinite(penalty_weights_t).all().item()):
+                raise RuntimeError("Resident GPU ALASSO pilot produced nonfinite penalty weights")
+            # Keep solver weights on CUDA; retain only a diagnostic snapshot.
+            penalty_weights = penalty_weights_t
+            self.penalty_weights_ = _to_numpy(penalty_weights_t, np.float64)
+            print("[gpu_resident] adaptive pilot=GPU CGLS gamma=%.6g weight_range=[%.6e, %.6e]" % (self.gamma, float(penalty_weights_t.min().item()), float(penalty_weights_t.max().item())), flush=True)
+            if self.alpha_auto:
+                weighted_kkt = torch.max(torch.abs(op.rmatvec(yt)) / torch.clamp(penalty_weights_t, min=torch.finfo(yt.dtype).tiny)) / A.shape[0]
+                amax = float(weighted_kkt.item())
+                if amax > 0 and np.isfinite(amax):
+                    self.alphas = np.logspace(np.log10(amax) - self.decades, np.log10(amax), max(self.nalpha, len(self.alphas)))
+        splits = _make_cv_splits(A.shape[0], self.cv, self.rand_seed, self.group_size)
+        cv_tol = float(os.environ.get("PHEASY_CV_TOL", str(max(self.tol, 1e-3))))
+        cv_cap = int(os.environ.get("PHEASY_CV_MAX_ITER", str(min(self.max_iter, 800))))
+        if cv_cap < 1 or cv_tol <= 0:
+            raise ValueError("CV max_iter and tol must be positive")
+        # Replicate factors once per card, never once per fold. Copy primary
+        # normalization and power estimate to keep numerical setup identical.
+        # Every selected card must fit the FULL factors (preflighted on upload).
+        devices = devices[:max(1, len(splits))]
+        resources = [(op, yt, L)]
+        for dev in devices[1:]:
+            with _resident_device_context(dev):
+                replica = GpuTwoLevelOperator(A, device_id=dev)
+                owned.append(replica)
+                replica.scale = op.scale.to(dev).clone()
+                resources.append((replica, yt.to(dev), L.to(dev)))
+        self.cv_devices_ = [str(dev) for dev in devices]
+        print("[gpu_resident] dynamic CV devices=%s folds=%d primary=%s" %
+              (self.cv_devices_, len(splits), op.device), flush=True)
+        # Complete caller-stream setup before handing tensors to dispatchers.
+        for dev in devices:
+            if torch.device(dev).type == "cuda":
+                torch.cuda.synchronize(dev)
+
+        def solve_fold(resource, k, fold):
+            worker, target, estimate = resource
+            with _resident_device_context(worker.device):
+                tr, va = fold
+                trt = torch.as_tensor(tr, dtype=torch.int64, device=worker.device)
+                vat = torch.as_tensor(va, dtype=torch.int64, device=worker.device)
+                values = torch.empty(len(self.alphas), dtype=target.dtype, device=worker.device)
+                x = None
+                infos = []
+                for i in range(len(self.alphas) - 1, -1, -1):
+                    x, info = _fista_twolevel(worker, target, float(self.alphas[i]), x,
+                                             cv_cap, cv_tol, estimate, trt,
+                                             penalty_weights=penalty_weights, n_samples=int(trt.numel()))
+                    err = worker.matvec(x)[vat] - target[vat]
+                    values[i] = err.square().mean()
+                    infos.append(dict(info, alpha=float(self.alphas[i])))
+                    print("[gpu_resident] device=%s fold=%d/%d alpha=%.6e n_iter=%d kkt=%.3e converged=%s elapsed=%.2fs" %
+                          (worker.device, k + 1, len(splits), self.alphas[i], info["n_iter"],
+                           info["kkt_relative"], info["converged"], time.monotonic() - started), flush=True)
+                # Complete the fold on its own card, not on another busy GPU.
+                if torch.device(worker.device).type == "cuda":
+                    torch.cuda.synchronize(worker.device)
+                return values, infos, str(worker.device)
+
+        results = _dynamic_fold_map(resources, splits, solve_fold)
+        # Only tiny MSE paths cross devices, after all dispatchers have joined.
+        # Iterative vectors and factors never round-trip through host memory.
+        mse = torch.stack([result[0].to(op.device) for result in results], dim=1)
+        self.cv_solver_info_ = [result[1] for result in results]
+        self.cv_fold_devices_ = [result[2] for result in results]
+        max_cv_iterations = max((info["n_iter"] for infos in self.cv_solver_info_ for info in infos), default=0)
+        for replica in owned[1:]:
+            replica.close()
+        resources.clear()
+        means = mse.mean(dim=1)
+        if not bool(torch.isfinite(means).all().item()):
+            raise RuntimeError("Resident CV produced nonfinite MSE")
+        # Match iterative selection: ascending argmin chooses the smallest
+        # alpha on exact ties. Near-tie tolerance is diagnostic only.
+        best_i = int(torch.argmin(means).item())
+        rtol = float(os.environ.get("PHEASY_LASSO_TIE_RTOL", "1e-9"))
+        tied = means <= means[best_i] * (1 + rtol) + 1e-300
+        self.alpha_ = float(self.alphas[best_i])
+        # Preserve independent full-data descending warm-start path.
+        x = None
+        for i in range(len(self.alphas) - 1, best_i - 1, -1):
+            x, path_info = _fista_twolevel(op, yt, float(self.alphas[i]), x, cv_cap, cv_tol, L,
+                                         penalty_weights=penalty_weights, n_samples=A.shape[0])
+            print("[gpu_resident] full-path alpha=%.6e n_iter=%d kkt=%.3e converged=%s elapsed=%.2fs" %
+                  (self.alphas[i], path_info["n_iter"], path_info["kkt_relative"],
+                   path_info["converged"], time.monotonic() - started), flush=True)
+        x, info = _fista_twolevel(op, yt, self.alpha_, x, self.max_iter, self.tol, L,
+                                  penalty_weights=penalty_weights, n_samples=A.shape[0])
+        print("[gpu_resident] final alpha=%.6e n_iter=%d kkt=%.3e converged=%s elapsed=%.2fs" %
+              (self.alpha_, info["n_iter"], info["kkt_relative"], info["converged"],
+               time.monotonic() - started), flush=True)
+        self.coef_ = _to_numpy(x / op.scale, np.float64)
+        self.column_scale_ = _to_numpy(op.scale, np.float64)
+        self.mse_path_ = _to_numpy(mse, np.float64)
+        self.alphas_ = self.alphas
+        self.intercept_ = 0.0
+        self.n_iter_ = info["n_iter"]
+        self.n_features_in_ = A.shape[1]
+        self.regularized_solver_info_ = dict(info, solver="FISTA", backend="gpu_twolevel_resident",
+            device=str(op.device), dtype="float64", stage="regularized_refit_before_debias", tol=float(self.tol))
+        self._alpha_at_min = best_i == 0
+        self._alpha_at_min_flat = self._alpha_at_min and int(tied.sum().item()) > 1
+        self._alpha_at_min_hitcap = self._alpha_at_min_flat and max_cv_iterations >= cv_cap
+        if self._alpha_at_min:
+            import warnings
+            warnings.warn("Resident LASSO selected grid minimum%s" %
+                          (" on a flat CV tail" if self._alpha_at_min_flat else ""), RuntimeWarning, stacklevel=2)
+        # Do not retain VRAM after the fit. Predict and optional debias use the
+        # ordinary public host interface, explicitly outside the resident stage.
+        return self

@@ -7,6 +7,7 @@ tests cover splitting, index limits, preflight memory checks and cleanup.
 """
 import contextlib
 import importlib.util
+import os
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
@@ -47,6 +48,7 @@ class _FakeTorch:
     int32 = np.int32
 
     def __init__(self):
+        self.set_num_threads = Mock()
         self.cuda = SimpleNamespace(
             is_available=lambda: True,
             device_count=lambda: 6,
@@ -73,6 +75,21 @@ class GpuMemoryRegressions(unittest.TestCase):
         self.free_patch.start()
         self.addCleanup(self.torch_patch.stop)
         self.addCleanup(self.free_patch.stop)
+
+    def test_sparse_dispatch_threads_default_and_opt_out(self):
+        matrix = sp.eye(4, format="csr")
+        for setting, expected in (("1", True), ("0", False)):
+            with self.subTest(setting=setting), patch.dict(
+                    os.environ, {"PHEASY_GPU_SM_TORCH_THREADS": setting}):
+                self.torch.set_num_threads.reset_mock()
+                gpu = gb.GpuSparseMV(matrix, n_gpu=1, device_ids=[0])
+                try:
+                    if expected:
+                        self.torch.set_num_threads.assert_called_once_with(1)
+                    else:
+                        self.torch.set_num_threads.assert_not_called()
+                finally:
+                    gpu.close()
 
     def test_oversized_nnz_is_rejected_before_tensor_allocation(self):
         matrix = SimpleNamespace(shape=(2, 2), nnz=2**31)

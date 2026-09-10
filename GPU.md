@@ -6,17 +6,198 @@ relaxed-LASSO debias, recursive feature elimination -- and moves dense linear
 algebra and optional two-level sparse matrix-vector products onto GPUs. This is a
 separate package named `pheasy_gpu` so both can be installed side by side.
 
+## Convergence diagnostics and current operator limits
+
+FISTA checks L1 KKT stationarity at the actual coefficient iterate before
+accepting a small-step stop. The relative residual is normalized by
+`max(abs(A.T @ y))`; nonconvergence emits `RuntimeWarning`. Final refits honor
+the requested `max_iter` and `tol`; CV has separate `PHEASY_CV_MAX_ITER` and
+`PHEASY_CV_TOL` settings. A small update or a low training error alone is not
+a convergence certificate.
+
+FISTA-backed LASSO/ALASSO expose `Optimizer.results["regularized_solver_info"]`
+with `converged`, `kkt_relative`, `n_iter`, and `tol`. Its stage is explicitly
+`regularized_refit_before_debias`: it certifies neither every CV candidate nor
+the post-debias/thresholded output. Dense sklearn paths retain sklearn warnings
+and do not invent a FISTA certificate.
+
+Operator RIDGE/LASSO/ALASSO currently reject `fit_intercept=True` or non-None
+`weights` with `NotImplementedError`; iterative LASSO also rejects these
+options when selected for a large sparse input. Previously these options could
+be ignored. Default force-constant fits (no intercept, no weights) are unchanged.
+Full weighted/intercept operator fitting is not implemented. ALASSO also
+rejects sample weights on dense inputs because its adaptive pilot is unweighted.
+Weighted LASSO with debias enabled is rejected; use `PHEASY_LASSO_DEBIAS=0`
+with a supported dense backend for weighted LASSO. These fail-fast checks
+prevent partially weighted fits, not implement full weighted fitting.
+
+Mg2C60 c2=7.0/c3=4.5 validation is complete for ordinary RFE, RIDGE,
+LASSO and ALASSO on a fixed 80/20 configuration split (float64). Local
+regressions pass 29/29; CUDA checks pass 18/18, including full-support debias.
+LASSO/ALASSO default to debias (`PHEASY_LASSO_DEBIAS=1`): refit OLS on
+selected support, including full support; only empty support is skipped.
+`results["pre_debias_coef"]` preserves physical-coordinate coefficients before
+debias (without the final output threshold). Operator debias uses LSQR, with
+`PHEASY_LSQR_ATOL`, `PHEASY_LSQR_BTOL`, `PHEASY_LSQR_MAXITER`.
+Debias is not always better: LASSO holdout RMSE fell 30.20%, while same-run
+ALASSO rose 4.98%. These are single-split development results, not a new blind
+test or proof of universal method superiority. Timing and memory comparisons
+are recorded in `tmp/other_methods_20260907/METHOD_RESOURCE_COMPARISON_zh.md`.
+
+## Opt-in GPU-resident two-level LASSO
+
+`PHEASY_GPU_LASSO_RESIDENT=1` selects the experimental resident backend for
+`Optimizer("LASSO")` or `Optimizer("ALASSO")` with `TwoLevelSM` input. Unlike `PHEASY_GPU_SM=1`, which
+only accelerates `SM_prime` multiplication and returns vectors to the host,
+this backend uploads both `SM_prime` and `NS` (and their transposes), and keeps
+normalization, residuals, gradients, soft thresholding, momentum, training-row
+masks, validation MSE and KKT calculations on one CUDA device in float64.
+No dense sensing matrix or Gram matrix is formed. Small scalar synchronizations
+for line search, convergence and logging remain; this is not a CPU-free program.
+
+The resident LASSO/ALASSO path has passed the local single-card CUDA acceptance suite and, as of
+2026-09, a real multi-card hardware run on a 6x RTX 3090 host (Torch 2.6.0+cu124, two devices
+pinned via `CUDA_VISIBLE_DEVICES`) covering 1-GPU, 2-GPU, 3-GPU, and 6-GPU CV. The 6-GPU run also passed the same 24-check
+acceptance matrix; an explicit request
+without CUDA, with an unsupported input/method, or with insufficient memory
+fails rather than silently claiming GPU execution after a CPU fallback.
+`CUDA_VISIBLE_DEVICES` still controls available devices; no GPU allocation is
+requested by the solver itself. Resident CV supports dynamic fold scheduling
+through `PHEASY_GPU_DEVICES` and `PHEASY_GPU_NGPU`; every selected GPU must
+fit a complete factor replica. Hardware acceptance must be reported separately
+from CPU-emulated scheduler tests.
+
+### GPU acceleration status (current)
+
+Dense OLS/Ridge and opt-in dense streamed TSQR use CUDA float64 kernels.
+
+`PHEASY_GPU_RFE_RESIDENT=1` retains dense matrices or sparse/TwoLevel factors and targets across RFE subset solves and CV predictions. It supports OLS and positive-alpha Ridge subsets and requires `n_jobs=1` (the existing Jacobi option applies only to operator inputs; `jacobi_applied` reports actual use), with a conservative workspace budget checked before upload. Metadata exposes `resident_subset_inputs` and `resident_fallback_reason`. Dense fits cache CV row indices and the current support matrix on CUDA; sparse/TwoLevel fits reuse factors through vector scatter/gather views without constructing subset matrices. Their solver is CGLS (`gpu_rfe_resident_iterative`), with per-solve convergence diagnostics and `PHEASY_LSQR_ATOL/BTOL/MAXITER` controls; nonconvergence aborts before elimination. `resident_row_index_uploads`, `resident_column_index_uploads`, and `resident_subset_builds` count this work. The pre-upload budget includes the support matrix and index caches (`resident_index_cache_budget_bytes`). An allocation failure during recursion currently aborts the fit; only initial input-upload failures use the fallback path. Training-fold coefficients and validation residuals stay on CUDA; only per-fold RMSE scalars are downloaded. BIC/AIC residual sums are reduced on CUDA and only RSS scalars are downloaded. With GPU ranking enabled, full-fit coefficients stay on CUDA until a tied/nonfinite importance requires NumPy fallback or the final public coefficient vector is produced. Verbose logs download only the nonzero count. With GPU ranking disabled, coefficients are downloaded each round for CPU importance calculation. Column norms are computed on CPU, uploaded once, then reused for CUDA importance and operator Jacobi scaling. Fold aggregation, support updates, patience and selection remain CPU. Metadata exposes `cv_fold_scoring="gpu"`. This is input residency, not a fully resident RFE loop. The existing validator supports `--benchmark-ridge-rfe --benchmark-rows 6000 --benchmark-columns 256` to compare CPU, legacy GPU and resident-input GPU fits. Add `--benchmark-input csr|twolevel` for sparse fixtures (10% density; TwoLevel uses identity NS). On the local RTX 4060, a 6000×256 CSR fixture gave CPU 0.3193 s versus resident GPU 0.5210 s median over three fits, with relative prediction difference 4.06e-10 (`tmp/csr_bench130.json`). A smaller 1200×96 TwoLevel fixture was also slower on GPU. These synthetic results do not establish a sparse speedup; keep residency opt-in and measure the actual workload.
+
+A matched 6000x256 sweep on a confirmed-idle RTX 3090 (Torch 2.6.0+cu124; all six devices
+verified at 0% utilization before and after; median of three warm fits) gives the clearest
+current picture:
+
+| input | CPU | GPU (non-resident) | GPU resident |
+| --- | --- | --- | --- |
+| dense | 0.5322 s | 0.3381 s | **0.1621 s** |
+| csr, 10% density | 0.5534 s | **0.2829 s** | 0.3392 s |
+| TwoLevel, identity NS | 0.2097 s | 0.2328 s | 0.5264 s |
+| TwoLevel, sparse-mixed NS | 0.4458 s | 0.4475 s | 0.7916 s |
+
+Dense residency is a real win on this hardware (3.3x vs CPU, and 2.1x vs the non-resident GPU
+path, so residency itself -- not merely "using the GPU" -- is what pays). Sparse CSR is ~2x faster
+than CPU on the GPU, but residency is ~20% *slower* than the simpler non-resident GPU path: CGLS
+iteration and per-solve setup cost more than the subset transfers it avoids at this size. TwoLevel
+is the worst case because each `matvec` is two sparse products, so CGLS needs far more work per
+solved subset; resident TwoLevel is slower than CPU here and should stay opportunistic. Do not
+extrapolate any of these figures to larger problems in either direction -- re-measure the actual
+workload. Prediction agreement with CPU stayed at 1e-15 (dense/CSR) and ~4e-10 (CGLS paths).
+`PHEASY_GPU_OLS_RESIDENT=1` enables CUDA-resident CGLS for `TwoLevelSM` OLS.
+`PHEASY_GPU_LASSO_RESIDENT=1` enables CUDA-resident LASSO and ALASSO: adaptive pilot, weights, weighted FISTA, CV, refit, and KKT run on CUDA.
+`PHEASY_GPU_TSQR=1` enables bounded binary-tree TSQR for oversized dense tall full-rank systems; CPU TSQR remains the default. `PHEASY_GPU_RIDGE_RESIDENT=1` enables augmented GPU CGLS for TwoLevel/operator Ridge, with CPU metrics and fallback. Dense RFE subset solves/predictions use CUDA when memory allows, while RFE orchestration, support selection, and postprocessing remain CPU. `PHEASY_GPU_RFE_RANKING=1` opts into CUDA importance sorting; with resident RFE it also computes importance from CUDA coefficients (`gpu_importance_rounds`); otherwise importance calculation remains CPU. Column norms are prepared on CPU and support updates remain CPU. Tied/nonfinite importance falls back to NumPy to preserve its exact ordering. Metadata reports `gpu_ranking_rounds`. This is not a resident RFE loop or a demonstrated speedup. For public OLS, the same `PHEASY_GPU_TSQR=1` flag also enables sparse/TwoLevel streamed TSQR, with `PHEASY_TSQR_BLOCK_ROWS` (default 40000, at least the column count). CPU code assembles and expands each bounded row block; CUDA performs QR, tree reduction and triangular solve. Memory/rank failures fall back to matrix-free LSQR/LSMR with `fallback_reason`; operator ridge/Jacobi options retain their existing path. RFE sparse/TwoLevel residency uses the separate `PHEASY_GPU_RFE_RESIDENT=1` CGLS path, not streamed TSQR. TSQR still requires an O(n_columns^2) dense R factor and workspace.
+
+**Scope:** file I/O, automatic alpha-grid preprocessing (including its own column
+norm calculation), CV split construction and final host metrics remain on CPU.
+The resident solver performs its own standardization on GPU; this does not
+move the earlier CLI alpha-grid preparation to GPU.
+The existing optional LASSO OLS-debias stage also remains on CPU and is reported
+separately as `postfit_backend`. Setting `PHEASY_LASSO_DEBIAS=0` isolates pure
+LASSO for solver validation but changes the delivered estimator relative to
+a debiased fit; never present that comparison as an identical full pipeline.
+Neither a completed CUDA kernel nor a generated IFC certifies CV convergence
+or dynamical stability. Check per-fold and final KKT records.
+
+Tests: `dev/test_gpu_twolevel_lasso.py` covers dispatch, numerical comparison,
+normalization and device residency. Torch-CPU emulation and skipped CUDA tests
+are not evidence of GPU execution. `dev/validate_resident_lasso.py` reads existing
+cache files without modifying them and writes a new exclusive output directory.
+Real-data full-fit speed and convergence are not established merely by these
+interfaces existing; report the measured device, precision, CV limits and
+postprocessing scope with every benchmark.
+
+Initial real-cache validation (RTX 4060, Torch 2.5.1+cu121): a 99792×20125
+effective operator with 20 alphas and five row-wise folds took 510.70 s including
+CPU automatic-grid preparation, with debias explicitly disabled. Final refit
+converged in 4180 iterations (relative KKT 9.38e-7, target 1e-6), but 57/100
+CV candidates failed the historical 800-iteration / 1e-3 criteria. Therefore
+the complete run is **FAIL**, not an accepted alpha-selection result. Peak
+PyTorch allocation was 1,770,686,976 bytes. This is not a speedup measurement
+against a matched CPU pipeline. A stricter 20000-iteration / 1e-6 CV run is not part of the local acceptance evidence;
+these historical directories are retained as diagnostic artifacts only. They must
+not be interpreted as an accepted real-data result or a speed benchmark.
+
+Accepted real-cache dual-GPU run (2026-09, 6x RTX 3090 host, Torch 2.6.0+cu124): the same
+99792x20125 effective operator, `--devices 0,1 --ngpu 2 --debias 0` with the strict CV
+settings (`--cv-tol 1e-6 --cv-max-iter 20000`), returned **status PASS** with every CV
+convergence record and the final refit accepted. Five folds were split across `cuda:0` and
+`cuda:1` (61 and 40 solver records respectively), so this is genuine two-card CV, not a
+single card with a second visible. Total fit time was 552.29 s. Note the caveats that ship
+in that run's own `result.json`: the CPU-derived automatic alpha grid is inside the timing,
+CUDA residency covers the solver stage rather than every pipeline operation, allocator peaks
+are not total device memory, and the strict CV defaults differ from the historical 1e-3/800
+criteria, so this is a correctness acceptance and **not** a matched CPU/GPU speed benchmark.
+
+### Reproduce resident acceptance tests
+
+Use a CUDA-enabled Python environment with this checkout as the working directory:
+
+```bash
+# Small numerical/device tests; CUDA skips do not certify a GPU pass.
+CUDA_VISIBLE_DEVICES=0 OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 python dev/test_gpu_twolevel_lasso.py
+
+# Independent CPU/GPU full synthetic comparison, default CPU debias preserved.
+CUDA_VISIBLE_DEVICES=0 python dev/validate_resident_lasso.py --synthetic --cpu-reference \
+  --output tmp/resident-synthetic-NEW
+
+# Full real-cache model-selection acceptance; explicitly isolate pure LASSO.
+# DATA contains sm_prime.npz, ns_harm.npz and fm1d.npz.
+# This is a real-data run, not a local synthetic acceptance; do not run without DATA.
+CUDA_VISIBLE_DEVICES=0 python dev/validate_resident_lasso.py DATA --debias 0 \
+  --cv-tol 1e-6 --cv-max-iter 20000 --output tmp/resident-real-NEW
+```
+
+### Reproduce the two-card hardware acceptance
+
+```bash
+# Full acceptance matrix (dense + rank-deficient, all five methods, resident dense/CSR/
+# TwoLevel) plus 1-GPU and 2-GPU CV. Pins two devices and asserts the resident backend
+# actually dispatched, so a silent CPU fallback fails the run instead of passing.
+CUDA_VISIBLE_DEVICES=0,1 python dev/validate_gpu_backends.py --devices 0,1 \
+  --json tmp/gpu_backend_validation_twogpu.json
+
+# Direct two-card CV hardware test (requires >= 2 visible devices).
+CUDA_VISIBLE_DEVICES=0,1 python -m unittest dev.test_multigpu_cuda_hw
+```
+
+On a host where the package is also installed under its distribution name (so both a flat
+`core` and a `pheasy_gpu.core` namespace resolve), the unit tests that monkeypatch
+`core.gpu_backend` will miss the module object the optimizer imports and report phantom
+failures. Alias the namespaces before running them (`sys.modules["pheasy_gpu"] = core`,
+`sys.modules["pheasy_gpu.core"] = core`) or import the package the same way the tests do.
+
+
+Output directories must not already exist. The script validates all 100 CV
+convergence records and the final refit after allowing the complete path to
+finish. The default random-row split preserves the historical comparison but
+is **not** independent configuration-level generalization evidence.
+Use `--group-size` deliberately for a different, grouped validation design.
+To enable the solver in an existing LASSO command, prefix it with
+`PHEASY_GPU_LASSO_RESIDENT=1`; existing debias behavior is preserved unless
+explicitly changed. Select a free allocated device using `CUDA_VISIBLE_DEVICES`
+and logical `PHEASY_GPU_DEVICE=0`, rather than copying a physical device index
+into both variables. No new remote deployment is implied by these examples.
+
 ## What is accelerated
 
 | Method | CPU (scipy/sklearn) | GPU (torch/cuSOLVER) |
 |---|---|---|
 | OLS | `scipy.linalg.lstsq` (gelsd SVD) | `torch.linalg.svd` + rcond solve |
-| RIDGE | grouped K-fold CV (closed form) | grouped K-fold CV (closed form, SVD per fold) |
+| RIDGE | grouped K-fold CV (closed form) / operator LSMR | dense grouped SVD CV; opt-in TwoLevel/operator augmented CGLS |
 | LASSO | `sklearn.LassoCV` (coordinate descent) | Gram-based FISTA (GPU by default) |
 | ALASSO | ridge pilot + `LassoCV` on scaled cols | ridge pilot + FISTA with per-column weights |
-| RFE | `scipy.linalg.lstsq` per subset | rank-checked QR + `gels` per subset, SVD fallback |
+| RFE | `scipy.linalg.lstsq` per subset | dense: rank-checked QR + `gels` per subset, SVD fallback; outer CV/orchestration remains CPU |
 | SM loading | `sm_prime @ NS` (sparse) on CPU | `torch.sparse.mm` on GPU (**holdout_eval only**) |
-| TwoLevelSM | two sparse matvecs on CPU | `PHEASY_GPU_SM=1`: SM_prime/transpose split across GPUs; NS and LSMR iteration remain on CPU |
+| TwoLevelSM | two sparse matvecs on CPU | `PHEASY_GPU_SM=1`: matvec split across GPUs; opt-in resident OLS/Ridge/LASSO/ALASSO use CUDA CGLS/FISTA without densifying |
 
 **LASSO/ALASSO default to the GPU Gram-based FISTA.** FISTA solves the exact
 same convex problem as sklearn's coordinate descent and, once the per-iteration
@@ -33,21 +214,22 @@ coef (debias off) agrees to ~3.5e-4 / 5.9e-6. Set
 sklearn coordinate-descent path when you want bit-identical LASSO against the
 original pheasy.
 
-**RFE uses QR for the per-subset solves**, not the SVD. QR is
-backward-stable for the full-rank subsets and ~50x faster on the 3090 than the
-FP64 SVD. `qr_solve` factorizes R only (`mode="r"`, no Q materialization),
+**Dense RFE uses QR for the per-subset solves**, not the SVD. QR is
+backward-stable for the full-rank subsets; a historical 3090 measurement reported
+~50x faster than the FP64 SVD, but this is not a current benchmark. `qr_solve` factorizes R only (`mode="r"`, no Q materialization),
 checks its diagonal (the same threshold as `_solve_qr`), falls back to the SVD
 for rank-deficient or wide subsets, then runs the fast cuSOLVER `gels` solve;
 CUDA `gels` silently returns NaN/inf on rank-deficient inputs, so the earlier
 try/except fallback never fired. Verified `qr_solve` vs
 `numpy.linalg.lstsq` to ~5e-15 (full rank).
 
-**`RFE-OLS-TSQR` (alias `RFE-TSQR`) is also GPU-accelerated.** Its dense
+**`RFE-OLS-TSQR` (alias `RFE-TSQR`) has a GPU dense subset-solve path.** Its dense
 subset solves go through the same `qr_solve` path as RFE (the Q-less tall-skinny
 blocked QR is a memory optimisation for CPU tall matrices; on the GPU the same
 rank-checked QR + `gels` path is used). Its BIC/AIC stopping rule is opt-in via
 `PHEASY_TSQR_CRITERION=bic`; the default is `cv`, which makes it select the same
-support as RFE. Verified on n=8: ~72 s, nnz=2092.
+support as RFE. The historical n=8 timing (~72 s, nnz=2092) is retained only as
+non-current diagnostic evidence, not as a current performance benchmark.
 
 ## Usage
 
@@ -93,10 +275,12 @@ checked before upload. Ordinary fitting reports a CPU fallback if a GPU
 cannot be used; `dev/validate_large_fit.py` treats a fallback as a failed test.
 
 `RFE-OLS-TSQR` can use `PHEASY_RFE_TWOLEVEL=1` to avoid constructing the dense
-product. Its subset solves then use **LSMR**, not a distributed QR. Dense
-TSQR retains an O(p²) factor and is unsuitable when that factor and its
-workspace exceed RAM. Grouped RFE may require many complete iterative
-solves, so first measure a representative configuration subset.
+product. Its sparse/TwoLevel subset solves use **LSMR**, not a distributed QR;
+dense subsets use GPU QR when the dense GPU gate passes. Dense TSQR retains an
+O(p²) factor and is unsuitable when that factor and its workspace exceed RAM. Grouped RFE may require many complete iterative
+solves, so first measure a representative configuration subset. `Optimizer.results`
+records `execution_backend`, `backend_metadata`, and `postfit_backend` so callers
+can distinguish GPU subset algebra from CPU RFE control and metrics.
 
 OLS exposes iterative stopping diagnostics in `Optimizer.results["solver_info"]`.
 LSQR/LSMR warn on iteration/condition limits. Check `converged` before accepting
@@ -130,7 +314,8 @@ larger complete tensor.
 * `PHEASY_GPU_DEVICE` -- CUDA device index (default `0` / first visible
   device); read fresh on every call (no caching).
 * `PHEASY_GPU_MEM_FRACTION` -- fraction of free VRAM a dense solve may occupy
-  before it falls back to the CPU (default 0.8).
+  before it falls back to the CPU (default 0.8). The returned backend diagnostics
+  identify whether a fallback occurred; explicit resident requests fail closed.
 * `PHEASY_FISTA_RESTART_EVERY` -- how often (iterations) the FISTA adaptive-
   restart overshoot check syncs to the host (default 5). Higher = fewer syncs,
   marginally less-frequent restarts; the fixed point is unchanged.
@@ -140,9 +325,9 @@ larger complete tensor.
 * `PHEASY_LASSO_1SE` -- `1` applies the one-standard-error rule to LASSO
   alpha selection on all backends (dense, iterative, and GPU).
 
-## Measured performance (RTX 3090, c7 sensing matrix 25515x6588)
+## Historical measured performance (RTX 3090, c7 sensing matrix 25515x6588)
 
-`holdout_eval` n=8, one split, single free 3090 (CUDA_VISIBLE_DEVICES=6):
+Historical `holdout_eval` n=8, one split, single free 3090 (CUDA_VISIBLE_DEVICES=6); these figures are not current hardware acceptance:
 
 | step | CPU | GPU |
 |---|---|---|
@@ -267,18 +452,19 @@ LASSO diff, add `PHEASY_GPU_LASSO=0` to both runs.
 
 ## Limitations
 
-* `TwoLevelSM` uses GPU sparse matvecs only when `PHEASY_GPU_SM=1`. The solver
-  iteration and the NS multiplication remain on the CPU.
+* Legacy `PHEASY_GPU_SM=1` accelerates sparse matvecs while the solver iteration and NS multiplication remain on the CPU. The separate resident OLS/Ridge/LASSO/ALASSO flags keep their supported solver vectors and factors on CUDA.
 * **GPU SM loading is wired into `holdout_eval.py` only.** The `pheasy-gpu`
   CLI (`run_pheasy.py`) still assembles `SM_prime @ NS` with scipy on the CPU;
   the "SM load 1421s -> 28s" row above applies to `holdout_eval`, not to the
-  CLI. The CLI *does* get GPU-accelerated fitting (OLS/LASSO/ALASSO/RIDGE/RFE
-  solves) once SM is assembled.
+  CLI. Once SM is assembled, its supported dense and resident fitting paths can use
+  GPU acceleration (OLS/LASSO/ALASSO/RIDGE, and dense RFE subset solves); RFE
+  orchestration/postprocessing and optional debias remain CPU.
 * `torch.linalg.lstsq` on CUDA only exposes `driver="gels"`, so `lstsq()` here
   reimplements the SVD (gelsd) solve with `torch.linalg.svd` -- numerically
   equivalent to scipy, at a small constant-factor cost.
-* FP64 throughput on a consumer 3090 is ~1/64 of FP32, but the dense fits here
-  are still 10-60x faster than the single-machine CPU LAPACK path.
+* FP64 throughput on a consumer 3090 is ~1/64 of FP32. The 10-60x dense-fit
+  comparison is historical and workload-specific, not a current benchmark or a
+  guarantee for grouped Ridge/RFE end-to-end pipelines.
 
 
 
@@ -329,6 +515,21 @@ Verify any new dataset with the per-config residual check
   slices) or ~185 GB with the full-transpose path -- the kernel OOM killer
   (exit 137) strikes on the shared box unless the construction is memory-lean
   (see GpuSparseMV __init__).
+
+## RFE operator preconditioning
+
+`PHEASY_RFE_JACOBI=1` enables right column scaling for operator RFE subset
+LSMR solves (default off). `PHEASY_OLS_JACOBI` only controls standalone OLS,
+not RFE. RFE reuses its training-matrix column norms across subsets; these
+are not exact per-fold norms. Coefficients are mapped back before ranking
+and prediction, and ridge augmentation retains the original coefficient
+penalty. No dense sensing matrix is formed. In rank-deficient problems,
+right scaling can select a different nonunique solution; evaluate held-out
+predictions as well as solver convergence. Small regression tests cover
+scaling, masked rows/columns, ridge, and estimator integration. Real Mg2C60
+RFE validation passed with this option: 13 LSMR sub-solves converged;
+26,141/52,283 coefficients selected and fixed-split holdout RMSE improved
+2.62% versus OLS. This is one split, not a general performance guarantee.
 
 ## Null-space construction profile: order-3 translational invariance (C60Mg2, 2026-09)
 
