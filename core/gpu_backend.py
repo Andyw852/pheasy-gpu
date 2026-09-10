@@ -1351,8 +1351,14 @@ class GpuTwoLevelOperator:
     def rmatvec(self, vector):
         return self._mm(self.ns_t, self._mm(self.prime_t, vector)) / (self.scale * self.input_scale)
 
-    def normalize(self):
-        """Exact full-data unit-L2 normalization, as in Optimizer.standardize.
+    def norm_estimate(self, iters=10):
+        """Cached spectral estimate for the current normalized operator."""
+        if getattr(self, "_norma", None) is None:
+            self._norma = _operator_norm_estimate(self, iters)
+        return self._norma
+
+    def col_norms(self):
+        """Exact full-row column norms of the current effective operator, on CUDA.
 
         Bounded column blocks avoid sparse-sparse products and never allocate
         the full sensing matrix. Workspace is O(block*(n + mid + p)).
@@ -1369,9 +1375,16 @@ class GpuTwoLevelOperator:
             basis = torch.zeros((p, count), dtype=torch.float64, device=self.device)
             idx = torch.arange(count, device=self.device)
             basis[start + idx, idx] = 1
-            cols = self._mm(self.prime, self._mm(self.ns, basis / self.input_scale[:, None]))
+            cols = self._mm(self.prime, self._mm(self.ns, basis / (self.input_scale * self.scale)[:, None]))
             norms[start:start + count] = torch.linalg.vector_norm(cols, dim=0)
+        return norms
+
+    def normalize(self):
+        """Apply exact unit-L2 normalization and invalidate the spectral estimate."""
+        torch = self.torch
+        norms = self.col_norms() * self.scale
         self.scale = torch.where(norms < 1e-30, torch.ones_like(norms), norms)
+        self._norma = None
         return self.scale
 
     def lipschitz(self):
@@ -1504,6 +1517,19 @@ def _iterative_ridge_tensor(A, y, alpha, atol=1e-8, btol=1e-8, maxiter=5000, row
     return _iterative_lstsq_tensor(Augmented(), torch.cat((y * mask, y.new_zeros(A.shape[1]))), atol, btol, maxiter)
 
 
+def _operator_norm_estimate(A, iters=10):
+    """Deterministic matrix-free spectral estimate, not SciPy's Frobenius estimate."""
+    t = A.torch
+    gen = t.Generator(device=A.device).manual_seed(0)
+    v = t.randn(A.shape[1], generator=gen, dtype=t.float64, device=A.device)
+    tiny = t.finfo(v.dtype).tiny
+    v = v / t.linalg.vector_norm(v).clamp_min(tiny)
+    for _ in range(iters):
+        w = A.rmatvec(A.matvec(v))
+        v = w / t.linalg.vector_norm(w).clamp_min(tiny)
+    return float(t.linalg.vector_norm(A.matvec(v)).item())
+
+
 def iterative_lstsq(A, y, atol=1e-8, btol=1e-8, maxiter=5000):
     """Solve min_x ||A x-y|| with GPU-resident CGLS, returning NumPy coefficients."""
     x, info = _iterative_lstsq_tensor(A, y, atol, btol, maxiter)
@@ -1531,7 +1557,14 @@ def _iterative_lstsq_tensor(A, y, atol=1e-8, btol=1e-8, maxiter=5000):
     gamma = torch.dot(s, s)
     rhs_norm = torch.linalg.vector_norm(y).clamp_min(torch.finfo(y.dtype).tiny)
     normal_norm = torch.linalg.vector_norm(s)
-    converged = bool((torch.isfinite(normal_norm) & torch.isfinite(rhs_norm) & (normal_norm <= atol * rhs_norm)).item())
+    residual_norm = torch.linalg.vector_norm(r)
+    norma = A.norm_estimate() if hasattr(A, "norm_estimate") else _operator_norm_estimate(A)
+    def meets_tolerance():
+        normx = torch.linalg.vector_norm(x)
+        finite = torch.isfinite(normal_norm) & torch.isfinite(residual_norm) & torch.isfinite(rhs_norm) & torch.isfinite(normx)
+        return bool((finite & bool(np.isfinite(norma)) & ((normal_norm <= atol * norma * residual_norm)
+                    | (residual_norm <= btol * rhs_norm + atol * norma * normx))).item())
+    converged = meets_tolerance()
     n_iter = 0
     residual_norm = torch.linalg.vector_norm(r)
     stop_reason = "iteration_limit"
@@ -1551,8 +1584,7 @@ def _iterative_lstsq_tensor(A, y, atol=1e-8, btol=1e-8, maxiter=5000):
         residual_norm = torch.linalg.vector_norm(r)
         normal_norm = torch.linalg.vector_norm(s_new)
         n_iter = it + 1
-        converged = bool((torch.isfinite(normal_norm) & torch.isfinite(residual_norm) & torch.isfinite(rhs_norm)
-                          & ((normal_norm <= atol * rhs_norm) | (residual_norm <= btol * rhs_norm))).item())
+        converged = meets_tolerance()
         if converged:
             break
         if bool((~torch.isfinite(gamma_new) | (gamma <= 0)).item()):
@@ -1561,8 +1593,20 @@ def _iterative_lstsq_tensor(A, y, atol=1e-8, btol=1e-8, maxiter=5000):
         p = s_new + (gamma_new / gamma) * p
         s = s_new
         gamma = gamma_new
+    # Certify the delivered coefficients, not only the recursively updated residual.
+    recurrence_converged = converged
+    true_r = y - A.matvec(x)
+    residual_norm = torch.linalg.vector_norm(true_r)
+    normal_norm = torch.linalg.vector_norm(A.rmatvec(true_r))
+    converged = meets_tolerance()
+    if recurrence_converged and not converged:
+        stop_reason = "true_residual_check_failed"
     info = {"solver": "GPU CGLS", "itn": n_iter, "n_iter": n_iter,
+            "residual_certificate": "recomputed_y_minus_Ax",
             "stop_reason": "converged" if converged else stop_reason,
+            "norma": float(norma), "norma_estimator": "spectral_power_10",
+            "normb": float(rhs_norm.item()), "normx": float(torch.linalg.vector_norm(x).item()),
+            "criterion": "normar<=atol*norma*normr or normr<=btol*normb+atol*norma*normx",
             "normr": float(residual_norm.item()), "normar": float(normal_norm.item()),
             "converged": bool(converged), "device": str(device),
             "backend": "gpu_resident_iterative", "atol": float(atol),

@@ -7,6 +7,76 @@ import scipy.sparse as sp
 from core import optimizer as opt
 
 class TestOperatorRidgeGPU(unittest.TestCase):
+    def test_cgls_stopping_is_invariant_to_joint_scaling(self):
+        import torch
+        from core import gpu_backend as gb
+        if not torch.cuda.is_available(): self.skipTest("CUDA required")
+        class Operator:
+            def matvec(self, x): return self.matrix @ x
+            def rmatvec(self, y): return self.matrix.T @ y
+        for scale in (1., 1e-12, 1e12):
+            A = Operator()
+            A.torch, A.device = torch, torch.device("cuda:0")
+            A.matrix = torch.eye(3, dtype=torch.float64, device=A.device) * scale
+            A.shape = (3, 3)
+            target = torch.tensor([1., 2., -3.], dtype=torch.float64, device=A.device)
+            coef, info = gb._iterative_lstsq_tensor(A, target * scale)
+            self.assertTrue(info["converged"])
+            torch.testing.assert_close(coef, target, rtol=1e-10, atol=1e-10)
+            self.assertAlmostEqual(info["norma"] / scale, 1., places=12)
+            self.assertEqual(info["norma_estimator"], "spectral_power_10")
+            self.assertTrue(info["normar"] <= 1e-8 * info["norma"] * info["normr"]
+                            or info["normr"] <= 1e-8 * (info["normb"] + info["norma"] * info["normx"]))
+
+    def test_cgls_inconsistent_system_matches_cpu_lsmr(self):
+        import torch
+        from scipy.sparse.linalg import lsmr
+        from core import gpu_backend as gb
+        if not torch.cuda.is_available(): self.skipTest("CUDA required")
+        rng = np.random.default_rng(72)
+        matrix = rng.normal(size=(80, 12))
+        y = matrix @ rng.normal(size=12) + rng.normal(scale=.01, size=80)
+        class Operator:
+            def matvec(self, x): return self.matrix @ x
+            def rmatvec(self, y): return self.matrix.T @ y
+        for scale in (1e-9, 1., 1e9):
+            A = Operator()
+            A.torch, A.device = torch, torch.device("cuda:0")
+            A.matrix = torch.as_tensor(matrix * scale, device=A.device)
+            A.shape = matrix.shape
+            cpu = lsmr(matrix * scale, y * scale, atol=1e-8, btol=1e-8, conlim=0, maxiter=100)
+            gpu, info = gb.iterative_lstsq(A, y * scale)
+            self.assertTrue(info["converged"])
+            self.assertIn(cpu[1], (1, 2))
+            np.testing.assert_allclose(gpu, cpu[0], rtol=1e-7, atol=1e-8)
+            residual = (y - matrix @ gpu) * scale
+            self.assertAlmostEqual(info["normr"] / np.linalg.norm(residual), 1., places=9)
+            self.assertEqual(info["residual_certificate"], "recomputed_y_minus_Ax")
+
+    def test_full_column_norms_do_not_change_operator(self):
+        import torch
+        from core import gpu_backend as gb
+        if not torch.cuda.is_available(): self.skipTest("CUDA required")
+        prime = sp.csr_matrix([[1., 2.], [3., -1.], [0., 4.]])
+        ns = sp.csr_matrix([[2., 0., 0.], [1., .01, 0.]])
+        expected = np.linalg.norm((prime @ ns).toarray(), axis=0)
+        with patch.dict(os.environ, {"PHEASY_GPU": "1"}):
+            A = gb.GpuTwoLevelOperator(opt.TwoLevelSM(prime, ns))
+            try:
+                x = torch.ones(3, dtype=torch.float64, device=A.device)
+                before = A.matvec(x).clone()
+                norms = A.col_norms()
+                self.assertEqual(norms.device.type, "cuda")
+                np.testing.assert_allclose(norms.cpu().numpy(), expected)
+                torch.testing.assert_close(A.matvec(x), before, rtol=0, atol=0)
+                A.normalize()
+                np.testing.assert_allclose(A.col_norms().cpu().numpy(), [1., 1., 0.])
+                normalized = A.matvec(x).clone()
+                A.normalize()
+                torch.testing.assert_close(A.matvec(x), normalized)
+            finally:
+                A.close()
+
     def test_extra_workspace_rejected_before_any_upload(self):
         import torch
         from core import gpu_backend as gb
