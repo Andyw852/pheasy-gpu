@@ -1246,8 +1246,15 @@ class WorkFlow(object):
                 settings.MODEL.upper() == "ALASSO"
                 and os.environ.get("PHEASY_ALASSO_WEIGHTED_GRID", "1").lower()
                 in ("1", "true", "yes"))
+            # Resident LASSO derives its own KKT-threshold grid on the GPU
+            # (GpuTwoLevelLassoCV with alpha_auto=True); skip the redundant CPU
+            # derive_alpha_grid rmatvec below so the grid is computed exactly once.
+            _lasso_resident = False
+            if settings.MODEL.upper() == "LASSO":
+                from pheasy_gpu.core.optimizer import _lasso_backend
+                _lasso_resident = _lasso_backend(SM) == "gpu_resident"
             if settings.ALPHA_AUTO and (
-                    settings.MODEL.upper() == "LASSO"
+                    (settings.MODEL.upper() == "LASSO" and not _lasso_resident)
                     or (settings.MODEL.upper() == "ALASSO" and not _alasso_weighted)):
                 try:
                     from pheasy_gpu.core.optimizer import derive_alpha_grid as _derive_alpha
