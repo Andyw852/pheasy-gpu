@@ -3052,7 +3052,13 @@ class Optimizer(object):
                 backend = str(info.get("backend", ""))
                 if backend:
                     self._results["execution_backend"] = backend
-                    self._results["postfit_backend"] = "cpu_debias_and_metrics" if self._debias_enabled() else "cpu_metrics"
+                    if self._debias_enabled():
+                        db = getattr(self, "_debias_backend", "unknown")
+                        self._results["debias_backend"] = db
+                        self._results["postfit_backend"] = db + "_and_cpu_metrics"
+                    else:
+                        self._results["debias_backend"] = "disabled"
+                        self._results["postfit_backend"] = "cpu_metrics"
             alpha_idx = int(np.argmin(np.abs(self._model.alphas_ - self._model.alpha_)))
             self._metrics["mse_path"] = np.asarray(self._model.mse_path_[alpha_idx])
             self._metrics["mse_path_mean"] = float(np.mean(self._metrics["mse_path"]))
@@ -3176,6 +3182,7 @@ class Optimizer(object):
         # Full support still has L1 shrinkage and must be refitted.
         # Only empty support has no least-squares problem to solve.
         if sup.size == 0:
+            self._debias_backend = "skipped"
             return coef
         gram = getattr(self, "_gram", None)
         # Relaxed-LASSO debias is an explicitly-declared post-fit stage; a CPU
@@ -3186,6 +3193,7 @@ class Optimizer(object):
             # [FIX P34] OLS on the support via the Gram: G[sup,sup] x = b[sup]
             # is a |sup| x |sup| dense solve, far cheaper than re-solving the
             # full least-squares problem against the operator.
+            self._debias_backend = "cpu_gram_solve"
             G, b = gram
             Gss = G[np.ix_(sup, sup)]
             bs = b[sup]
@@ -3204,6 +3212,7 @@ class Optimizer(object):
             # [FIX P26] column-slice via a masked operator + LSMR, so the
             # relaxed-LASSO debias is no longer skipped on the two-level
             # operator (the L1 shrinkage bias is removed there too).
+            self._debias_backend = "cpu_lsmr"
             op = _make_masked_op(A, None, sup)
             coef_sub = _solve_sparse_lsqr(op, y)
             new = np.zeros_like(coef)
@@ -3214,6 +3223,7 @@ class Optimizer(object):
                 return new
             return coef
         A_sub = A[:, sup]
+        self._debias_backend = ("gpu_dense_lstsq" if _gpu_dense(A_sub) else "cpu_dense_lstsq")
         coef_sub = _solve_lstsq(A_sub, y)
         new = np.zeros_like(coef)
         new[sup] = coef_sub

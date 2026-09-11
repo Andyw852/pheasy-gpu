@@ -138,6 +138,7 @@ def _fit(Optimizer, method, matrix, forces, gpu):
         "alpha": optimizer.results.get("alpha"),
         "nonzero": int(np.count_nonzero(coefficients)),
         "solver_info": optimizer.results.get("solver_info"),
+        "execution_backend": optimizer.results.get("execution_backend"),
         "fista_records": iterative_records,
     }
 
@@ -150,6 +151,9 @@ def _dense_check(Optimizer, gb, method, matrix, forces, rank_deficient):
         raise AssertionError("GPU fit created no verified CUDA tensor")
     if any(key.endswith('.errors') for key in counts):
         raise AssertionError('GPU dense solver error or hidden fallback: ' + repr(counts))
+    if not (gpu_info.get("execution_backend") or "").startswith("gpu"):
+        raise AssertionError("%s GPU fit reported a non-GPU execution backend: %r"
+                             % (method, gpu_info.get("execution_backend")))
     prediction_error = _relative(matrix @ gpu, matrix @ cpu)
     coefficient_error = _relative(gpu, cpu)
     info = dict(cpu=cpu_info, gpu=gpu_info, gpu_dispatch=counts,

@@ -218,8 +218,11 @@ accumulate in the adjoint.
 norm calculation), CV split construction and final host metrics remain on CPU.
 The resident solver performs its own standardization on GPU; this does not
 move the earlier CLI alpha-grid preparation to GPU.
-The existing optional LASSO OLS-debias stage also remains on CPU and is reported
-separately as `postfit_backend`. Setting `PHEASY_LASSO_DEBIAS=0` isolates pure
+The optional LASSO OLS-debias stage is reported separately as `debias_backend`
+and `postfit_backend`. Dense and densified-sparse debias solve the support
+least-squares on the GPU (`debias_backend="gpu_dense_lstsq"` via `gb.lstsq`);
+the resident TwoLevel path still solves it with CPU LSQR
+(`debias_backend="cpu_lsmr"`). Setting `PHEASY_LASSO_DEBIAS=0` isolates pure
 LASSO for solver validation but changes the delivered estimator relative to
 a debiased fit; never present that comparison as an identical full pipeline.
 Neither a completed CUDA kernel nor a generated IFC certifies CV convergence

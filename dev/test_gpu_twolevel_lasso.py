@@ -116,7 +116,8 @@ class ResidentNumericsTests(unittest.TestCase):
         with patch.dict(os.environ, {"PHEASY_GPU_LASSO_RESIDENT": "1", "PHEASY_LASSO_DEBIAS": "1"}), patch.object(gb, "available", return_value=True), patch.object(gb, "enabled", return_value=True), patch.object(gb, "device", return_value="cpu"):
             model = opt.Optimizer("lasso", alpha=[.1], cv=2, tol=1e-10)
             model.fit(A, np.array([2., -2., .1, 0.]))
-        self.assertEqual(model.results["postfit_backend"], "cpu_debias_and_metrics")
+        self.assertEqual(model.results["debias_backend"], "cpu_lsmr")
+        self.assertEqual(model.results["postfit_backend"], "cpu_lsmr_and_cpu_metrics")
         np.testing.assert_allclose(model.results["pre_debias_coef"], [1.6, -1.6, 0., 0.], atol=1e-10)
         np.testing.assert_allclose(model.results["coef"], [2., -2., 0., 0.], atol=1e-8)
 

@@ -837,6 +837,7 @@ class GpuLassoCV(object):
         self.mse_path_ = mse_path
         self.n_iter_ = int(nfin)
         self.regularized_solver_info_ = dict(final_info, solver="GPU FISTA",
+                                            backend="gpu_dense_fista",
                                             stage="regularized_refit_before_debias", tol=float(self.tol))
         self.n_features_in_ = m
         return self
