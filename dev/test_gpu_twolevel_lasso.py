@@ -149,6 +149,27 @@ class ResidentNumericsTests(unittest.TestCase):
         self.assertEqual(model.results["debias_backend"], "gpu_cgls")
         self.assertEqual(model.results["postfit_backend"], "gpu_cgls_and_cpu_metrics")
 
+    def test_resident_subset_nonconvergence_flag_controls_abort(self):
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA hardware required for resident subset solve")
+        # A wide, ill-conditioned support cannot converge in 3 CGLS iterations:
+        # RFE (default) must fail closed, debias must return the last iterate.
+        rng = np.random.default_rng(0)
+        prime = sp.csr_matrix(rng.normal(size=(40, 12)))
+        ns = sp.eye(12, format="csr")
+        A = opt.TwoLevelSM(prime, ns)
+        y = np.asarray(A @ np.linspace(-1., 1., 12)).ravel()
+        cols = np.arange(12)
+        op = gb.GpuTwoLevelOperator(A, device_id=0)
+        try:
+            with self.assertRaises(RuntimeError):
+                gb.solve_resident_subset(op, y, cols, maxiter=3)
+            coef, info = gb.solve_resident_subset(op, y, cols, maxiter=3, raise_on_nonconvergence=False)
+            self.assertFalse(info["converged"])
+            self.assertEqual(tuple(coef.shape), (12,))
+        finally:
+            op.close()
+
     def test_memory_preflight_refuses_before_upload(self):
         A = opt.TwoLevelSM(sp.eye(4, format="csr"), sp.eye(4, format="csr"))
         with patch.object(gb, "available", return_value=True), patch.object(gb, "enabled", return_value=True), patch.object(gb, "device", return_value="cpu"), patch.object(gb, "_device_free_bytes", return_value=1), patch.object(torch, "as_tensor", side_effect=AssertionError("upload before preflight")):

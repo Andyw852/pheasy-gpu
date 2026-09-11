@@ -1485,8 +1485,14 @@ class GpuSubsetOperator:
 
 
 def solve_resident_subset(base, target, columns, rows=None, column_scale=None,
-                          ridge_alpha=0.0, atol=1e-8, btol=1e-8, maxiter=5000):
+                          ridge_alpha=0.0, atol=1e-8, btol=1e-8, maxiter=5000,
+                          raise_on_nonconvergence=True):
     """Return physical CUDA subset coefficients; reject unconverged elimination fits.
+
+    raise_on_nonconvergence keeps elimination fits fail-closed (RFE), while the
+    relaxed-LASSO debias sets it False so an unconverged CGLS returns its last
+    iterate -- exactly the CPU LSQR path's non-aborting behavior -- and the caller's
+    residual check decides whether to keep the refit.
 
     target is the full row-space vector; column_scale is in active-column order.
     """
@@ -1505,7 +1511,7 @@ def solve_resident_subset(base, target, columns, rows=None, column_scale=None,
         coef, info = _iterative_lstsq_tensor(view, y, atol, btol, maxiter)
     info = dict(info, n_samples=view.shape[0], n_features=view.shape[1],
                 fit_scope="full" if rows is None else "fold", ridge_alpha=float(ridge_alpha))
-    if not info["converged"]:
+    if not info["converged"] and raise_on_nonconvergence:
         raise RuntimeError("Resident subset solve did not converge: " + repr(info))
     return coef / view.column_scale, info
 

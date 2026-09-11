@@ -3267,7 +3267,7 @@ class Optimizer(object):
         from . import gpu_backend as gb
         res_op = self._model._operator
         try:
-            coef_sub, _info = gb.solve_resident_subset(res_op, y, sup)
+            coef_sub, _info = gb.solve_resident_subset(res_op, y, sup, raise_on_nonconvergence=False)
             coef_sub = gb._to_numpy(coef_sub, np.float64)
             scale = getattr(self._model, "column_scale_", None)
             if scale is not None:
