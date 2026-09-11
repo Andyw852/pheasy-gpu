@@ -1895,6 +1895,16 @@ class GpuTwoLevelLassoCV(GpuLassoCV):
                 amax = float(weighted_kkt.item())
                 if amax > 0 and np.isfinite(amax):
                     self.alphas = np.logspace(np.log10(amax) - self.decades, np.log10(amax), max(self.nalpha, len(self.alphas)))
+        elif self.alpha_auto:
+            # Non-adaptive LASSO: derive the KKT-threshold grid on the resident
+            # operator instead of relying on the CLI's CPU derive_alpha_grid. op
+            # is already normalized (when standardize=True), so op.rmatvec(yt)
+            # yields A.T y / ||col|| -- the standardized-space gradient the grid
+            # needs -- matching derive_alpha_grid(standardize=True) exactly.
+            g = op.rmatvec(yt)
+            amax = float(torch.max(torch.abs(g)).item()) / A.shape[0]
+            if amax > 0 and np.isfinite(amax):
+                self.alphas = np.logspace(np.log10(amax) - self.decades, np.log10(amax), max(self.nalpha, len(self.alphas)))
         splits = _make_cv_splits(A.shape[0], self.cv, self.rand_seed, self.group_size)
         cv_tol = float(os.environ.get("PHEASY_CV_TOL", str(max(self.tol, 1e-3))))
         cv_cap = int(os.environ.get("PHEASY_CV_MAX_ITER", str(min(self.max_iter, 800))))

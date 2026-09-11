@@ -76,7 +76,7 @@ class ResidentNumericsTests(unittest.TestCase):
                 expected[i, k] = np.mean((X[va] @ ref.coef_ - y[va])**2)
         # Explicit CPU Torch numerical emulation, not GPU evidence.
         with patch.object(gb, "available", return_value=True), patch.object(gb, "enabled", return_value=True), patch.object(gb, "device", return_value="cpu"), patch.dict(os.environ, {"PHEASY_CV_TOL": "1e-9", "PHEASY_CV_MAX_ITER": "3000"}):
-            model = gb.GpuTwoLevelLassoCV(alphas, 3, 1e-9, 3000, 42, group_size=3, standardize=True)
+            model = gb.GpuTwoLevelLassoCV(alphas, 3, 1e-9, 3000, 42, group_size=3, standardize=True, alpha_auto=False)
             model.fit(opt.TwoLevelSM(prime, ns), y)
         np.testing.assert_allclose(model.mse_path_, expected, rtol=1e-6, atol=1e-8)
         self.assertEqual(model.alpha_, alphas[np.argmin(expected.mean(axis=1))])
@@ -88,7 +88,7 @@ class ResidentNumericsTests(unittest.TestCase):
         dense = np.diag([1., 2., 3., 4.])
         A = opt.TwoLevelSM(sp.csr_matrix(dense), sp.eye(4, format="csr"))
         with patch.object(gb, "available", return_value=True), patch.object(gb, "enabled", return_value=True), patch.object(gb, "device", return_value="cpu"), patch.dict(os.environ, {"PHEASY_GPU_LASSO_RESIDENT": "1", "PHEASY_LASSO_DEBIAS": "0"}), patch.object(A, "col_norms", side_effect=AssertionError("host normalization forbidden")):
-            model = opt.Optimizer("lasso", alpha=[.1], cv=2, standardize=True, tol=1e-10)
+            model = opt.Optimizer("lasso", alpha=[.1], cv=2, standardize=True, tol=1e-10, alpha_auto=False)
             model.fit(A, np.array([2., -2., .1, 0.]))
         # Unit normalized design is identity; soft threshold is n*alpha=.4.
         np.testing.assert_allclose(model.results["coef"], [1.6, -.8, 0., 0.], atol=1e-10)
@@ -114,12 +114,27 @@ class ResidentNumericsTests(unittest.TestCase):
     def test_resident_default_debias_preserves_cpu_postfit_semantics(self):
         A = opt.TwoLevelSM(sp.eye(4, format="csr"), sp.eye(4, format="csr"))
         with patch.dict(os.environ, {"PHEASY_GPU_LASSO_RESIDENT": "1", "PHEASY_LASSO_DEBIAS": "1"}), patch.object(gb, "available", return_value=True), patch.object(gb, "enabled", return_value=True), patch.object(gb, "device", return_value="cpu"):
-            model = opt.Optimizer("lasso", alpha=[.1], cv=2, tol=1e-10)
+            model = opt.Optimizer("lasso", alpha=[.1], cv=2, tol=1e-10, alpha_auto=False)
             model.fit(A, np.array([2., -2., .1, 0.]))
         self.assertEqual(model.results["debias_backend"], "cpu_lsmr")
         self.assertEqual(model.results["postfit_backend"], "cpu_lsmr_and_cpu_metrics")
         np.testing.assert_allclose(model.results["pre_debias_coef"], [1.6, -1.6, 0., 0.], atol=1e-10)
         np.testing.assert_allclose(model.results["coef"], [2., -2., 0., 0.], atol=1e-8)
+
+    def test_resident_lasso_auto_grid_matches_derive_alpha_grid(self):
+        rng = np.random.default_rng(5)
+        prime = sp.csr_matrix(rng.normal(size=(12, 5)))
+        ns = sp.csr_matrix(rng.normal(size=(5, 4)))
+        A = opt.TwoLevelSM(prime, ns)
+        y = np.asarray(A @ np.linspace(-1, 1, 4)).ravel()
+        nalpha, decades = 5, 4.0
+        expected = opt.derive_alpha_grid(A, y, nalpha=nalpha, decades=decades, standardize=True)
+        with patch.object(gb, "available", return_value=True), patch.object(gb, "enabled", return_value=True), patch.object(gb, "device", return_value="cpu"), patch.dict(os.environ, {"PHEASY_CV_TOL": "1e-6", "PHEASY_CV_MAX_ITER": "500"}):
+            model = gb.GpuTwoLevelLassoCV([1.0], 3, 1e-6, 500, 0, standardize=True,
+                                          nalpha=nalpha, decades=decades, alpha_auto=True)
+            model.fit(A, y)
+        # The resident KKT grid must reproduce derive_alpha_grid(standardize=True).
+        np.testing.assert_allclose(model.alphas, expected, rtol=1e-12, atol=1e-14)
 
     def test_resident_debias_runs_gpu_cgls_on_cuda(self):
         if torch is None or not torch.cuda.is_available():
@@ -144,7 +159,7 @@ class ResidentNumericsTests(unittest.TestCase):
         A = opt.TwoLevelSM(sp.eye(4, format="csr"), sp.eye(4, format="csr"))
         A = opt._scale_columns(opt._scale_columns(A, np.array([1., 2., 3., 4.])), np.array([2., 1., 2., 1.]))
         with patch.object(gb, "available", return_value=True), patch.object(gb, "enabled", return_value=True), patch.object(gb, "device", return_value="cpu"):
-            model = gb.GpuTwoLevelLassoCV([.1], 2, 1e-10, 1000, 0, standardize=True).fit(A, np.array([2., -2., .1, 0.]))
+            model = gb.GpuTwoLevelLassoCV([.1], 2, 1e-10, 1000, 0, standardize=True, alpha_auto=False).fit(A, np.array([2., -2., .1, 0.]))
         np.testing.assert_allclose(model.coef_, [3.2, -3.2, 0., 0.], atol=1e-10)
 
     def test_sparse_factor_adjoint_norms_and_no_numpy_iteration_transfers(self):

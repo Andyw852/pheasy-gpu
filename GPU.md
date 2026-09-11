@@ -214,10 +214,14 @@ accumulate in the adjoint.
 `PHEASY_GPU_LASSO_RESIDENT=1` enables CUDA-resident LASSO and ALASSO: adaptive pilot, weights, weighted FISTA, CV, refit, and KKT run on CUDA.
 `PHEASY_GPU_TSQR=1` enables bounded binary-tree TSQR for oversized dense tall full-rank systems; CPU TSQR remains the default. `PHEASY_GPU_RIDGE_RESIDENT=1` enables augmented GPU CGLS for TwoLevel/operator Ridge, with CPU metrics and fallback. Dense RFE subset solves/predictions use CUDA when memory allows, while RFE orchestration, support selection, and postprocessing remain CPU. `PHEASY_GPU_RFE_RANKING=1` opts into CUDA importance sorting; with resident RFE it also computes importance from CUDA coefficients (`gpu_importance_rounds`); otherwise importance calculation remains CPU. Column norms are prepared on CPU and support updates remain CPU. Tied/nonfinite importance falls back to NumPy to preserve its exact ordering. Metadata reports `gpu_ranking_rounds`. This is not a resident RFE loop or a demonstrated speedup. For public OLS, the same `PHEASY_GPU_TSQR=1` flag also enables sparse/TwoLevel streamed TSQR, with `PHEASY_TSQR_BLOCK_ROWS` (default 40000, at least the column count). CPU code assembles and expands each bounded row block; CUDA performs QR, tree reduction and triangular solve. Memory/rank failures fall back to matrix-free LSQR/LSMR with `fallback_reason`; operator ridge/Jacobi options retain their existing path. RFE sparse/TwoLevel residency uses the separate `PHEASY_GPU_RFE_RESIDENT=1` CGLS path, not streamed TSQR. TSQR still requires an O(n_columns^2) dense R factor and workspace.
 
-**Scope:** file I/O, automatic alpha-grid preprocessing (including its own column
-norm calculation), CV split construction and final host metrics remain on CPU.
-The resident solver performs its own standardization on GPU; this does not
-move the earlier CLI alpha-grid preparation to GPU.
+**Scope:** file I/O, CV split construction and final host metrics remain on CPU.
+The resident solver performs its own standardization on GPU and, when
+`alpha_auto=True`, derives its own KKT-threshold alpha grid on the retained
+operator (`op.rmatvec`) for both LASSO and ALASSO, matching
+`derive_alpha_grid(standardize=True)` to machine precision; the earlier CLI
+alpha-grid preprocessing is therefore redundant for the resident path. Dense and
+sparse column-norm standardization (`_col_norms` + `_scale_columns`) remains a
+CPU BLAS preprocessing step outside the resident stage.
 The optional LASSO OLS-debias stage is reported separately as `debias_backend`
 and `postfit_backend`. Dense and densified-sparse debias solve the support
 least-squares on the GPU (`debias_backend="gpu_dense_lstsq"` via `gb.lstsq`);
