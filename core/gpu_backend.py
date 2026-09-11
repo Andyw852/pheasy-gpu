@@ -1386,10 +1386,10 @@ class GpuTwoLevelOperator:
         """
         torch = self.torch
         n, p = self.shape
-        budget = int(os.environ.get("PHEASY_GPU_NORM_WORKSPACE_MB", "64")) * 1024**2
+        budget = int(os.environ.get("PHEASY_GPU_NORM_WORKSPACE_MB", "512")) * 1024**2
         if budget <= 0:
             raise ValueError("PHEASY_GPU_NORM_WORKSPACE_MB must be positive")
-        block = max(1, min(64, budget // max(8 * (n + self.ns.shape[0] + p) * 2, 1)))
+        block = max(1, budget // max(8 * (n + self.ns.shape[0] + p) * 2, 1))
         norms = torch.empty_like(self.scale)
         for start in range(0, p, block):
             count = min(block, p - start)
