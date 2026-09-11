@@ -221,7 +221,13 @@ operator (`op.rmatvec`) for both LASSO and ALASSO, matching
 `derive_alpha_grid(standardize=True)` to machine precision; the earlier CLI
 alpha-grid preprocessing is therefore redundant for the resident path. Dense and
 sparse column-norm standardization (`_col_norms` + `_scale_columns`) remains a
-CPU BLAS preprocessing step outside the resident stage.
+CPU BLAS preprocessing step outside the resident stage. A real-data benchmark
+(`dev/benchmark_phases.py`, 99792 x 20125 c2.6 operator) measures column norms
+at ~2.6s as the only host-side O(nnz) pass, with the rmatvec ~0.02s, metrics
+~0.02s and RFE ranking ~0.002s; those three are too cheap for a GPU round-trip,
+so metrics/RFE stay host-side by design. The resident GPU column norms run in
+bounded column blocks sized by `PHEASY_GPU_NORM_WORKSPACE_MB` (default 512 MB,
+no 64-column cap); the earlier 64-column cap made them ~3.5x slower than CPU.
 The optional LASSO OLS-debias stage is reported separately as `debias_backend`
 and `postfit_backend`. Dense and densified-sparse debias solve the support
 least-squares on the GPU (`debias_backend="gpu_dense_lstsq"` via `gb.lstsq`);
