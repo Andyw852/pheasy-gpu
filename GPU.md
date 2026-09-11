@@ -221,7 +221,8 @@ move the earlier CLI alpha-grid preparation to GPU.
 The optional LASSO OLS-debias stage is reported separately as `debias_backend`
 and `postfit_backend`. Dense and densified-sparse debias solve the support
 least-squares on the GPU (`debias_backend="gpu_dense_lstsq"` via `gb.lstsq`);
-the resident TwoLevel path still solves it with CPU LSQR
+the resident TwoLevel path solves it with GPU CGLS on the retained operator
+(`debias_backend="gpu_cgls"`); `PHEASY_GPU_DEBIAS=0` falls back to CPU LSQR
 (`debias_backend="cpu_lsmr"`). Setting `PHEASY_LASSO_DEBIAS=0` isolates pure
 LASSO for solver validation but changes the delivered estimator relative to
 a debiased fit; never present that comparison as an identical full pipeline.

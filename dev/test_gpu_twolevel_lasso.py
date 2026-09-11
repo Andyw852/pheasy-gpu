@@ -121,6 +121,19 @@ class ResidentNumericsTests(unittest.TestCase):
         np.testing.assert_allclose(model.results["pre_debias_coef"], [1.6, -1.6, 0., 0.], atol=1e-10)
         np.testing.assert_allclose(model.results["coef"], [2., -2., 0., 0.], atol=1e-8)
 
+    def test_resident_debias_runs_gpu_cgls_on_cuda(self):
+        if torch is None or not torch.cuda.is_available():
+            self.skipTest("CUDA hardware required for resident debias")
+        A = opt.TwoLevelSM(sp.eye(6, format="csr"), sp.eye(6, format="csr"))
+        y = np.array([2., -2., .1, 0., .3, 0.])
+        model = opt.Optimizer("lasso", alpha=[.1], cv=2, tol=1e-7, max_iter=300,
+                              use_gpu=True, standardize=False, alpha_auto=False)
+        with patch.dict(os.environ, {"PHEASY_GPU_LASSO_RESIDENT": "1", "PHEASY_LASSO_DEBIAS": "1"}):
+            model.fit(A, y)
+        self.assertEqual(model.results["execution_backend"], "gpu_twolevel_resident")
+        self.assertEqual(model.results["debias_backend"], "gpu_cgls")
+        self.assertEqual(model.results["postfit_backend"], "gpu_cgls_and_cpu_metrics")
+
     def test_memory_preflight_refuses_before_upload(self):
         A = opt.TwoLevelSM(sp.eye(4, format="csr"), sp.eye(4, format="csr"))
         with patch.object(gb, "available", return_value=True), patch.object(gb, "enabled", return_value=True), patch.object(gb, "device", return_value="cpu"), patch.object(gb, "_device_free_bytes", return_value=1), patch.object(torch, "as_tensor", side_effect=AssertionError("upload before preflight")):

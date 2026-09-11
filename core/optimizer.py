@@ -2833,13 +2833,15 @@ class Optimizer(object):
                 init_alpha=float(os.environ.get("PHEASY_ALASSO_RIDGE_ALPHA", "1e-3")),
                 eps=float(os.environ.get("PHEASY_ALASSO_EPS", "1e-8")),
                 nalpha=self._nalpha, decades=self._decades, alpha_auto=self._alpha_auto)
-            self._model.fit(A, F64, sample_weight=weights)
+            self._model.fit(A, F64, sample_weight=weights,
+                            retain_operator=self._debias_enabled())
             coef = self._model.coef_
             # Backend returns physical coefficients. Keep A_fit unscaled so
             # the existing optional CPU debias operates in physical coordinates.
             self._results["execution_backend"] = "gpu_twolevel_resident"
-            self._results["postfit_backend"] = "cpu_debias_and_metrics" if self._debias_enabled() else "cpu_metrics"
-            print("[optimizer] gpu_resident %s complete; postfit backend=%s" % (method, self._results["postfit_backend"]), flush=True)
+            # postfit_backend is set after the optional debias (which now runs on the
+            # retained resident operator); do not pre-declare it here.
+            print("[optimizer] gpu_resident %s complete" % method, flush=True)
         elif method == "LASSO":
             self._model = _LassoCVModel(
                 self._alpha, self._cv, self._tol, self._max_iter, self._rand_seed,
@@ -3212,9 +3214,12 @@ class Optimizer(object):
             # [FIX P26] column-slice via a masked operator + LSMR, so the
             # relaxed-LASSO debias is no longer skipped on the two-level
             # operator (the L1 shrinkage bias is removed there too).
-            self._debias_backend = "cpu_lsmr"
-            op = _make_masked_op(A, None, sup)
-            coef_sub = _solve_sparse_lsqr(op, y)
+            if self._resident_debias_available():
+                coef_sub = self._debias_resident_gpu(y, sup)
+            else:
+                self._debias_backend = "cpu_lsmr"
+                op = _make_masked_op(A, None, sup)
+                coef_sub = _solve_sparse_lsqr(op, y)
             new = np.zeros_like(coef)
             new[sup] = coef_sub
             r_new = float(np.linalg.norm(np.asarray(A @ new).ravel() - y))
@@ -3234,6 +3239,44 @@ class Optimizer(object):
         if r_new <= r_old:
             return new
         return coef
+
+    def _resident_debias_available(self):
+        """True when the resident operator is retained and CUDA is on.
+
+        The retained operator is only usable for a GPU support refit on real CUDA;
+        under torch-CPU emulation (tests) or an explicit PHEASY_GPU_DEBIAS=0 the
+        ordinary CPU LSQR path keeps running so the post-fit semantics are unchanged.
+        """
+        res_op = getattr(getattr(self, "_model", None), "_operator", None)
+        if res_op is None:
+            return False
+        dev = getattr(res_op, "device", None)
+        if dev is None or str(dev).split(":")[0] != "cuda":
+            return False
+        if os.environ.get("PHEASY_GPU_DEBIAS", "1").lower() in ("0", "false", "no", "off"):
+            return False
+        return True
+
+    def _debias_resident_gpu(self, y, sup):
+        """Support OLS refit on the retained resident operator (GPU CGLS).
+
+        solve_resident_subset solves against the normalized resident operator, so
+        its coefficients carry the column scale; divide by column_scale_ to return
+        the physical-coordinate support coefficients that match the CPU LSQR path.
+        """
+        from . import gpu_backend as gb
+        res_op = self._model._operator
+        try:
+            coef_sub, _info = gb.solve_resident_subset(res_op, y, sup)
+            coef_sub = gb._to_numpy(coef_sub, np.float64)
+            scale = getattr(self._model, "column_scale_", None)
+            if scale is not None:
+                coef_sub = coef_sub / np.asarray(scale, dtype=np.float64)[sup]
+        finally:
+            res_op.close()
+            self._model._operator = None
+        self._debias_backend = "gpu_cgls"
+        return coef_sub
 
     @staticmethod
     def _detect_group_size(n_samples):

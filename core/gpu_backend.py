@@ -1834,19 +1834,25 @@ class GpuTwoLevelLassoCV(GpuLassoCV):
         self.alpha_auto = bool(alpha_auto)
         self.penalty_weights_ = None
 
-    def fit(self, A, y, sample_weight=None):
+    def fit(self, A, y, sample_weight=None, retain_operator=False):
         if not enabled() or not available():
             raise RuntimeError("Resident two-level LASSO requires enabled CUDA; no CPU fallback")
         devices = _resident_cv_devices()
         owned = []
         try:
             with _resident_device_context(devices[0]):
-                return self._fit_resident(A, y, devices, owned, sample_weight)
+                return self._fit_resident(A, y, devices, owned, sample_weight, retain_operator)
+        except BaseException:
+            op = getattr(self, "_operator", None)
+            if op is not None:
+                op.close()
+                self._operator = None
+            raise
         finally:
             for operator in owned:
                 operator.close()
 
-    def _fit_resident(self, A, y, devices, owned, sample_weight):
+    def _fit_resident(self, A, y, devices, owned, sample_weight, retain_operator):
         import time
         from .optimizer import _make_cv_splits
         started = time.monotonic()
@@ -1982,6 +1988,11 @@ class GpuTwoLevelLassoCV(GpuLassoCV):
         self._alpha_at_min = best_i == 0
         self._alpha_at_min_flat = self._alpha_at_min and int(tied.sum().item()) > 1
         self._alpha_at_min_hitcap = self._alpha_at_min_flat and max_cv_iterations >= cv_cap
+        if retain_operator:
+            # Keep the primary operator resident so the post-fit OLS debias can reuse
+            # its factors (solve_resident_subset) instead of re-uploading the support.
+            self._operator = op
+            owned.clear()
         if self._alpha_at_min:
             import warnings
             warnings.warn("Resident LASSO selected grid minimum%s" %
