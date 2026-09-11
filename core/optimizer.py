@@ -151,6 +151,25 @@ def _gpu_footprint_ok(gb, n, m):
     return footprint <= avail * frac
 
 
+def _gpu_required():
+    """True when the execution context demands GPU and no explicit CPU override.
+
+    PHEASY_GPU_MODE=required fails closed, but a per-instance use_gpu=False is an
+    explicit CPU choice (set via set_gpu_mode(False) for the duration of fit) that
+    overrides the ambient required mode. CPU baselines and explicit CPU fits must
+    keep working under a required environment.
+    """
+    if os.environ.get("PHEASY_GPU_MODE", "").strip().lower() != "required":
+        return False
+    try:
+        from . import gpu_backend as _gb
+        if _gb.get_gpu_mode() is False:
+            return False
+    except Exception:
+        pass
+    return True
+
+
 def _gpu_dense(A):
     """True when A should be solved on the GPU (dense, or sparse small enough to densify).
 
@@ -165,11 +184,17 @@ def _gpu_dense(A):
     if gb is None:
         return False
     if isinstance(A, np.ndarray):
-        return _gpu_footprint_ok(gb, *A.shape)
+        ok = _gpu_footprint_ok(gb, *A.shape)
+        if not ok and _gpu_required():
+            raise RuntimeError("GPU dense solve exceeds the configured VRAM budget; use a resident/iterative GPU path or explicit CPU mode")
+        return ok
     if sp.issparse(A):
         # _should_densify_sparse only checks the HOST budget; the densified
         # matrix still has to fit VRAM, so run the same gate as the ndarray path.
-        return _should_densify_sparse(A) and _gpu_footprint_ok(gb, *A.shape)
+        ok = _should_densify_sparse(A) and _gpu_footprint_ok(gb, *A.shape)
+        if not ok and _gpu_required() and _should_densify_sparse(A):
+            raise RuntimeError("GPU sparse densification exceeds the configured VRAM budget; use an iterative GPU path or explicit CPU mode")
+        return ok
     return False
 
 
@@ -362,13 +387,43 @@ def _should_densify_sparse(A):
 
 
 def _resident_lasso_requested():
-    """Canonical opt-in with the initial development spelling as an alias."""
+    """Explicit opt-in for the resident two-level LASSO/ALASSO backend.
+
+    The initial development spelling (PHEASY_GPU_TWOLEVEL_LASSO) is an alias.
+    This returns True only when the user explicitly requested the resident path;
+    required-GPU-mode defaulting is handled separately by
+    _resident_lasso_active so dense/sparse inputs keep their own GPU dispatch.
+    """
     return os.environ.get("PHEASY_GPU_LASSO_RESIDENT",
                           os.environ.get("PHEASY_GPU_TWOLEVEL_LASSO", "0")).lower() in ("1", "true", "yes", "on")
 
 
 def _resident_twolevel_input(A):
     return isinstance(A, TwoLevelSM) or hasattr(A, "_twolevel_base")
+
+
+def _gpu_sm_explicit():
+    """True when the narrower GPU-SM (sparse matvec) path was explicitly enabled."""
+    return os.environ.get("PHEASY_GPU_SM", "0").lower() in ("1", "true", "yes", "on")
+
+
+def _resident_default():
+    """Production default selects a resident GPU path: required GPU mode without an
+    explicit GPU-SM override. PHEASY_GPU_SM=1 is an explicit, narrower GPU path and
+    must keep its own dispatch instead of being shadowed by the resident default."""
+    return _gpu_required() and not _gpu_sm_explicit()
+
+
+def _resident_lasso_active(A):
+    """True when the resident two-level LASSO/ALASSO backend should run for A.
+
+    Resident dispatch only applies to TwoLevelSM input. It activates on an
+    explicit PHEASY_GPU_LASSO_RESIDENT=1, or by default in required GPU mode
+    (where every supported main solve must run on the GPU) unless an explicit
+    GPU-SM path was requested. Dense and ordinary sparse inputs are excluded
+    here so they keep their own dense-GPU dispatch.
+    """
+    return _resident_twolevel_input(A) and (_resident_lasso_requested() or _resident_default())
 
 
 def _lasso_backend(A):
@@ -379,7 +434,7 @@ def _lasso_backend(A):
     through the matvec-only FISTA solver instead. This is the same dispatch
     policy _solve_lstsq already uses for OLS.
     """
-    if _resident_lasso_requested() and _resident_twolevel_input(A):
+    if _resident_lasso_active(A):
         # Selection is independent of availability: execution must fail closed.
         return "gpu_resident"
     if _is_linear_operator(A):
@@ -520,8 +575,10 @@ def _solve_qr(A, y, block_rows=None, diag_floor=1e-12):
             try:
                 coef, _gpu_info = _gpu().gpu_tsqr(_to_dense_f64(A), y, int(block_rows), diag_floor)
                 return np.asarray(coef, dtype=np.float64)
-            except (RuntimeError, MemoryError, np.linalg.LinAlgError):
-                # Preserve CPU TSQR/SVD semantics for automatic fallback.
+            except (RuntimeError, MemoryError, np.linalg.LinAlgError) as exc:
+                if _gpu_required():
+                    raise RuntimeError("GPU TSQR failed with fallback disabled: %s" % exc) from exc
+                # Preserve CPU TSQR/SVD semantics only in auto mode.
                 pass
         # [FIX P35] _tsqr_qless can raise (e.g. wide matrices); catch so the
         # SVD fallback actually runs instead of propagating the exception.
@@ -858,7 +915,7 @@ def _row_slice_op(A, rows):
     def rmv(u):
         u = np.asarray(u, dtype=dt).ravel()
         u_full = np.zeros(A.shape[0], dtype=dt)
-        u_full[rows] = u
+        np.add.at(u_full, rows, u)  # repeated selected rows contribute additively
         return np.asarray(A.T @ u_full, dtype=dt).ravel()
 
     return LinearOperator((len(rows), n), matvec=mv, rmatvec=rmv, dtype=dt)
@@ -891,7 +948,7 @@ def _ridge_solve(A, y, alpha, x0=None):
         # Narrow opt-in: keep TwoLevel factors resident and solve the augmented
         # ridge system with GPU CGLS. Any setup/kernel failure deliberately
         # falls through to the established CPU LSMR path.
-        resident = (os.environ.get("PHEASY_GPU_RIDGE_RESIDENT", "0").lower()
+        resident = (os.environ.get("PHEASY_GPU_RIDGE_RESIDENT", "1" if _resident_default() else "0").lower()
                     in ("1", "true", "yes", "on"))
         if resident and (hasattr(A, "SM_prime") or hasattr(A, "_twolevel_base")):
             try:
@@ -909,7 +966,8 @@ def _ridge_solve(A, y, alpha, x0=None):
                     A._gpu_solver_info = _iterative_solver_info(info, "GPU CGLS-RIDGE")
                     return np.asarray(coef, dtype=np.float64)
             except Exception as exc:
-                # CPU fallback below is intentional and keeps the opt-in narrow.
+                if _gpu_required():
+                    raise RuntimeError("GPU Ridge solve failed with fallback disabled: %s" % exc) from exc
                 pass
         n = A.shape[1]
         sqrt_a = float(np.sqrt(alpha)) if alpha > 0 else 0.0
@@ -1124,6 +1182,8 @@ class TwoLevelSM(LinearOperator):
                 print("[GPU-SM] SpMV on %d device(s), dtype=%s" % (
                     len(self._gpu_mv._devs), SM_prime.dtype), flush=True)
             except Exception as _e:
+                if os.environ.get("PHEASY_GPU_FALLBACK", "0").lower() in ("0", "false", "off", "no"):
+                    raise RuntimeError("GPU SM initialization failed with fallback disabled: %s" % _e) from _e
                 print("[GPU-SM] SpMV unavailable (%s); using CPU" % _e, flush=True)
                 self._disable_gpu()
         super().__init__(np.dtype(dt), (SM_prime.shape[0], NS.shape[1]))
@@ -1161,6 +1221,8 @@ class TwoLevelSM(LinearOperator):
             try:
                 return self._gpu_mv.matvec(t)
             except Exception as _e:
+                if os.environ.get("PHEASY_GPU_FALLBACK", "0").lower() in ("0", "false", "off", "no"):
+                    raise RuntimeError("GPU SM matvec failed with fallback disabled: %s" % _e) from _e
                 print("[GPU-SM] matvec failed (%s); disabling GPU, CPU fallback" % _e, flush=True)
                 self._disable_gpu()
         return _sp_mv(self.SM_prime, np.ascontiguousarray(t, dtype=self._dt))
@@ -1172,6 +1234,8 @@ class TwoLevelSM(LinearOperator):
                 t = self._gpu_mv.rmatvec(u)
                 return _sp_mv(self.NST, np.ascontiguousarray(t, dtype=self._dt))
             except Exception as _e:
+                if os.environ.get("PHEASY_GPU_FALLBACK", "0").lower() in ("0", "false", "off", "no"):
+                    raise RuntimeError("GPU SM rmatvec failed with fallback disabled: %s" % _e) from _e
                 print("[GPU-SM] rmatvec failed (%s); disabling GPU, CPU fallback" % _e, flush=True)
                 self._disable_gpu()
         t = _sp_mv(self.SM_primeT, u)
@@ -1233,6 +1297,12 @@ class TwoLevelSM(LinearOperator):
         NST (built once) instead of rebuilding a redundant copy per fold.
         SM_primeT stays per-child because each fold slices different rows.
         """
+        if self._gpu_mv is not None:
+            # CV must not allocate another copy of resident GPU factors.
+            # The view keeps the parent alive and trades extra SpMV work for
+            # bounded device memory. Normalize slices/masks to explicit rows.
+            selected = np.arange(self.shape[0], dtype=np.intp)[rows]
+            return _row_slice_op(self, selected)
         child = TwoLevelSM(self.SM_prime[rows], self.NS, dtype=self._dt)
         if self._cache_T:
             self.NST                     # force-build the shared NS transpose
@@ -1495,9 +1565,9 @@ class _LassoCVIterative:
         # warning below) is fixed by tightening these, not by --tol (which only
         # affects the final refit).
         cv_tol = float(os.environ.get(
-            "PHEASY_CV_TOL", str(max(float(self.tol), 1e-3))))
+            "PHEASY_CV_TOL", str(float(self.tol))))
         cv_max_iter = int(os.environ.get(
-            "PHEASY_CV_MAX_ITER", str(min(self.max_iter, 800))))
+            "PHEASY_CV_MAX_ITER", str(int(self.max_iter))))
 
         # [FIX P33] hoist the per-fold row slices out of the alpha loop so the
         # CSR / TwoLevelSM slicing is done once instead of n_alphas times.  Off
@@ -2147,7 +2217,7 @@ class _RFECVBase:
         resident_operator = False
         iterative_diagnostics = []
         resident_subset_builds = 0
-        if os.environ.get("PHEASY_GPU_RFE_RESIDENT", "0").lower() in ("1", "true", "yes", "on"):
+        if os.environ.get("PHEASY_GPU_RFE_RESIDENT", "1" if _resident_default() else "0").lower() in ("1", "true", "yes", "on"):
             if isinstance(A, np.ndarray) and self.n_jobs == 1:
                 resident_backend = _gpu()
                 if resident_backend is not None:
@@ -2189,6 +2259,11 @@ class _RFECVBase:
                         resident_reason = "resident RFE setup failed: %s: %s" % (type(exc).__name__, exc)
             else:
                 resident_reason = "resident RFE requires dense, scipy sparse or TwoLevel input and n_jobs=1"
+
+        if (resident_reason is not None and _is_linear_operator(A)
+                and not resident_reason.startswith("resident RFE requires")
+                and (os.environ.get("PHEASY_GPU_RFE_RESIDENT", "").lower() in ("1", "true", "yes", "on") or _gpu_required())):
+            raise RuntimeError("GPU RFE resident solve failed with fallback disabled: %s" % resident_reason)
 
         full_fit_coef = None
         resident_norms = None
@@ -2606,7 +2681,7 @@ class Optimizer(object):
         btol = float(os.environ.get("PHEASY_OLS_BTOL", str(btol)))
         maxiter = int(os.environ.get("PHEASY_OLS_MAXITER", str(maxiter)))
         ridge = float(os.environ.get("PHEASY_OLS_RIDGE", "0"))
-        if (os.environ.get("PHEASY_GPU_OLS_RESIDENT", "0").lower()
+        if (os.environ.get("PHEASY_GPU_OLS_RESIDENT", "1" if _resident_default() else "0").lower()
                 in ("1", "true", "yes", "on")) and (hasattr(X, "SM_prime") or hasattr(X, "_twolevel_base")):
             try:
                 from . import gpu_backend as _gb
@@ -2623,6 +2698,8 @@ class Optimizer(object):
                     return coef
             except Exception as exc:
                 self._ols_gpu_fallback_reason = "%s: %s" % (type(exc).__name__, exc)
+                if _gpu_required():
+                    raise RuntimeError("GPU OLS solve failed with fallback disabled: %s" % exc) from exc
         """OLS via LSMR (iterative; sparse and LinearOperator safe).
 
         [P2] PHEASY_OLS_JACOBI=1 applies a Jacobi (column-scaling)
@@ -2724,13 +2801,14 @@ class Optimizer(object):
         if weights is not None and method == "LASSO" and self._debias_enabled():
             raise NotImplementedError("weighted LASSO debias is not supported; set PHEASY_LASSO_DEBIAS=0 for supported dense weighted fitting")
 
-        resident_lasso = _resident_lasso_requested()
+        resident_lasso = _resident_lasso_active(A)
+        if (_resident_lasso_requested() and not _resident_twolevel_input(A)
+                and method in ("LASSO", "ALASSO")):
+            raise NotImplementedError("Resident GPU LASSO/ALASSO requires TwoLevelSM input")
         if resident_lasso and method in ("LASSO", "ALASSO"):
             from . import gpu_backend as resident_gb
             if self._use_gpu is False or not resident_gb.enabled() or not resident_gb.available():
                 raise RuntimeError("Resident two-level LASSO requires enabled CUDA; no CPU fallback")
-            if not _resident_twolevel_input(A):
-                raise NotImplementedError("Resident GPU LASSO/ALASSO requires LASSO and TwoLevelSM input")
 
         self._group_size = self._detect_group_size(A.shape[0])
 
@@ -2738,7 +2816,7 @@ class Optimizer(object):
         # penalized methods; coefficients are un-scaled after fitting.
         col_scale = None
         A_fit = A
-        if self._standardize and method in ("LASSO", "ALASSO", "RIDGE") and not (resident_lasso and method == "LASSO"):
+        if self._standardize and method in ("LASSO", "ALASSO", "RIDGE") and not (resident_lasso and method in ("LASSO", "ALASSO")):
             col_scale = _col_norms(A)
             col_scale = np.where(col_scale < 1e-30, 1.0, col_scale)
             A_fit = _scale_columns(A, col_scale)
@@ -3024,6 +3102,17 @@ class Optimizer(object):
                 self._results["fallback_reason"] = self._ols_gpu_fallback_reason
                 self._results["execution_backend"] = "cpu_lsmr"
 
+        # A returned coefficient vector is not automatically a certified fit.
+        _solver_infos = []
+        for _key in ("solver_info", "regularized_solver_info"):
+            _value = self._results.get(_key)
+            if isinstance(_value, dict):
+                _solver_infos.append(_value)
+        _nonconverged = [x for x in _solver_infos if x.get("converged") is False]
+        self._results["fit_accepted"] = not _nonconverged
+        self._results["status"] = ("fit_returned" if not _nonconverged
+                                     else "fit_returned_not_accepted")
+
         F_pred = np.asarray(self.predict(A)).ravel()
         eps = np.finfo(F64.dtype).eps
         F_err = np.abs(F_pred - F64)
@@ -3052,6 +3141,8 @@ class Optimizer(object):
                     self._ols_lsmr_info = info
                     return coef, None
                 except (MemoryError, RuntimeError, np.linalg.LinAlgError) as exc:
+                    if _gpu_required():
+                        raise RuntimeError("GPU TSQR OLS solve failed with fallback disabled: %s" % exc) from exc
                     self._results["fallback_reason"] = "GPU TSQR: %s: %s" % (type(exc).__name__, exc)
                     # Keep sparse fallback matrix-free even for small inputs.
                     if sp.issparse(A):
@@ -3062,7 +3153,7 @@ class Optimizer(object):
                     self._results["execution_backend"] = "cpu_lsmr"
         if _is_linear_operator(A):
             # LSMR only needs matvec/rmatvec; the two-level operator stays sparse.
-            coef = self._ols_lsmr(A, F)
+            coef = self._ols_lsmr(A, F, maxiter=self._max_iter)
             n_iter = self._ols_lsmr_info.get("itn")
             return coef, n_iter
         if sp.issparse(A) and not _should_densify_sparse(A):
@@ -3087,6 +3178,10 @@ class Optimizer(object):
         if sup.size == 0:
             return coef
         gram = getattr(self, "_gram", None)
+        # Relaxed-LASSO debias is an explicitly-declared post-fit stage; a CPU
+        # support refit here is permitted (and reported via postfit_backend), not
+        # a silent solver fallback. It never changes which backend ran the main
+        # regularized solve.
         if gram is not None:
             # [FIX P34] OLS on the support via the Gram: G[sup,sup] x = b[sup]
             # is a |sup| x |sup| dense solve, far cheaper than re-solving the

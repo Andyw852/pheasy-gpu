@@ -345,7 +345,7 @@ class OptimizerLargeRegressions(unittest.TestCase):
         prime = sp.csr_matrix([[1., 2.], [3., 4.]])
         ns = sp.eye(2, format="csr")
         for operation in ("matvec", "rmatvec"):
-            with self.subTest(operation=operation):
+            with self.subTest(operation=operation), patch.dict(os.environ, {"PHEASY_GPU_FALLBACK": "1"}):
                 A = opt.TwoLevelSM(prime, ns)
                 failing_gpu = Mock()
                 getattr(failing_gpu, operation).side_effect = RuntimeError("GPU lost")

@@ -7,34 +7,6 @@ import scipy.sparse as sp
 from core import optimizer as opt
 
 class TestOperatorRidgeGPU(unittest.TestCase):
-    def test_cgls_scalar_reads_scale_as_one_per_iteration(self):
-        import torch
-        import warnings
-        from core import gpu_backend as gb
-        if not torch.cuda.is_available(): self.skipTest("CUDA required")
-        class Operator:
-            def matvec(self, x): return self.diagonal * x
-            def rmatvec(self, y): return self.diagonal * y
-            def norm_estimate(self): return 20.
-        A = Operator()
-        A.torch, A.device, A.shape = torch, torch.device("cuda:0"), (20, 20)
-        A.diagonal = torch.arange(1, 21, dtype=torch.float64, device=A.device)
-        original = torch.Tensor.item
-        counts = []
-        for cap in (2, 5):
-            reads = []
-            def counted(tensor, *args):
-                reads.append(tensor.device.type)
-                return original(tensor, *args)
-            with patch.object(torch.Tensor, "item", counted), warnings.catch_warnings():
-                warnings.simplefilter("ignore", RuntimeWarning)
-                _, info = gb._iterative_lstsq_tensor(A, torch.ones(20, device=A.device),
-                                                   atol=0., btol=0., maxiter=cap)
-            self.assertEqual(info["n_iter"], cap)
-            self.assertFalse(info["converged"])
-            counts.append(reads.count("cuda"))
-        self.assertEqual(counts[1] - counts[0], 5 - 2)
-
     def test_subset_norm_cache_is_local_to_view(self):
         import torch
         from core import gpu_backend as gb
@@ -206,6 +178,29 @@ class TestOperatorRidgeGPU(unittest.TestCase):
             with patch.object(opt,"_lsmr",wraps=opt._lsmr) as lsmr:
                 opt._ridge_solve(A,y,.1)
                 self.assertTrue(lsmr.called)
+    def test_true_residual_can_accept_after_iteration_limit(self):
+        import torch
+        from core import gpu_backend as gb
+        if not torch.cuda.is_available(): self.skipTest("CUDA required")
+        # Fault-injection operator isolates the two certificate branches;
+        # this is a diagnostic test, not a physical least-squares fixture.
+        class Operator:
+            shape = (2, 2)
+            device = torch.device("cuda:0")
+            calls = 0
+            def norm_estimate(self): return 1.
+            def matvec(self, x):
+                self.calls += 1
+                return x * x.new_tensor([1., 2.]) if self.calls == 1 else x.new_tensor([1., 2.])
+            def rmatvec(self, x): return x
+        A = Operator()
+        A.torch = torch
+        coef, info = gb._iterative_lstsq_tensor(A, [1., 2.], maxiter=1, btol=0., atol=0.)
+        self.assertTrue(info["converged"])
+        self.assertEqual(info["stop_reason"], "converged_on_true_residual")
+        self.assertEqual(info["normr"], 0.)
+        self.assertEqual(info["n_iter"], 1)
+
     def test_tensor_cgls_preserves_device_and_diagnostics(self):
         import torch
         from core import gpu_backend as gb

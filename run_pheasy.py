@@ -1328,6 +1328,38 @@ class WorkFlow(object):
             fit_results = optimizer.results
             fit_metrics = optimizer.metrics
 
+            # Persist a reproducibility manifest before any material output.
+            # Numpy arrays are summarized rather than copied into JSON.
+            import json as _fit_json
+            import platform as _fit_platform
+            def _manifest_value(_v):
+                if isinstance(_v, np.ndarray):
+                    return {"type": "ndarray", "shape": list(_v.shape), "dtype": str(_v.dtype)}
+                if isinstance(_v, (np.integer, np.floating, np.bool_)):
+                    return _v.item()
+                if isinstance(_v, dict):
+                    return {str(_k): _manifest_value(_x) for _k, _x in _v.items()}
+                if isinstance(_v, (list, tuple)):
+                    return [_manifest_value(_x) for _x in _v]
+                try:
+                    _fit_json.dumps(_v)
+                    return _v
+                except TypeError:
+                    return repr(_v)
+            _gpu_env = {k: os.environ[k] for k in sorted(os.environ) if k.startswith("PHEASY_GPU") or k.startswith("PHEASY_USE_GPU") or k.startswith("PHEASY_OLS") or k.startswith("PHEASY_LSQR") or k.startswith("PHEASY_CV") or k in ("CUDA_VISIBLE_DEVICES", "PHEASY_SM_DTYPE")}
+            _versions = {}
+            try:
+                from importlib import metadata as _imeta
+            except Exception:
+                _imeta = None
+            for _pkg in ("numpy", "scipy", "scikit-learn", "torch", "spglib", "phonopy", "ase", "h5py", "joblib", "f90nml"):
+                try:
+                    _versions[_pkg] = _imeta.version(_pkg) if _imeta is not None else "unknown"
+                except Exception:
+                    _versions[_pkg] = "unavailable"
+            with open("fit_manifest.json", "w") as _mf:
+                _fit_json.dump({"model": settings.MODEL, "python": _fit_platform.python_version(), "platform": _fit_platform.platform(), "versions": _versions, "environment": _gpu_env, "results": _manifest_value(fit_results), "metrics": _manifest_value(fit_metrics)}, _mf, indent=2, sort_keys=True)
+
             # warn when alpha_opt sits at a grid edge (the CV wanted a value
             # outside the grid); this replaces the old shell retry loop.
             if settings.MODEL.upper() in ("LASSO", "ALASSO") and "alpha" in fit_results:
@@ -1391,6 +1423,15 @@ class WorkFlow(object):
             logger.info(
                 "- Non-zero IFC terms: {}".format(np.count_nonzero(fit_results["coef"]))
             )
+
+            if not fit_results.get("fit_accepted", True):
+                _allow_unaccepted = os.environ.get("PHEASY_ALLOW_UNACCEPTED_FIT", "0").lower() in ("1", "true", "yes", "on")
+                _status = fit_results.get("status", "fit_returned_not_accepted")
+                logger.error("Fit was returned but not accepted (%s); refusing to write force constants. "
+                             "Set PHEASY_ALLOW_UNACCEPTED_FIT=1 only for diagnostic output.", _status)
+                if not _allow_unaccepted:
+                    raise RuntimeError("fit did not meet convergence acceptance criteria: %s" % _status)
+                logger.warning("PHEASY_ALLOW_UNACCEPTED_FIT=1: writing diagnostic, uncertified force constants")
 
             if settings.FIX_FC2:
                 APhi = NS_anharm.dot(fit_results["coef"])

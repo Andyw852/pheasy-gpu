@@ -19,6 +19,29 @@ pip install -e '.[gpu]'   # + torch (CUDA), the GPU backend
 pip install -e '.[fast]'  # + celer, a faster LASSO solver (CPU path)
 ```
 
+## Verify the install
+
+```bash
+python dev/smoke_installed.py                      # ambient interpreter
+/path/to/venv/bin/python dev/smoke_installed.py    # explicit env
+pheasy-gpu --help                                  # console entry point
+```
+
+A clean, reproducible base install (no GPU extra) is:
+
+```bash
+python -m venv .venv
+.venv/bin/python -m pip install --upgrade pip
+.venv/bin/python -m pip install -e .
+.venv/bin/python dev/smoke_installed.py
+```
+
+For CUDA, add the `[gpu]` extra: `.venv/bin/python -m pip install -e '.[gpu]'`.
+Each fit writes a `fit_manifest.json` recording the method, resolved GPU
+environment variables, dependency versions, backend, convergence diagnostics and
+`fit_accepted`/`status`; an unaccepted fit refuses to write force constants
+unless `PHEASY_ALLOW_UNACCEPTED_FIT=1` is set.
+
 ## Fitting methods (`-l`)
 
 | flag | method |
@@ -43,8 +66,14 @@ pheasy-gpu --dim 3 3 3 -w 3 -f --c3 5.2 --ndata 45 -l OLS --full_ifc --hdf5
 ## Notes
 
 - The `pheasy-gpu` CLI has no `--use-gpu` flag: GPU activation is via the
-  `PHEASY_USE_GPU` env var (`1` force GPU, `0` force CPU, unset = auto).
-  See `GPU.md`.
+  `PHEASY_GPU_MODE=auto|cpu|required` (`auto` is the default). Legacy
+  `PHEASY_USE_GPU=1/0` maps to `required/cpu`. `required` is the production
+  default: every supported main solve (OLS/RIDGE/LASSO/ALASSO/RFE) runs on the
+  GPU by default, and any GPU runtime failure raises instead of silently
+  returning a CPU result; a per-instance `use_gpu=False` still selects CPU
+  explicitly. See `GPU.md`. `PHEASY_GPU_FALLBACK=0` (now the default) makes an
+  enabled GPU sparse-matvec path fail closed on any mid-fit CUDA error; set
+  `PHEASY_GPU_FALLBACK=1` to restore the legacy CPU continuation.
 - LASSO / ALASSO need a tight tolerance. `--tol 1e-3` is *not* tight: sklearn
   scales it by `||y||^2`, coordinate descent stops early at small alpha, the CV
   curve goes flat and the fit ends up over-regularized. Use `--tol 1e-6`.

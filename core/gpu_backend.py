@@ -56,6 +56,8 @@ __all__ = [
     "enabled",
     "set_gpu_mode",
     "get_gpu_mode",
+    "gpu_mode_from_env",
+    "gpu_mode_required",
     "device",
     "lstsq",
     "qr_solve",
@@ -182,11 +184,25 @@ def _multi_gpu_devices(min_free_bytes=0):
     return devs
 
 
+def gpu_mode_from_env():
+    """Return the public GPU mode: auto, cpu, or required."""
+    raw = os.environ.get("PHEASY_GPU_MODE")
+    if raw is None:
+        raw = os.environ.get("PHEASY_USE_GPU")
+        if raw is None:
+            return "auto"
+        return "required" if raw.lower() in ("1", "true", "yes", "on") else "cpu"
+    mode = raw.strip().lower()
+    if mode not in ("auto", "cpu", "required"):
+        raise ValueError("PHEASY_GPU_MODE must be auto, cpu, or required")
+    return mode
+
+def gpu_mode_required():
+    return gpu_mode_from_env() == "required"
+
 def _env_wants():
-    v = os.environ.get("PHEASY_USE_GPU", None)
-    if v is None:
-        return None
-    return v.lower() in ("1", "true", "yes", "on")
+    mode = gpu_mode_from_env()
+    return None if mode == "auto" else mode == "required"
 
 
 def enabled():
@@ -197,6 +213,8 @@ def enabled():
         want = _env_wants()
         if want is None:
             want = True        # auto: use GPU when available
+    if (gpu_mode_required() or _mode is True) and not available():
+        raise RuntimeError("GPU mode is required but CUDA is unavailable")
     return bool(want) and available()
 
 
@@ -921,10 +939,11 @@ class GpuRidgeCV(object):
                         pred = AvV @ ((S / (S * S + float(a))) * Uty)
                         col[j] = float(((pred - yvat) ** 2).mean().item())
                     return col
-            except torch.cuda.OutOfMemoryError:
+            except torch.cuda.OutOfMemoryError as exc:
                 torch.cuda.empty_cache()
-                print("[GPU] RIDGE CV fold %d OOM on cuda:%d; falling back to "
-                      "CPU (shared box?)" % (k, dev), flush=True)
+                if gpu_mode_required() or os.environ.get("PHEASY_GPU_FALLBACK", "0").lower() not in ("1", "true", "yes", "on"):
+                    raise RuntimeError("GPU RIDGE CV fold %d failed with fallback disabled: %s" % (k, exc)) from exc
+                print("[GPU] RIDGE CV fold %d OOM on cuda:%d; explicit CPU fallback" % (k, dev), flush=True)
                 return _fold_cpu(k)
 
         if len(devs) > 1:
@@ -1007,8 +1026,9 @@ def load_sensing_matrix(sm_prime, ns_harm, ns_anharm, n_rows, dtype=np.float64):
     sm = sm_prime[:n_rows].tocsr()
 
     if not enabled():
-        # CPU path: keep NS sparse (like holdout_eval's own fallback) instead of
-        # densifying it -- avoids a large dense block-diagonal allocation.
+        if gpu_mode_required():
+            raise RuntimeError("GPU sensing-matrix construction requires CUDA")
+        # Explicit/ambient CPU mode only.
         import scipy.sparse as sp
         NS = sp.block_diag([ns_harm, ns_anharm], format="csr")
         SM = sm @ NS
@@ -1569,13 +1589,11 @@ def _iterative_lstsq_tensor(A, y, atol=1e-8, btol=1e-8, maxiter=5000):
     normal_norm = torch.linalg.vector_norm(s)
     residual_norm = torch.linalg.vector_norm(r)
     norma = A.norm_estimate() if hasattr(A, "norm_estimate") else _operator_norm_estimate(A)
-    def tolerance_tensor():
+    def meets_tolerance():
         normx = torch.linalg.vector_norm(x)
         finite = torch.isfinite(normal_norm) & torch.isfinite(residual_norm) & torch.isfinite(rhs_norm) & torch.isfinite(normx)
-        return finite & bool(np.isfinite(norma)) & ((normal_norm <= atol * norma * residual_norm)
-                    | (residual_norm <= btol * rhs_norm + atol * norma * normx))
-    def meets_tolerance():
-        return bool(tolerance_tensor().item())
+        return bool((finite & bool(np.isfinite(norma)) & ((normal_norm <= atol * norma * residual_norm)
+                    | (residual_norm <= btol * rhs_norm + atol * norma * normx))).item())
     converged = meets_tolerance()
     n_iter = 0
     residual_norm = torch.linalg.vector_norm(r)
@@ -1585,30 +1603,21 @@ def _iterative_lstsq_tensor(A, y, atol=1e-8, btol=1e-8, maxiter=5000):
             break
         q = A.matvec(p)
         denom = torch.dot(q, q)
-        invalid_direction = ~torch.isfinite(denom) | (denom <= 0)
-        # Keep the last valid iterate on device if the direction breaks down.
-        # Selecting the whole candidate also handles 0 * inf without host branching.
-        step = gamma / torch.where(invalid_direction, torch.ones_like(denom), denom)
-        x = torch.where(invalid_direction, x, x + step * p)
-        r = torch.where(invalid_direction, r, r - step * q)
+        if bool((~torch.isfinite(denom) | (denom <= 0)).item()):
+            stop_reason = "invalid_search_direction"
+            break
+        step = gamma / denom
+        x = x + step * p
+        r = r - step * q
         s_new = A.rmatvec(r)
         gamma_new = torch.dot(s_new, s_new)
         residual_norm = torch.linalg.vector_norm(r)
         normal_norm = torch.linalg.vector_norm(s_new)
         n_iter = it + 1
-        # One scalar transfer for all predicates; preserve failure precedence.
-        invalid_gradient = ~torch.isfinite(gamma_new) | (gamma <= 0)
-        status = int((tolerance_tensor().to(torch.int32)
-                      + 2 * invalid_gradient.to(torch.int32)
-                      + 4 * invalid_direction.to(torch.int32)).item())
-        if status & 4:
-            n_iter = it
-            stop_reason = "invalid_search_direction"
-            break
-        converged = bool(status & 1)
+        converged = meets_tolerance()
         if converged:
             break
-        if status & 2:
+        if bool((~torch.isfinite(gamma_new) | (gamma <= 0)).item()):
             stop_reason = "invalid_gradient_recurrence"
             break
         p = s_new + (gamma_new / gamma) * p
