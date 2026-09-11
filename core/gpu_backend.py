@@ -1913,7 +1913,12 @@ class GpuTwoLevelLassoCV(GpuLassoCV):
                 self.alphas = np.logspace(np.log10(amax) - self.decades, np.log10(amax), max(self.nalpha, len(self.alphas)))
         splits = _make_cv_splits(A.shape[0], self.cv, self.rand_seed, self.group_size)
         cv_tol = float(os.environ.get("PHEASY_CV_TOL", str(max(self.tol, 1e-3))))
-        cv_cap = int(os.environ.get("PHEASY_CV_MAX_ITER", str(min(self.max_iter, 800))))
+        # CV only needs the MSE *ranking* across alphas, not a tight solution per
+        # alpha. The mid-grid alphas (the sparse->dense transition) converge
+        # extremely slowly under FISTA and hit the cap with KKT ~1e-2 either way;
+        # 400 vs 800 iterations leaves the selected alpha unchanged on c2.6
+        # (5 seeds + full 99792 rows) while ~halving CV wall time.
+        cv_cap = int(os.environ.get("PHEASY_CV_MAX_ITER", str(min(self.max_iter, 400))))
         if cv_cap < 1 or cv_tol <= 0:
             raise ValueError("CV max_iter and tol must be positive")
         # Replicate factors once per card, never once per fold. Copy primary

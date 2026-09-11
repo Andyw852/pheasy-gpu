@@ -559,7 +559,7 @@ else; set these first to reproduce them:
 | knob | default | effect |
 |---|---|---|
 | `PHEASY_CV_TOL` | `max(tol, 1e-3)` | the CV path runs at 1e-3, not the caller's `tol` |
-| `PHEASY_CV_MAX_ITER` | `min(max_iter, 800)` | the CV path is capped at 800 iterations |
+| `PHEASY_CV_MAX_ITER` | `min(max_iter, 400)` | the CV path is capped at 400 iterations |
 | `PHEASY_LASSO_DEBIAS` | `1` | `results["coef"]` is the OLS refit on the support, not the raw FISTA/CD solution |
 
 Run a small case twice and diff:

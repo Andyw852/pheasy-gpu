@@ -170,6 +170,19 @@ class ResidentNumericsTests(unittest.TestCase):
         finally:
             op.close()
 
+    def test_cv_cap_defaults_to_min_maxiter_400(self):
+        # PHEASY_CV_MAX_ITER unset -> cv_cap = min(max_iter, 400). Capture the
+        # max_iter forwarded to _fista_twolevel: the CV/full-path stages must be
+        # capped at 400 (the new default), never the old 800.
+        A = opt.TwoLevelSM(sp.eye(6, format="csr"), sp.eye(6, format="csr"))
+        y = np.array([2., -2., .1, 0., .3, 0.])
+        with patch.object(gb, "available", return_value=True), patch.object(gb, "enabled", return_value=True), patch.object(gb, "device", return_value="cpu"), patch.object(gb, "_fista_twolevel", wraps=gb._fista_twolevel) as fista:
+            gb.GpuTwoLevelLassoCV([.1], 2, 1e-10, 2000, 0, standardize=False, alpha_auto=False).fit(A, y)
+        caps = [c.args[4] for c in fista.call_args_list]
+        self.assertTrue(caps)
+        self.assertIn(400, caps)
+        self.assertNotIn(800, caps)
+
     def test_memory_preflight_refuses_before_upload(self):
         A = opt.TwoLevelSM(sp.eye(4, format="csr"), sp.eye(4, format="csr"))
         with patch.object(gb, "available", return_value=True), patch.object(gb, "enabled", return_value=True), patch.object(gb, "device", return_value="cpu"), patch.object(gb, "_device_free_bytes", return_value=1), patch.object(torch, "as_tensor", side_effect=AssertionError("upload before preflight")):
