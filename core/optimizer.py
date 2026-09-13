@@ -3142,8 +3142,17 @@ class Optimizer(object):
                 # instead of per alpha (threadpool_limits walks the loaded BLAS
                 # libraries on every entry/exit).
                 ctx = _blas_limit(n_workers) if parallel else contextlib.nullcontext()
+                # Per-alpha progress.  Ridge on a matrix-free two-level operator
+                # is a long, completely silent loop (one linear solve per fold,
+                # x folds x alphas); a fit that printed nothing for hours could
+                # only be monitored by guessing, and an alpha grid anchored in
+                # the wrong decade could not be spotted before the run ended.
+                # A per-alpha line costs one print per fold-solve.
+                import time as _time
+                _t_alpha0 = _time.time()
                 with ctx:
                     for j, a in enumerate(alphas):
+                        _t_one = _time.time()
                         if parallel:
                             errs = Parallel(n_jobs=n_workers, prefer="threads")(
                                 delayed(_fold_rmse)(a, k)
@@ -3151,6 +3160,12 @@ class Optimizer(object):
                         else:
                             errs = [_fold_rmse(a, k) for k in range(len(splits))]
                         mse_path[j] = errs
+                        print("[RIDGE-CV] alpha %d/%d = %.3e | fold_mse %s | mean %.6e"
+                              " | %.1fs (total %.1fs)"
+                              % (j + 1, len(alphas), float(a),
+                                 " ".join("%.6e" % float(e) for e in errs),
+                                 float(np.mean(errs)), _time.time() - _t_one,
+                                 _time.time() - _t_alpha0), flush=True)
                 best_alpha = float(alphas[int(np.argmin(mse_path.mean(axis=1)))])
                 coef = _ridge_solve(A_fit, F64, best_alpha)
                 self._model = _OLSModel(coef, alpha=best_alpha)
