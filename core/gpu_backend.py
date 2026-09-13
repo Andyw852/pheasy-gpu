@@ -1960,6 +1960,14 @@ class GpuSubsetOperator:
 
     def __init__(self, base, columns, rows=None, column_scale=None):
         self.base, self.torch, self.device = base, base.torch, base.device
+        # Mirror the base operator's value dtype.  This used to be read as
+        # self._value_dtype further down without ever being assigned: the class
+        # has no __getattr__ delegation and no class-level default, so every
+        # construction raised AttributeError('GpuSubsetOperator' object has no
+        # attribute '_value_dtype') -- i.e. the resident subset view, the
+        # resident LASSO debias path and GpuSubsetOperator's own tests were all
+        # dead.  Bind it once here so new call sites cannot miss it again.
+        self._value_dtype = getattr(base, "_value_dtype", None) or base.torch.float64
         torch = self.torch
         def index_tensor(values):
             raw = torch.as_tensor(values, device=self.device)

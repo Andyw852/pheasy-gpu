@@ -365,7 +365,15 @@ class TestOperatorOLSFallback(unittest.TestCase):
         A = opt.TwoLevelSM(sp.eye(6, format="csr"), sp.eye(6, format="csr"))
         y = np.arange(6.)
         model = opt.Optimizer("OLS", use_gpu=True)
-        with patch.dict(os.environ, {"PHEASY_GPU_OLS_RESIDENT": "1"}), patch.object(gb, "enabled", return_value=True), patch.object(gb, "GpuTwoLevelOperator", side_effect=RuntimeError("injected upload failure")):
+        # PHEASY_OLS_JACOBI=0 is required for this scenario to exist at all: the
+        # matrix-free default is Jacobi ON, and the resident OLS branch skips
+        # itself (setting fallback_reason = "...ridge/Jacobi options") whenever
+        # Jacobi or a ridge is requested, so the injected upload failure below
+        # would never be attempted.  Same env as
+        # test_resident_ols_honors_limits_and_ridge_option, which already knew
+        # this.  The assertion intent is unchanged: a *failed* resident upload
+        # must be reported in fallback_reason.
+        with patch.dict(os.environ, {"PHEASY_GPU_OLS_RESIDENT": "1", "PHEASY_OLS_JACOBI": "0"}), patch.object(gb, "enabled", return_value=True), patch.object(gb, "GpuTwoLevelOperator", side_effect=RuntimeError("injected upload failure")):
             model.fit(A, y)
         self.assertEqual(model.results["execution_backend"], "cpu_lsmr")
         self.assertIn("injected upload failure", model.results["fallback_reason"])
