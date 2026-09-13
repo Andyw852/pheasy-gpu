@@ -3167,7 +3167,36 @@ class Optimizer(object):
                                  float(np.mean(errs)), _time.time() - _t_one,
                                  _time.time() - _t_alpha0), flush=True)
                 best_alpha = float(alphas[int(np.argmin(mse_path.mean(axis=1)))])
-                coef = _ridge_solve(A_fit, F64, best_alpha)
+                # L-curve.  The CV curve says which alpha predicts best; it does
+                # not say whether the alpha grid was anchored anywhere near the
+                # region where alpha changes the solution at all -- the first
+                # RIDGE attempt on this dataset swept [1e-16,1e-8] and its
+                # strongest point had not converged after 32 minutes, i.e. the
+                # whole grid sat inside "indistinguishable from OLS".
+                # ||c(alpha)|| and the full-data residual expose that directly.
+                # Note this is NOT free in this code path: each alpha solves on
+                # the CV folds only, so this is an extra warm-started full-data
+                # refit per alpha (the alpha path walks large->small, so the
+                # previous solution is a good x0).  Gate it with
+                # PHEASY_RIDGE_LCURVE=0 if the extra solves are not wanted; the
+                # best alpha's coefficient is reused for the final model.
+                _lc = {}
+                if os.environ.get("PHEASY_RIDGE_LCURVE", "1").lower() not in ("0", "false", "no", "off"):
+                    _x0 = None
+                    print("[RIDGE-LC] alpha | ||c|| | ||Xc-y|| | time", flush=True)
+                    for _a in alphas:
+                        _tl = _time.time()
+                        _c = _ridge_solve(A_fit, F64, _a, x0=_x0)
+                        _x0 = _c
+                        _lc[float(_a)] = _c
+                        _res = np.asarray(A_fit @ _c, dtype=np.float64).ravel() - F64
+                        print("[RIDGE-LC] %.6e | %.6e | %.6e | %.1fs"
+                              % (float(_a), float(np.linalg.norm(_c)),
+                                 float(np.linalg.norm(_res)),
+                                 _time.time() - _tl), flush=True)
+                coef = _lc.get(best_alpha)
+                if coef is None:
+                    coef = _ridge_solve(A_fit, F64, best_alpha)
                 self._model = _OLSModel(coef, alpha=best_alpha)
                 self._results["alpha"] = best_alpha
                 self._results["mse_path"] = mse_path
