@@ -99,12 +99,25 @@ A matched 6000x256 sweep on a confirmed-idle RTX 3090 (Torch 2.6.0+cu124; all si
 verified at 0% utilization before and after; median of three warm fits) gives the clearest
 current picture:
 
-| input | CPU | GPU (non-resident) | GPU resident |
-| --- | --- | --- | --- |
-| dense | 0.5322 s | 0.3381 s | **0.1621 s** |
-| csr, 10% density | 0.5534 s | **0.2829 s** | 0.3392 s |
-| TwoLevel, identity NS | 0.2097 s | 0.2328 s | 0.5264 s |
-| TwoLevel, sparse-mixed NS | 0.4458 s | 0.4475 s | 0.7916 s |
+| input | CPU | GPU (non-resident) | GPU resident | required env (reconstructed from the code paths -- the original run did not record it) |
+| --- | --- | --- | --- | --- |
+| dense | 0.5322 s | 0.3381 s | **0.1621 s** | CPU: none; non-resident: `PHEASY_USE_GPU=1`; resident: `PHEASY_GPU_RFE_RESIDENT=1` |
+| csr, 10% density | 0.5534 s | **0.2829 s** | 0.3392 s | same as dense |
+| TwoLevel, identity NS | 0.2097 s | 0.2328 s | 0.5264 s | CPU: none; non-resident: `PHEASY_USE_GPU=1`; **resident: `PHEASY_GPU_OLS_RESIDENT=1` AND `PHEASY_OLS_JACOBI=0`** |
+| TwoLevel, sparse-mixed NS | 0.4458 s | 0.4475 s | 0.7916 s | same as TwoLevel, identity NS |
+
+**Read the env column, not just the timings.** The TwoLevel resident column is unreachable
+under the default configuration: Jacobi defaults ON for matrix-free input, and the resident OLS
+branch implements neither Jacobi nor a ridge, so it skips itself and sets `fallback_reason` to
+the ridge/Jacobi message before it ever constructs a `GpuTwoLevelOperator`. Any measurement of
+that column therefore had `PHEASY_OLS_JACOBI=0` set, and a production OLS fit -- which never sets
+it -- lands on CPU LSMR no matter what `PHEASY_GPU_OLS_RESIDENT` says. The default behaviour is
+pinned by `dev/test_gpu_operator_ridge.py::test_matrix_free_default_skips_resident_ols`.
+
+The same trap applies to the harness: `dev/validate_large_fit.py` sets `PHEASY_OLS_JACOBI='1'`,
+so that validator exercises the **CPU LSMR** path, not residency. Its green light is not evidence
+that the GPU OLS path works; add a `PHEASY_OLS_JACOBI=0` configuration to it (or rename what it
+claims to validate) before citing it for GPU behaviour.
 
 Dense residency is a real win on this hardware (3.3x vs CPU, and 2.1x vs the non-resident GPU
 path, so residency itself -- not merely "using the GPU" -- is what pays). Sparse CSR is ~2x faster

@@ -2,8 +2,15 @@
 
 GPU-accelerated (CUDA / PyTorch) edition of pheasy. Same fitting methods
 and control flow as pheasy; the heavy dense linear algebra (OLS, RIDGE, RFE,
-sensing-matrix loading) runs on the GPU. See [`GPU.md`](GPU.md) for activation,
-measured speedups, and correctness checks.
+sensing-matrix loading) runs on the GPU **when the input is dense**. On a
+matrix-free `TwoLevelSM` input -- the production path for large cells --
+the default configuration does *not* reach the GPU for OLS: Jacobi defaults ON
+for matrix-free input and the resident OLS branch implements neither Jacobi nor
+a ridge, so it skips itself and the fit lands on CPU LSMR. Set
+`PHEASY_OLS_JACOBI=0` (together with `PHEASY_GPU_OLS_RESIDENT=1`) to reach it,
+and note that GPU-resident TwoLevel OLS measured *slower* than CPU at the sizes
+tried. See [`GPU.md`](GPU.md) for activation, the per-row env of every measured
+benchmark, and correctness checks.
 
 This is a separate package named `pheasy_gpu` and a separate console command
 `pheasy-gpu`, so it can be installed alongside the original `pheasy` without
