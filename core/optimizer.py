@@ -27,6 +27,49 @@ from sklearn.metrics import (
 )
 from sklearn.model_selection import GroupKFold, KFold
 
+
+# ===== _sm_precision / _lsmr_tol (working-precision floor for LSMR tolerances) =====
+def _sm_precision():
+    """Working precision of the sensing matrix.
+
+    Only an explicitly requested PHEASY_SM_DTYPE=float32 means float32.  When it
+    is unset the caller is a library user (or a test) driving Optimizer directly
+    on numpy float64 data, so the floor must not be applied to them -- defaulting
+    this to float32 raised the tolerance of every dense float64 solve to 1.2e-6
+    and broke the Jacobi equivalence checks, which need a tight tolerance
+    precisely because they compare two paths to high accuracy.
+    """
+    name = os.environ.get("PHEASY_SM_DTYPE")
+    if name is not None and str(name).strip().lower() in ("float32", "f32", "single"):
+        return np.float32
+    return np.float64
+
+
+def _lsmr_tol(name, default):
+    """atol/btol, raised to the floor the working precision can actually reach.
+
+    scipy's LSMR stops when normar <= atol*normA*normr (and normr <= btol*normb).
+    With PHEASY_SM_DTYPE=float32 the acting matrix carries ~1.2e-7 relative
+    precision, so a requested 1e-8 can never be met: every solve burns its whole
+    maxiter budget with istop=7, and the runtime stops depending on alpha or on
+    the condition number at all.  Measured on the c6.5/c3=4.5 dataset: a ridge
+    solve at alpha=1e-8 and one at alpha=1.127e2 (augmented condition number
+    ~10, where the linear algebra says ~70 iterations) took the same order of
+    time.  Raise the request to the floor and say so, rather than silently
+    running thousands of useless iterations.
+    """
+    want = float(os.environ.get(name, str(default)))
+    dt = _sm_precision()
+    floor = 10.0 * float(np.finfo(dt).eps)
+    if want < floor:
+        warnings.warn(
+            "[lsmr] %s=%g is below the %s reachable floor %.3g; raised to the "
+            "floor -- a tighter request only makes the stopping test "
+            "unreachable and burns the iteration budget."
+            % (name, want, np.dtype(dt).name, floor), stacklevel=2)
+        return floor
+    return want
+
 try:
     from sparse_dot_mkl import dot_product_mkl as _mkl_dot
 except Exception:                                   # pragma: no cover
@@ -371,8 +414,8 @@ def _solve_sparse_lsqr(A, y, info=None):
     ~280 GB). This is the same Krylov approach used by symfc / phonopy.
     """
     from scipy.sparse.linalg import lsqr as _sp_lsqr
-    atol = float(os.environ.get("PHEASY_LSQR_ATOL", "1e-8"))
-    btol = float(os.environ.get("PHEASY_LSQR_BTOL", "1e-8"))
+    atol = float(_lsmr_tol("PHEASY_LSQR_ATOL", 1e-8))
+    btol = float(_lsmr_tol("PHEASY_LSQR_BTOL", 1e-8))
     iter_lim = int(os.environ.get("PHEASY_LSQR_MAXITER", "5000"))
     y64 = np.asarray(y, dtype=np.float64).ravel()
     res = _sp_lsqr(A, y64, atol=atol, btol=btol, iter_lim=iter_lim)
@@ -1050,8 +1093,8 @@ def _ridge_solve(A, y, alpha, x0=None):
                     try:
                         coef, info = _gb.iterative_ridge(
                             gpu_op, y64, alpha,
-                            atol=float(os.environ.get("PHEASY_LSQR_ATOL", "1e-8")),
-                            btol=float(os.environ.get("PHEASY_LSQR_BTOL", "1e-8")),
+                            atol=float(_lsmr_tol("PHEASY_LSQR_ATOL", 1e-8)),
+                            btol=float(_lsmr_tol("PHEASY_LSQR_BTOL", 1e-8)),
                             maxiter=int(os.environ.get("PHEASY_LSQR_MAXITER", "5000")))
                     finally:
                         gpu_op.close()
@@ -1079,8 +1122,8 @@ def _ridge_solve(A, y, alpha, x0=None):
             y_aug = np.concatenate([y64, np.zeros(n)])
         else:
             op, y_aug = A, y64
-        atol = float(os.environ.get("PHEASY_LSQR_ATOL", "1e-8"))
-        btol = float(os.environ.get("PHEASY_LSQR_BTOL", "1e-8"))
+        atol = float(_lsmr_tol("PHEASY_LSQR_ATOL", 1e-8))
+        btol = float(_lsmr_tol("PHEASY_LSQR_BTOL", 1e-8))
         maxiter = int(os.environ.get("PHEASY_LSQR_MAXITER", "5000"))
         res = _lsmr(op, y_aug, atol=atol, btol=btol, maxiter=maxiter, x0=x0)
         _iterative_solver_info(res, "LSMR")
@@ -2853,8 +2896,8 @@ class Optimizer(object):
         self._metrics = {}
 
     def _ols_lsmr(self, X, y, atol=1e-8, btol=1e-8, maxiter=5000):
-        atol = float(os.environ.get("PHEASY_OLS_ATOL", str(atol)))
-        btol = float(os.environ.get("PHEASY_OLS_BTOL", str(btol)))
+        atol = float(_lsmr_tol("PHEASY_OLS_ATOL", atol))
+        btol = float(_lsmr_tol("PHEASY_OLS_BTOL", btol))
         maxiter = int(os.environ.get("PHEASY_OLS_MAXITER", str(maxiter)))
         ridge = float(os.environ.get("PHEASY_OLS_RIDGE", "0"))
         # Jacobi (exact column scaling) is a pure change of variables for OLS: it
@@ -3091,8 +3134,8 @@ class Optimizer(object):
                 min_features=int(os.environ.get("PHEASY_RFE_MIN_FEATURES", "1")),
                 patience=int(os.environ.get("PHEASY_RFE_PATIENCE", "5")),
                 lsmr_maxiter=int(os.environ.get("PHEASY_LSQR_MAXITER", "5000")),
-                lsmr_atol=float(os.environ.get("PHEASY_LSQR_ATOL", "1e-8")),
-                lsmr_btol=float(os.environ.get("PHEASY_LSQR_BTOL", "1e-8")),
+                lsmr_atol=float(_lsmr_tol("PHEASY_LSQR_ATOL", 1e-8)),
+                lsmr_btol=float(_lsmr_tol("PHEASY_LSQR_BTOL", 1e-8)),
                 verbose=True, random_state=self._rand_seed)
             self._model.fit(A, F64, sample_weight=weights)
             coef = self._model.coef_
