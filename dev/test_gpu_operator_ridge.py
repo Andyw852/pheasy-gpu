@@ -383,6 +383,32 @@ class TestOperatorOLSFallback(unittest.TestCase):
         self.assertNotIn("fallback_reason", model.results)
         self.assertNotIn("execution_backend", model.results)
 
+    def test_matrix_free_default_skips_resident_ols(self):
+        """Default (Jacobi unset) must NOT reach the resident GPU OLS.
+
+        Jacobi defaults ON for matrix-free input, and the resident OLS branch
+        implements neither Jacobi nor a ridge, so it skips itself and sets
+        fallback_reason to the ridge/Jacobi message before it ever builds a
+        GpuTwoLevelOperator.  So the resident OLS is unreachable under the
+        default configuration and every OLS fit lands on CPU LSMR -- a
+        deliberate trade-off (Jacobi is what keeps LSMR from stalling at
+        istop=7 on 1e5-unknown systems), but a silent one.  Pin it down: if a
+        later change makes the resident OLS reachable by default, this test
+        fails and the GPU.md / README claims have to be re-measured.
+        """
+        from core import gpu_backend as gb
+        A = opt.TwoLevelSM(sp.eye(6, format="csr"), sp.eye(6, format="csr"))
+        y = np.arange(6.)
+        model = opt.Optimizer("OLS", use_gpu=True)
+        with patch.dict(os.environ, {"PHEASY_GPU_OLS_RESIDENT": "1"}):
+            os.environ.pop("PHEASY_OLS_JACOBI", None)   # the default spelling
+            with patch.object(gb, "enabled", return_value=True), \
+                    patch.object(gb, "GpuTwoLevelOperator") as operator:
+                model.fit(A, y)
+                operator.assert_not_called()
+        self.assertEqual(model.results["execution_backend"], "cpu_lsmr")
+        self.assertIn("ridge/Jacobi", model.results["fallback_reason"])
+
     def test_resident_ols_honors_limits_and_ridge_option(self):
         from core import gpu_backend as gb
         A = opt.TwoLevelSM(sp.eye(6, format="csr"), sp.eye(6, format="csr"))
