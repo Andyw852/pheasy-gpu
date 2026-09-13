@@ -154,20 +154,27 @@ def _gpu_footprint_ok(gb, n, m):
 def _gpu_required():
     """True when the execution context demands GPU and no explicit CPU override.
 
+    Delegates the env mapping to gpu_backend.gpu_mode_from_env(), so
+    PHEASY_USE_GPU=1 counts as "required" here EXACTLY as it does in the backend
+    (and as README.md/GPU.md promise).  Reading only PHEASY_GPU_MODE left this
+    False for PHEASY_USE_GPU=1 -- which the shipped fc-fit submit template
+    exports -- and that silently disarmed every fail-closed guard below (they
+    are no-ops unless the mode is required) and the resident default dispatch.
+
     PHEASY_GPU_MODE=required fails closed, but a per-instance use_gpu=False is an
     explicit CPU choice (set via set_gpu_mode(False) for the duration of fit) that
     overrides the ambient required mode. CPU baselines and explicit CPU fits must
     keep working under a required environment.
     """
-    if os.environ.get("PHEASY_GPU_MODE", "").strip().lower() != "required":
-        return False
     try:
         from . import gpu_backend as _gb
-        if _gb.get_gpu_mode() is False:
-            return False
     except Exception:
-        pass
-    return True
+        return False
+    # An invalid PHEASY_GPU_MODE raises here on purpose: a typo must not read as
+    # "not required" and silently turn the guarantees off.
+    if _gb.gpu_mode_from_env() != "required":
+        return False
+    return _gb.get_gpu_mode() is not False
 
 
 def _gpu_dense(A):
@@ -285,23 +292,49 @@ def derive_alpha_grid(A, y, nalpha=100, decades=4.0, standardize=False,
 
 
 def _make_cv_splits(n_samples, cv, random_state=None, group_size=None):
-    """Return a list of (train_idx, val_idx) index arrays."""
+    """Return a list of (train_idx, val_idx) index arrays.
+
+    Identical to core/gpu_backend._make_cv_splits (GPU and CPU CV must agree).
+    """
+    global _WARNED_UNGROUPED_CV, _WARNED_NO_SEED
     if cv is None or cv <= 1:
         cv = min(3, n_samples)
     cv = int(cv)
-    if group_size and group_size > 1 and n_samples % group_size == 0:
-        groups = np.arange(n_samples) // group_size
-        n_groups = int(groups[-1]) + 1
-        if n_groups >= 2:
-            # Clamp cv to the number of configurations. A row-based KFold here
-            # would leak rows of the same configuration across train/val folds,
-            # silently biasing the CV estimate (FIX P23).
-            eff_cv = int(min(cv, n_groups))
-            gkf = GroupKFold(n_splits=eff_cv)
-            return list(gkf.split(np.zeros(n_samples, dtype=np.int8),
-                                  np.zeros(n_samples, dtype=np.int8), groups))
+    if group_size and group_size > 1:
+        if n_samples % group_size == 0:
+            groups = np.arange(n_samples) // group_size
+            n_groups = int(groups[-1]) + 1
+            if n_groups >= 2:
+                # Clamp cv to the number of configurations. A row-based KFold here
+                # would leak rows of the same configuration across train/val folds,
+                # silently biasing the CV estimate (FIX P23).
+                eff_cv = int(min(cv, n_groups))
+                gkf = GroupKFold(n_splits=eff_cv)
+                return list(gkf.split(np.zeros(n_samples, dtype=np.int8),
+                                      np.zeros(n_samples, dtype=np.int8), groups))
+        else:
+            # Grouped CV is impossible when the group size does not tile the row
+            # count.  Falling back SILENTLY was the dangerous part: rows of one
+            # configuration then sit in both folds, which leaks and biases the
+            # selected alpha toward 0 (measured: 0 % -> 91.7 % of validation rows
+            # sharing a configuration with training).
+            warnings.warn(
+                "PHEASY_CV_GROUP_SIZE=%s does not divide n_samples=%d: grouped "
+                "cross-validation is impossible, so this fit falls back to "
+                "shuffled ROW-based KFold.  Rows of one configuration then appear "
+                "in both folds, which leaks information and biases alpha*/ridge "
+                "toward 0.  Fix PHEASY_CV_GROUP_SIZE (it must be 3*natom and must "
+                "divide the row count)." % (group_size, n_samples),
+                RuntimeWarning, stacklevel=2)
     # no group info (or a single configuration): fall back to row-based KFold
     cv = max(2, min(cv, n_samples))
+    if random_state is None and not _WARNED_NO_SEED:
+        _WARNED_NO_SEED = True
+        warnings.warn(
+            "CV splits use KFold(shuffle=True, random_state=None): the fold "
+            "assignment (and therefore alpha*, the CV curve and every reported "
+            "score) changes from run to run.  Pass --seed / PHEASY_SEED to make "
+            "the fit reproducible.", RuntimeWarning, stacklevel=2)
     kf = KFold(n_splits=cv, shuffle=True, random_state=random_state)
     return list(kf.split(np.arange(n_samples)))
 
@@ -414,6 +447,21 @@ def _resident_default():
     return _gpu_required() and not _gpu_sm_explicit()
 
 
+def _resident_lasso_explicitly_disabled():
+    """True when the caller explicitly turned the resident backend OFF.
+
+    Required GPU mode makes the resident path the default, but an explicit
+    PHEASY_GPU_LASSO_RESIDENT=0 (which the shipped submit template exports, via
+    ${...:-0}) must win: otherwise a deliberate opt-out is silently ignored and a
+    run that cannot afford the resident factors is forced onto them.
+    """
+    for _key in ("PHEASY_GPU_LASSO_RESIDENT", "PHEASY_GPU_TWOLEVEL_LASSO"):
+        raw = os.environ.get(_key)
+        if raw is not None and raw.strip().lower() in ("0", "false", "no", "off"):
+            return True
+    return False
+
+
 def _resident_lasso_active(A):
     """True when the resident two-level LASSO/ALASSO backend should run for A.
 
@@ -423,7 +471,13 @@ def _resident_lasso_active(A):
     GPU-SM path was requested. Dense and ordinary sparse inputs are excluded
     here so they keep their own dense-GPU dispatch.
     """
+    if _resident_lasso_explicitly_disabled():
+        return False
     return _resident_twolevel_input(A) and (_resident_lasso_requested() or _resident_default())
+
+
+_WARNED_UNGROUPED_CV = False
+_WARNED_NO_SEED = False      # _make_cv_splits: non-reproducible shuffled KFold
 
 
 def _lasso_backend(A):
@@ -435,8 +489,42 @@ def _lasso_backend(A):
     policy _solve_lstsq already uses for OLS.
     """
     if _resident_lasso_active(A):
-        # Selection is independent of availability: execution must fail closed.
-        return "gpu_resident"
+        # Pre-flight the footprint BEFORE the expensive path.  The resident
+        # backend must hold both factors on one device; catching it here costs
+        # seconds, while catching it inside the operator costs the factor load
+        # (measured: 2 min into the fit, after a 3.6 GB SM_prime read).
+        from . import gpu_backend as _gbp
+        try:
+            peak, budget, _free, _frac = _gbp.resident_twolevel_estimate(A)
+        except Exception:   # never let the pre-flight itself become the bug
+            peak = budget = None
+        if peak is not None and budget is not None and peak > budget:
+            # Fail closed by default: the documented contract is that an enabled
+            # GPU path raises rather than quietly running something else (see
+            # GPU.md).  PHEASY_GPU_RESIDENT_FALLBACK=1 opts into a substitute,
+            # but the substitute must be named accurately: the fall-through
+            # below is the plain FISTA backend, which is a GPU solve ONLY when
+            # PHEASY_GPU_SM=1 shards the SM_prime matvec onto CUDA.  The old
+            # message announced the GPU-SM path unconditionally, so a required
+            # -mode run could return an unmarked CPU result.
+            if os.environ.get("PHEASY_GPU_RESIDENT_FALLBACK", "0").lower() in ("1", "true", "yes", "on"):
+                gpu_sm = _gpu_sm_explicit()
+                if _gpu_required() and not gpu_sm:
+                    raise MemoryError(_gbp.resident_twolevel_error_message(peak, budget))
+                warnings.warn(
+                    "Resident LASSO does not fit this device (%d > %d bytes); "
+                    "PHEASY_GPU_RESIDENT_FALLBACK=1 switches to the %s."
+                    % (peak, budget,
+                       "two-level GPU-SM matvec path (SM_prime sharded over "
+                       "PHEASY_GPU_SM_NGPU cards)" if gpu_sm else
+                       "CPU FISTA 'iterative' path -- set PHEASY_GPU_SM=1 to "
+                       "keep the solve on the GPU"),
+                    RuntimeWarning, stacklevel=2)
+            else:
+                raise MemoryError(_gbp.resident_twolevel_error_message(peak, budget))
+        else:
+            # Selection is independent of availability: execution must fail closed.
+            return "gpu_resident"
     if _is_linear_operator(A):
         return "iterative"
     if sp.issparse(A) and not _should_densify_sparse(A):
@@ -758,7 +846,7 @@ def _compute_gram(A, y):
 
 def _fista_lasso(A, y, alpha, x0=None, max_iter=3000, tol=1e-7,
                  lipschitz=None, penalty_weights=None, _info=None,
-                 gram=None, n_samples=None):
+                 gram=None, n_samples=None, warn_nonconvergence=True):
     """Solve min 0.5||A x - y||^2 + alpha * sum_j w_j |x_j| via FISTA.
 
     [FIX P26] Matvec-only LASSO so LASSO / ALASSO can run on a TwoLevelSM /
@@ -870,7 +958,11 @@ def _fista_lasso(A, y, alpha, x0=None, max_iter=3000, tol=1e-7,
         converged = bool(np.isfinite(kkt) and kkt <= tol)
     if _info is not None:
         _info.update(n_iter=n_iter, converged=converged, kkt_relative=kkt)
-    if not converged:
+    if not converged and warn_nonconvergence:
+        # CV folds pass warn_nonconvergence=False and report ONE aggregated line
+        # instead: a ranking-only solve that stops at the cap is not the same
+        # problem as an uncertified final refit, and 36 identical tracebacks
+        # buried the real diagnostics.
         import warnings
         warnings.warn("FISTA did not converge: iterations=%d, relative KKT=%g, tol=%g"
                       % (n_iter, kkt, tol), RuntimeWarning, stacklevel=2)
@@ -1005,11 +1097,15 @@ def _ridge_solve(A, y, alpha, x0=None):
 
 def _solve_subset(A, y, row_idx, col_idx, ridge_alpha=0.0, qr=False,
                   lsmr_atol=None, lsmr_btol=None, lsmr_maxiter=None,
-                  block_rows=None, diag_floor=1e-12, column_scale=None):
+                  block_rows=None, diag_floor=1e-12, column_scale=None,
+                  diag_sink=None, diag_scope="full"):
     """Solve min ||A[row_idx][:, col_idx] x - y[row_idx]||^2 (+ optional ridge).
 
     [FIX P09] the lsmr_* / block_rows / diag_floor knobs are threaded through
     from the estimator instead of being silently dropped on the floor.
+    diag_sink (a list) collects the LSMR stopping diagnostics: RFE used to
+    throw them away, so a subset solve that hit its iteration limit still
+    produced a coefficient vector with nothing recording that fact.
     """
     y_sub = np.asarray(y, dtype=np.float64).ravel()
     if row_idx is not None:
@@ -1048,7 +1144,10 @@ def _solve_subset(A, y, row_idx, col_idx, ridge_alpha=0.0, qr=False,
                                 rmatvec=rmv_aug, dtype=np.float64)
             y_sub = np.concatenate([y_sub, np.zeros(n)])
         res = _lsmr(op, y_sub, atol=atol, btol=btol, maxiter=maxiter)
-        _iterative_solver_info(res, "LSMR")
+        _subset_info = _iterative_solver_info(res, "LSMR")
+        if diag_sink is not None:
+            diag_sink.append(dict(_subset_info, fit_scope=diag_scope,
+                                  n_features=int(len(col_idx))))
         return np.asarray(res[0], dtype=np.float64) / scale
 
     A_sub = A[:, col_idx]
@@ -1221,7 +1320,7 @@ class TwoLevelSM(LinearOperator):
             try:
                 return self._gpu_mv.matvec(t)
             except Exception as _e:
-                if os.environ.get("PHEASY_GPU_FALLBACK", "0").lower() in ("0", "false", "off", "no"):
+                if _gpu_required() or os.environ.get("PHEASY_GPU_FALLBACK", "0").lower() in ("0", "false", "off", "no"):
                     raise RuntimeError("GPU SM matvec failed with fallback disabled: %s" % _e) from _e
                 print("[GPU-SM] matvec failed (%s); disabling GPU, CPU fallback" % _e, flush=True)
                 self._disable_gpu()
@@ -1234,7 +1333,7 @@ class TwoLevelSM(LinearOperator):
                 t = self._gpu_mv.rmatvec(u)
                 return _sp_mv(self.NST, np.ascontiguousarray(t, dtype=self._dt))
             except Exception as _e:
-                if os.environ.get("PHEASY_GPU_FALLBACK", "0").lower() in ("0", "false", "off", "no"):
+                if _gpu_required() or os.environ.get("PHEASY_GPU_FALLBACK", "0").lower() in ("0", "false", "off", "no"):
                     raise RuntimeError("GPU SM rmatvec failed with fallback disabled: %s" % _e) from _e
                 print("[GPU-SM] rmatvec failed (%s); disabling GPU, CPU fallback" % _e, flush=True)
                 self._disable_gpu()
@@ -1590,6 +1689,10 @@ class _LassoCVIterative:
         # flat curve (converged).
         _cv_info = {}
         _cv_max_n_iter = 0
+        # [D1] "hit the cap" must mean "hit the cap WITHOUT converging" (the
+        # periodic FISTA check can let a converged fit report n_iter == cap).
+        _cv_hit_cap = False
+        _cv_max_kkt = 0.0
 
         n_jobs = min(self.n_jobs, len(splits))
         for a_i in range(n_alphas - 1, -1, -1):  # descending: large alpha first
@@ -1612,7 +1715,8 @@ class _LassoCVIterative:
                                         lipschitz=lip_folds[k],
                                         penalty_weights=self.penalty_weights,
                                         gram=gram_folds[k],
-                                        n_samples=len(tr), _info=info)
+                                        n_samples=len(tr), _info=info,
+                                        warn_nonconvergence=False)
                     pred = np.asarray(A_va_list[k] @ coef, dtype=np.float64).ravel()
                 else:
                     if A_folds is not None:
@@ -1627,10 +1731,12 @@ class _LassoCVIterative:
                                         max_iter=cv_max_iter, tol=cv_tol,
                                         lipschitz=self._lipschitz,
                                         penalty_weights=self.penalty_weights,
-                                        _info=info)
+                                        _info=info, warn_nonconvergence=False)
                     pred = _predict_rows(A, coef, va)
                 err = pred - y64[va]
-                return float(np.mean(err * err)), coef, int(info.get("n_iter", 0))
+                return (float(np.mean(err * err)), coef, int(info.get("n_iter", 0)),
+                        bool(info.get("converged", False)),
+                        float(info.get("kkt_relative", float("nan"))))
 
             if n_jobs > 1:
                 from joblib import Parallel, delayed
@@ -1640,10 +1746,14 @@ class _LassoCVIterative:
             else:
                 results = [_fold_fit(k) for k in range(len(splits))]
             fold_mse = np.zeros(len(splits))
-            for k, (mse_k, coef, n_it) in enumerate(results):
+            for k, (mse_k, coef, n_it, conv_k, kkt_k) in enumerate(results):
                 fold_mse[k] = mse_k
                 x_folds[k] = coef
                 _cv_max_n_iter = max(_cv_max_n_iter, n_it)
+                if np.isfinite(kkt_k):
+                    _cv_max_kkt = max(_cv_max_kkt, kkt_k)
+                if n_it >= cv_max_iter and not conv_k:
+                    _cv_hit_cap = True
             mse_path[a_i] = fold_mse
             mean = float(fold_mse.mean())
             # warm-start the next (smaller) alpha from this alpha's full fit
@@ -1652,13 +1762,17 @@ class _LassoCVIterative:
                                       max_iter=cv_max_iter, tol=cv_tol,
                                       lipschitz=lip_full,
                                       penalty_weights=self.penalty_weights,
-                                      gram=gram_full, _info=_cv_info)
+                                      gram=gram_full, _info=_cv_info,
+                                      warn_nonconvergence=False)
             else:
                 x_full = _fista_lasso(A, y64, alpha, x0=x_full,
                                       max_iter=cv_max_iter, tol=cv_tol,
                                       lipschitz=self._lipschitz,
                                       penalty_weights=self.penalty_weights,
-                                      _info=_cv_info)
+                                      _info=_cv_info, warn_nonconvergence=False)
+            # The full-data warm-start solve also reports n_iter; it feeds the
+            # "max iterations" message but must NOT set the hit-cap flag: that
+            # flag is the CONVERGENCE diagnosis for the CV solves themselves.
             _cv_max_n_iter = max(_cv_max_n_iter, _cv_info.get("n_iter", 0))
             # [FIX P27] <= (not <) so a tie picks the SMALLEST alpha (the one
             # seen LAST in the descending walk), matching _reselect_alpha's
@@ -1668,12 +1782,40 @@ class _LassoCVIterative:
                 best_i = a_i
                 best_x = x_full.copy()
 
+        # [CV-budget] ONE aggregated line instead of a warning per fold: the CV
+        # folds only RANK the alphas, so a fold that stops at the cap is not an
+        # uncertified fit -- but the reader does need to know the ranking was
+        # computed at a loose tolerance (PHEASY_CV_TOL) or a small cap.
+        if _cv_hit_cap:
+            print("[CV] ranking budget: a fold hit cv_max_iter (%d) with relative "
+                  "KKT up to %.3e > PHEASY_CV_TOL=%.1e. CV only ranks alphas "
+                  "(differences between alphas are far larger than this gap), so "
+                  "alpha* is not affected by itself; raise PHEASY_CV_TOL toward "
+                  "1e-3 (the GPU backends' default) or raise PHEASY_CV_MAX_ITER "
+                  "to certify the ranking." % (cv_max_iter, _cv_max_kkt, cv_tol),
+                  flush=True)
         # [FIX P27] port _reselect_alpha's tie warning: a flat CV tail means the
         # loose CV solver did not separate the alphas and the choice is suspect.
         mean_path = mse_path.mean(axis=1)
+        # PHEASY_LASSO_1SE: one-standard-error rule (largest alpha within 1 SE of
+        # the CV minimum), matching _reselect_alpha and GpuLassoCV.  This class is
+        # the backend auto-selected for TwoLevelSM / LinearOperator / large sparse
+        # input, and it used to ignore the knob entirely (only _reselect_alpha,
+        # the sklearn path, read it) -- so the documented "all backends" rule was
+        # a silent no-op on the production path.
+        if os.environ.get("PHEASY_LASSO_1SE", "0").lower() in ("1", "true", "yes"):
+            _se = (float(mse_path[best_i].std(ddof=1) / np.sqrt(mse_path.shape[1]))
+                   if mse_path.shape[1] > 1 else 0.0)
+            _cand = np.flatnonzero(mean_path <= mean_path[best_i] + _se)
+            _new_i = int(_cand[np.argmax(self.alphas[_cand])])
+            if _new_i != best_i:
+                print("[CV] PHEASY_LASSO_1SE: alpha* %.6e -> %.6e (1 SE = %.3e above "
+                      "the CV minimum)" % (float(self.alphas[best_i]),
+                                           float(self.alphas[_new_i]), _se), flush=True)
+            best_i = _new_i
+            best_x = None          # the new alpha needs its own warm start
         rtol = float(os.environ.get("PHEASY_LASSO_TIE_RTOL", "1e-9"))
         tied = np.flatnonzero(mean_path <= best_mean * (1.0 + rtol) + 1e-300)
-        _cv_hit_cap = _cv_max_n_iter >= cv_max_iter
         if tied.size > 1:
             if _cv_hit_cap:
                 print("[CV] WARNING: %d alphas tie at CV MSE %.6e (%.3e ... %.3e). "
@@ -1742,8 +1884,15 @@ class _LassoCVIterative:
         self.alphas_ = self.alphas
         self.mse_path_ = mse_path
         self.n_iter_ = int(_finfo.get("n_iter", 0))
-        self.regularized_solver_info_ = dict(_finfo, solver="FISTA",
-                                            stage="regularized_refit_before_debias", tol=float(self.tol))
+        # Name the backend explicitly: the iterative LASSO is the CPU FISTA
+        # solver unless PHEASY_GPU_SM shards the SM_prime matvec onto CUDA.  The
+        # key used to be absent, so Optimizer._fit_impl never set
+        # results["execution_backend"] for this path and a CPU solve was
+        # indistinguishable from a GPU one in the result record.
+        self.regularized_solver_info_ = dict(
+            _finfo, solver="FISTA",
+            stage="regularized_refit_before_debias", tol=float(self.tol),
+            backend=("gpu_sm_spmv" if _gpu_sm_explicit() else "cpu_iterative_fista"))
         self.n_features_in_ = A.shape[1]
         return self
 
@@ -2176,9 +2325,22 @@ class _RFECVBase:
         self._criterion = "cv"
 
     def _cv_group_size(self, n_samples):
-        gs = int(os.environ.get("PHEASY_CV_GROUP_SIZE", "0"))
+        raw = os.environ.get("PHEASY_CV_GROUP_SIZE")
+        gs = int(raw or 0)
         if gs > 1 and n_samples % gs == 0:
             return gs
+        if not raw:
+            global _WARNED_UNGROUPED_CV
+            if not _WARNED_UNGROUPED_CV:
+                _WARNED_UNGROUPED_CV = True
+                warnings.warn(
+                    "PHEASY_CV_GROUP_SIZE is not set: the cross-validation is "
+                    "ungrouped, so the 3*natom rows of one configuration can land "
+                    "in both folds.  That leaks information, biases the selected "
+                    "alpha/ridge toward 0 and inflates the reported CV score.  Set "
+                    "PHEASY_CV_GROUP_SIZE=3*natom (the pheasy CLI now does this "
+                    "automatically when the variable is unset).",
+                    RuntimeWarning, stacklevel=2)
         return None
 
     def _bic_n_eff(self, n_samples):
@@ -2348,7 +2510,9 @@ class _RFECVBase:
                                  lsmr_maxiter=self.lsmr_maxiter,
                                  block_rows=self.block_rows,
                                  diag_floor=self.diag_floor,
-                                 column_scale=col_norms if use_scaling else None)
+                                 column_scale=col_norms if use_scaling else None,
+                                 diag_sink=iterative_diagnostics,
+                                 diag_scope="full" if row_idx is None else "fold")
 
         def operator_prediction(cols, rows, coef):
             nonlocal resident_subset_builds
@@ -2541,10 +2705,17 @@ class _RFECVBase:
         self.intercept_ = 0.0
         self.support_ = best_support
         self.n_iter_ = round_num
-        self.best_rmse_cv_ = best_mean
+        # A run that broke out before the first CV evaluation has NO CV score.
+        # It used to publish best_mean = 0.0, i.e. a fabricated PERFECT CV RMSE
+        # ("- RMSE_CV: 0.0 eV/A" in the log, rmse_path_mean = 0.0 in the metrics)
+        # for a fit in which no cross-validation ever ran -- reachable whenever
+        # n_features <= min_features (RFE-OLS-TSQR defaults to min_features=100).
+        # Report it as not-evaluated instead of as a perfect score.
+        self.cv_evaluated = bool(round_num > 0)
+        self.best_rmse_cv_ = float(best_mean) if self.cv_evaluated else float("nan")
         self.ridge_alpha = self.ridge_alpha
         self.alphas_ = np.array([self.ridge_alpha])
-        self.mse_path_ = np.array([[best_mean ** 2]])
+        self.mse_path_ = np.array([[self.best_rmse_cv_ ** 2]])
         self.backend_metadata_ = {
             "subset_solver": "gpu_resident_iterative" if resident_operator else ("gpu_dense" if gpu_subset_solves else "cpu"),
             "iterative_diagnostics": iterative_diagnostics,
@@ -2655,6 +2826,11 @@ class Optimizer(object):
         self._standardize = standardize
         self._fit_intercept = fit_intercept
         self._alpha_auto = bool(alpha_auto)
+        # An explicit alpha= grid is a request to fit AT those alphas.  The
+        # ALASSO auto-grid used to overwrite it silently (the guard only covered
+        # the alpha_auto=False spelling), so the returned coefficients solved a
+        # different regularization problem than the one asked for.
+        self._alpha_user_supplied = alpha is not None
         self._decades = float(decades)
 
         if alpha is not None:
@@ -2681,15 +2857,46 @@ class Optimizer(object):
         btol = float(os.environ.get("PHEASY_OLS_BTOL", str(btol)))
         maxiter = int(os.environ.get("PHEASY_OLS_MAXITER", str(maxiter)))
         ridge = float(os.environ.get("PHEASY_OLS_RIDGE", "0"))
-        if (os.environ.get("PHEASY_GPU_OLS_RESIDENT", "1" if _resident_default() else "0").lower()
-                in ("1", "true", "yes", "on")) and (hasattr(X, "SM_prime") or hasattr(X, "_twolevel_base")):
+        # Jacobi (exact column scaling) is a pure change of variables for OLS: it
+        # cannot change the solution, only whether LSMR converges.  It used to be
+        # opt-in, which is how a 113794-unknown fit burned 16 minutes and was then
+        # REFUSED by the acceptance gate at istop=7 (measured column-norm spread
+        # on that system: 94x).  Default it ON for matrix-free input -- a
+        # LinearOperator / TwoLevelSM means the sensing matrix is never
+        # materialised, i.e. the regime where a stalled LSMR is expensive -- and
+        # keep PHEASY_OLS_JACOBI=0/1 as the explicit override.  Decided here, at
+        # the top, because the resident-GPU branch below must skip itself when
+        # Jacobi is wanted (it implements neither ridge nor Jacobi).
+        _jacobi_env = os.environ.get("PHEASY_OLS_JACOBI")
+        if _jacobi_env is None:
+            _use_jacobi = _is_linear_operator(X)
+            if _use_jacobi:
+                print("[OLS] Jacobi preconditioning ENABLED by default for matrix-free "
+                      "input (exact change of variables; PHEASY_OLS_JACOBI=0 disables)",
+                      flush=True)
+        else:
+            _use_jacobi = _jacobi_env.lower() in ("1", "true", "yes")
+        # Resident (device-side) OLS: single card, or SHARDED across the devices
+        # named by PHEASY_GPU_DEVICES / PHEASY_GPU_NGPU / PHEASY_GPU_SM_DEVICES.
+        # Explicitly selecting a device list counts as a request for it.
+        _res_env = os.environ.get("PHEASY_GPU_OLS_RESIDENT")
+        if _res_env is None:
+            _want_resident = bool(_resident_default()) or bool(
+                os.environ.get("PHEASY_GPU_DEVICES", "").strip()
+                or os.environ.get("PHEASY_GPU_NGPU", "").strip()
+                or os.environ.get("PHEASY_GPU_SM_DEVICES", "").strip())
+        else:
+            _want_resident = _res_env.lower() in ("1", "true", "yes", "on")
+        if _want_resident and (hasattr(X, "SM_prime") or hasattr(X, "_twolevel_base")):
             try:
                 from . import gpu_backend as _gb
-                jacobi = os.environ.get("PHEASY_OLS_JACOBI", "0").lower() in ("1", "true", "yes")
+                jacobi = _use_jacobi
                 if ridge > 0 or jacobi:
                     self._ols_gpu_fallback_reason = "Resident OLS does not implement ridge/Jacobi options; preserving CPU semantics"
                 if _gb.enabled() and ridge <= 0 and not jacobi:
-                    gpu_op = _gb.GpuTwoLevelOperator(getattr(X, "_twolevel_base", X))
+                    _dev_ids = _gb.resident_device_ids()
+                    gpu_op = _gb.GpuTwoLevelOperator(getattr(X, "_twolevel_base", X),
+                                                     device_ids=_dev_ids)
                     try:
                         coef, info = _gb.iterative_lstsq(gpu_op, y, atol=atol, btol=btol, maxiter=maxiter)
                     finally:
@@ -2713,7 +2920,7 @@ class Optimizer(object):
         n_samples = X.shape[0]
         damp = float(np.sqrt(ridge * n_samples)) if ridge > 0 else 0.0
         y_in = np.asarray(y, dtype=np.float64).ravel()
-        if os.environ.get("PHEASY_OLS_JACOBI", "0").lower() in ("1", "true", "yes"):
+        if _use_jacobi:
             print("[OLS] Computing exact column norms for Jacobi scaling", flush=True)
             cn = (X.col_norms() if hasattr(X, "col_norms") else _col_norms(X))
             cn = np.where(np.asarray(cn, dtype=np.float64) < 1e-30, 1.0, cn)
@@ -2820,6 +3027,18 @@ class Optimizer(object):
             col_scale = _col_norms(A)
             col_scale = np.where(col_scale < 1e-30, 1.0, col_scale)
             A_fit = _scale_columns(A, col_scale)
+        elif self._standardize:
+            # Do not drop a requested knob silently: standardization is a MODEL
+            # choice for the penalized methods (it makes the L1/Ridge penalty
+            # fair per column, and alpha lives in standardized units), but it is
+            # only a reparametrization for OLS/RFE -- the OLS solution is
+            # invariant to column scaling, so the solve keeps the raw columns and
+            # uses PHEASY_OLS_JACOBI for conditioning instead.
+            print("[note] --std has no effect for %s: column standardization is a "
+                  "model choice only for LASSO/ALASSO/RIDGE. The %s solve is "
+                  "invariant to column scaling; its preconditioner is "
+                  "PHEASY_OLS_JACOBI (default on for matrix-free input)."
+                  % (method, method), flush=True)
 
         if method == "OLS":
             coef, n_iter = self._fit_ols(A, F64)
@@ -2832,7 +3051,8 @@ class Optimizer(object):
                 gamma=float(os.environ.get("PHEASY_ALASSO_GAMMA", "1.0")),
                 init_alpha=float(os.environ.get("PHEASY_ALASSO_RIDGE_ALPHA", "1e-3")),
                 eps=float(os.environ.get("PHEASY_ALASSO_EPS", "1e-8")),
-                nalpha=self._nalpha, decades=self._decades, alpha_auto=self._alpha_auto)
+                nalpha=self._nalpha, decades=self._decades,
+                alpha_auto=self._alpha_auto and not self._alpha_user_supplied)
             self._model.fit(A, F64, sample_weight=weights,
                             retain_operator=self._debias_enabled())
             coef = self._model.coef_
@@ -2859,7 +3079,7 @@ class Optimizer(object):
                 eps=float(os.environ.get("PHEASY_ALASSO_EPS", "1e-8")),
                 nalpha=self._nalpha,
                 decades=self._decades,
-                alpha_auto=self._alpha_auto)
+                alpha_auto=self._alpha_auto and not self._alpha_user_supplied)
             self._model.fit(A_fit, F64, sample_weight=weights)
             coef = self._model.coef_
         elif method == "RFE":
@@ -3071,7 +3291,12 @@ class Optimizer(object):
         elif method in ("RFE", "RFE-OLS-TSQR"):
             self._results["alpha"] = float(getattr(self._model, "ridge_alpha", 0.0))
             self._results["n_iter"] = int(getattr(self._model, "n_iter_", 0))
-            bcv = float(getattr(self._model, "best_rmse_cv_", 0.0))
+            # cv_evaluated=False means no CV ran at all: keep the metric NaN
+            # rather than the fabricated 0.0 (a "perfect" score nobody measured).
+            _cv_done = bool(getattr(self._model, "cv_evaluated", True))
+            bcv = float(getattr(self._model, "best_rmse_cv_", 0.0)) if _cv_done else float("nan")
+            if not _cv_done:
+                self._metrics["cv_evaluated"] = False
             self._metrics["mse_path"] = np.array([bcv ** 2])
             self._metrics["mse_path_mean"] = bcv ** 2
             self._metrics["rmse_path"] = np.array([bcv])
@@ -3104,7 +3329,15 @@ class Optimizer(object):
                     self._results["execution_backend"] = str(self._ols_lsmr_info["backend"])
             else:
                 self._results.pop("solver_info", None)
-                if _gpu_dense(A):
+                # Label query only: _gpu_dense() raises under required GPU mode
+                # when the matrix does not fit VRAM, and an OLS fit that already
+                # completed must not fail while REPORTING which backend ran.
+                try:
+                    _dense_gpu = bool(_gpu_dense(A))
+                except Exception as _label_exc:
+                    _dense_gpu = False
+                    self._results["backend_label_error"] = str(_label_exc)
+                if _dense_gpu:
                     self._results["execution_backend"] = "gpu_dense"
             if getattr(self, "_ols_gpu_fallback_reason", None):
                 self._results["fallback_reason"] = self._ols_gpu_fallback_reason
@@ -3116,6 +3349,16 @@ class Optimizer(object):
             _value = self._results.get(_key)
             if isinstance(_value, dict):
                 _solver_infos.append(_value)
+        # RFE records its subset solves in backend_metadata; without this the
+        # LSMR diagnostics never reached the acceptance check, so a subset solve
+        # that hit its iteration limit still reported fit_accepted=True (the
+        # resident GPU path raises for exactly the same condition).  Fold-level
+        # diagnostics do not veto the fit; the FULL-data solve does.
+        _meta = self._results.get("backend_metadata")
+        if isinstance(_meta, dict):
+            for _diag in _meta.get("iterative_diagnostics") or ():
+                if isinstance(_diag, dict) and _diag.get("fit_scope", "full") == "full":
+                    _solver_infos.append(_diag)
         _nonconverged = [x for x in _solver_infos if x.get("converged") is False]
         self._results["fit_accepted"] = not _nonconverged
         self._results["status"] = ("fit_returned" if not _nonconverged

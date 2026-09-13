@@ -189,7 +189,11 @@ def write_cell(cell, filename=None, settings=None, format=None, **kwargs):
             if settings.QE:
                 cell.write_pw_in(filename, direct=True)
             else:
-                cell.write("filename", format=format, direct=True)
+                # [FIX] the filename argument was quoted, so this branch wrote a
+                # file literally named "filename" in the CWD (and passed
+                # format=None through). Dormant today (the only caller passes
+                # filename=None) but wrong the moment it is used.
+                cell.write(filename, format=format, direct=True)
 
 
 def write_symops(symops, filename="spglib.symops"):

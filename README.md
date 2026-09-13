@@ -56,7 +56,7 @@ unless `PHEASY_ALLOW_UNACCEPTED_FIT=1` is set.
 ## Typical workflow
 
 ```bash
-python3 tools/prepare_dataset.py POSCAR SPOSCAR dataset_disps.npy dataset_forces.npy
+python3 tools/prepare_dataset.py SPOSCAR dataset_disps.npy dataset_forces.npy
 pheasy-gpu --dim 3 3 3 -w 3 -s --c3 5.2
 pheasy-gpu --dim 3 3 3 -w 3 -c --c3 5.2
 pheasy-gpu --dim 3 3 3 -w 3 -d --c3 5.2 --ndata 45 --disp_file

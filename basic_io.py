@@ -776,8 +776,19 @@ class InputParser(argparse.ArgumentParser):
         settings = deepcopy(self._default)
         if os.path.isfile(filename):
             nml = f90nml.read(filename)
-            for _, arg in enumerate(nml["input"]):
-                setattr(settings, arg.upper(), nml["input"][arg])
+            # [FIX] any key was accepted: a typo (CUTOF3 for CUT3, NBDDY for
+            # NBODY) became an unused attribute while the intended setting kept
+            # its default -- a silent model change with no warning and exit 0.
+            # Refuse unknown keys; the known set is exactly the CLI defaults.
+            _known = set(vars(self._default))
+            for _key in nml["input"]:
+                if _key.upper() not in _known:
+                    logger.error(
+                        "Unknown key \"%s\" in %s: refusing to continue. A typo "
+                        "here silently leaves the intended setting at its default "
+                        "(known keys: run pheasy --help)." % (_key, filename))
+                    raise ValueError("unknown namelist key: %s" % _key)
+                setattr(settings, _key.upper(), nml["input"][_key])
         settings = self.parse_args(namespace=settings)
 
         if settings.NBODY is None:
@@ -829,8 +840,14 @@ class InputParser(argparse.ArgumentParser):
                 raise NameError
             else:
                 mag_shape = len(nml.MAGMOM)
-                if (mag_shape != natom) or (mag_shape != 3 * natom):
-                    logger.error("Shape of MAGMOM is wrong.")
+                # [FIX] this used to be OR, which is true for EVERY natom > 0,
+                # so IS_MAGNETIC could never be enabled: both the collinear (N)
+                # and the noncollinear (3N) cases raised "Shape of MAGMOM is
+                # wrong".  Only a length matching NEITHER form is an error.
+                if (mag_shape != natom) and (mag_shape != 3 * natom):
+                    logger.error("Shape of MAGMOM is wrong: %d values for %d atoms "
+                                 "(expected %d for collinear or %d for noncollinear)."
+                                 % (mag_shape, natom, natom, 3 * natom))
                     raise ValueError
 
         """The type of rotational acoustic sum rules are correctly set or not."""

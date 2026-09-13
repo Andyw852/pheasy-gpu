@@ -24,11 +24,11 @@ RIDGE. Local editable install runs under the `atomate2_p_a` conda env.
 - **`git push` needs `HOME` set to the local user's home** (the credential
   store lives there) plus `GIT_TERMINAL_PROMPT=0`. GitHub is intermittently
   unreachable (GnuTLS / Empty reply / timeouts): push in a retry loop
-  (`for i in 1..8; timeout 120 git push origin master ...`).
+  (`for i in 1..8; timeout 120 git push origin main ...`; the branch is `main`).
 - **Check `git branch --show-current` before committing.** A background
   sanitizer (path-scrubbing for the public repo) can leave the worktree on a
-  `push-sanitized` branch; commits then land off `master` and
-  `git push origin master` silently pushes nothing.
+  `push-sanitized` branch; commits then land off `main` and
+  `git push origin main` silently pushes nothing.
 - **The GPU box is shared.** Load is frequently 2x oversubscribed by other
   users' gmx/mdrun jobs; long runs take ~5x wall time. Launch with
   `nohup ... > out 2>&1 &` and poll the output file; never block on them.

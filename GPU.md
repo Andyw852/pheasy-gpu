@@ -45,7 +45,10 @@ As of 2026-09-11 the full GPU acceptance is re-verified on a 3x RTX 3090 host
 ~1e-16, every method records `gpu_spmv_calls > 0`), `test_multigpu_cuda_hw.py`
 passes, `dev/test_cli_harmonic_chain.py --gpu` recovers the true Si fc2 to
 ~4e-16 relative error with a real `gpu_backend.lstsq` call on `cuda:0`, and the
-full `dev/` unittest suite is `123 tests, OK, 0 skipped` on GPU hardware.
+`dev/` unittest suite runs green (17 files, 124 tests collected; the 3 cases that
+need a live device report `CUDA unavailable` on a CPU-only host). Re-record this
+count on the GPU host whenever `dev/` changes: the suite does not run in CI, so
+a stale count is worse than no count.
 LASSO/ALASSO default to debias (`PHEASY_LASSO_DEBIAS=1`): refit OLS on
 selected support, including full support; only empty support is skipped.
 `results["pre_debias_coef"]` preserves physical-coordinate coefficients before
@@ -76,7 +79,14 @@ fails rather than silently claiming GPU execution after a CPU fallback.
 `CUDA_VISIBLE_DEVICES` still controls available devices; no GPU allocation is
 requested by the solver itself. Resident CV supports dynamic fold scheduling
 through `PHEASY_GPU_DEVICES` and `PHEASY_GPU_NGPU`; every selected GPU must
-fit a complete factor replica. Hardware acceptance must be reported separately
+fit a complete factor replica. Note the asymmetry: an explicit
+`PHEASY_GPU_DEVICES` list is a HARD requirement — the resident path does not
+filter it by free memory or by queryability, so one dead or busy entry aborts
+the whole fit (`Cannot query resident CUDA memory budget`), while the GPU-SM
+path would simply have skipped that card through `_multi_gpu_devices`.
+Prefer `PHEASY_GPU_NGPU`, which starts from `PHEASY_GPU_DEVICE` and picks
+other visible cards, when the device list is not known to be uniformly healthy.
+Hardware acceptance must be reported separately
 from CPU-emulated scheduler tests.
 
 ### GPU acceleration status (current)
@@ -207,7 +217,7 @@ parent operator; this trades extra SpMV work for bounded device memory. CPU
 row slices retain their physical sparse slicing. Repeated selected rows
 accumulate in the adjoint.
 
-`PHEASY_GPU_MODE=auto|cpu|required` is the unified dispatch contract. `auto` uses CUDA when available and preserves the legacy CPU fallback for compatibility; `cpu` disables GPU; and `required` is the production default: every supported main solve (OLS/RIDGE/LASSO/ALASSO/RFE and the resident TSQR) runs on the GPU by default, and any GPU runtime failure raises instead of silently returning a CPU result. Legacy `PHEASY_USE_GPU=1/0` maps to `required/cpu`. A per-instance `use_gpu=False` is an explicit CPU choice that still works under `required` (e.g. a CPU baseline in the validator).
+`PHEASY_GPU_MODE=auto|cpu|required` is the unified dispatch contract. `auto` uses CUDA when available and preserves the legacy CPU fallback for compatibility; `cpu` disables GPU; and `required` is the production default: every supported main solve (OLS/RIDGE/LASSO/ALASSO/RFE and the resident TSQR) runs on the GPU by default, and any GPU runtime failure raises instead of silently returning a CPU result. Concretely, under `required` the GPU-SM matvec/adjoint and the RIDGE-CV fold handlers raise even when `PHEASY_GPU_FALLBACK=1`, and an over-budget resident LASSO is refused unless `PHEASY_GPU_SM=1` actually supplies the substitute GPU path (`PHEASY_GPU_RESIDENT_FALLBACK=1` alone is not enough). Legacy `PHEASY_USE_GPU=1/0` maps to `required/cpu`. A per-instance `use_gpu=False` is an explicit CPU choice that still works under `required` (e.g. a CPU baseline in the validator).
 
 `PHEASY_GPU_FALLBACK=0` (now the default) makes an enabled GPU sparse-matvec path fail closed on any forward/adjoint CUDA error, and a GPU RIDGE-CV fold OOM raises instead of running a CPU SVD; `PHEASY_GPU_FALLBACK=1` restores the legacy CPU continuation for compatibility. Production runs should use `PHEASY_GPU_MODE=required PHEASY_GPU_FALLBACK=0` and inspect `gpu_call_delta`/backend metadata.
 
@@ -558,8 +568,8 @@ else; set these first to reproduce them:
 
 | knob | default | effect |
 |---|---|---|
-| `PHEASY_CV_TOL` | `max(tol, 1e-3)` | the CV path runs at 1e-3, not the caller's `tol` |
-| `PHEASY_CV_MAX_ITER` | `min(max_iter, 400)` | the CV path is capped at 400 iterations |
+| `PHEASY_CV_TOL` | `max(tol, 1e-3)` | GPU CV paths run at 1e-3, not the caller's `tol` (the CPU `_LassoCVIterative` path instead uses `tol` itself) |
+| `PHEASY_CV_MAX_ITER` | `min(max_iter, 400)` | resident two-level CV cap; the dense GPU `GpuLassoCV` uses `min(max_iter, 800)` and the CPU iterative path uses `max_iter` uncapped — the three backends do NOT share a CV budget, so a cross-backend alpha* comparison must set the env vars explicitly |
 | `PHEASY_LASSO_DEBIAS` | `1` | `results["coef"]` is the OLS refit on the support, not the raw FISTA/CD solution |
 
 Run a small case twice and diff:
@@ -575,8 +585,13 @@ diff <(grep -E "OLS|LASSO" gpu.out) <(grep -E "OLS|LASSO" cpu.out)
 OLS should match to ~1e-8 (identical SVD). LASSO/ALASSO match to ~1e-9..1e-7 in
 the sparse regime (nnz < 60%), degrading to ~1e-6 as nnz -> 100%. That is the
 joint relaxation of the two solvers' stopping criteria in the near-OLS regime,
-not a GPU-specific limit: the CPU `_LassoCVIterative` shares the same tol/iter
-caps as `GpuLassoCV`. The fixed-alpha scan (`dev/alpha_scan.py`) measured
+not a GPU-specific limit.  NOTE (verified by reading the defaults, not by a GPU
+run): the CPU `_LassoCVIterative` does NOT share the GPU CV caps -- it uses the
+caller's `tol`/`max_iter` (1e-4/20000 at the CLI defaults) while `GpuLassoCV` uses
+`max(tol,1e-3)`/`min(max_iter,800)` and `GpuTwoLevelLassoCV` uses
+`min(max_iter,400)`.  A CPU-vs-GPU alpha* comparison must set `PHEASY_CV_TOL` and
+`PHEASY_CV_MAX_ITER` explicitly on both sides, or the two runs are not solving the
+same CV problem. The fixed-alpha scan (`dev/alpha_scan.py`) measured
 LASSO |FISTA-CD|/|CD| 1.8e-10 -> 1.25e-6 as nnz ran 1.5% -> 98.5% on the c7 SM.
 The recheck's raw (debias-off) LASSO 3.5e-4 at ~92% nnz is a tol=1e-6 artifact,
 not a conditioning floor. To force the identical sklearn solver for a bit-exact

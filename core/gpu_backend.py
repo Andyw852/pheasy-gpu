@@ -78,6 +78,8 @@ __all__ = [
 
 _torch_mod = None
 _mode = None          # None = auto, True = force on, False = force off
+_WARNED_UNGROUPED_CV = False   # _make_cv_splits: group_size does not tile rows
+_WARNED_NO_SEED = False        # _make_cv_splits: shuffled KFold without a seed
 
 
 def _torch():
@@ -137,6 +139,173 @@ def available_memory_bytes():
         return None
 
 
+class ResidentFootprintError(MemoryError):
+    """The pre-flight says the resident factors do not fit this card.
+
+    A distinct type (not a bare MemoryError) so callers can retry with a SHARDED
+    layout -- which needs only ~1/G of the memory on each of the SAME cards --
+    while still refusing to continue after a genuine upload/allocation failure.
+    """
+
+
+def _norm_workspace_bytes():
+    """Workspace col_norms()/normalize() actually allocates.
+
+    One constant for one budget: the pre-flight and col_norms() used to read
+    different defaults for PHEASY_GPU_NORM_WORKSPACE_MB (64 MB vs 512 MB), so
+    the default standardized path under-reserved ~448 MB -- exactly the margin
+    that turns a borderline "fits" verdict into an OOM.
+    """
+    raw = os.environ.get("PHEASY_GPU_NORM_WORKSPACE_MB", "512")
+    value = int(raw)
+    if value <= 0:
+        raise ValueError("PHEASY_GPU_NORM_WORKSPACE_MB must be positive")
+    return value * 1024**2
+
+
+def resident_twolevel_estimate(A, device_id=None, extra_workspace_bytes=0, n_shards=1):
+    """Estimate the resident two-level footprint WITHOUT uploading anything.
+
+    n_shards > 1 describes a SHARDED resident operator: SM_prime is split by
+    rows (matvec) and by columns (adjoint) across that many devices, so each
+    card holds ~2*nnz_total/n_shards nonzeros instead of the whole matrix.
+
+    Pre-flighting matters because the resident backend refuses an oversized
+    input only when the operator is built -- after the sensing matrix has been
+    materialised and the factors loaded (measured: a third-order fit died 2
+    minutes in with "estimate 29.5 GB exceeds budget 19.9 GB", long after a
+    3.6 GB SM_prime had been written).  The formula below is exactly the one
+    GpuTwoLevelOperator uses for its own check.
+
+    Returns (estimated_peak_bytes, budget_bytes or None, free_bytes or None,
+    fraction).  A None budget means the device budget could not be queried;
+    callers must treat that as unknown, not as fits.
+    """
+    import scipy.sparse as _sp
+    base = getattr(A, "_twolevel_base", A)
+    if not (hasattr(base, "SM_prime") and hasattr(base, "NS")):
+        raise TypeError("resident_twolevel_estimate requires TwoLevelSM")
+    if (not np.isfinite(extra_workspace_bytes) or extra_workspace_bytes < 0
+            or int(extra_workspace_bytes) != extra_workspace_bytes):
+        raise ValueError("extra_workspace_bytes must be a nonnegative integer")
+    fraction = float(os.environ.get("PHEASY_GPU_MEM_FRACTION", "0.8"))
+    if not 0 < fraction <= 1:
+        raise ValueError("PHEASY_GPU_MEM_FRACTION must be in (0, 1]")
+    # Bytes per nonzero follow the FACTOR dtype instead of assuming float64 +
+    # int64.  A float32 sensing matrix (PHEASY_SM_DTYPE=float32, the production
+    # setting) was upcast to float64 on the device, which doubled the values and
+    # the indices -- that is exactly what made the resident backend report 29.5 GB
+    # for a 6.5 GB factor and refuse every fit that the sharded/GPU-SM paths run
+    # happily.  int32 indices are used while nnz fits in int32.
+    _prime = base.SM_prime
+    _value_bytes = 4 if getattr(_prime, "dtype", None) is not None and _prime.dtype == np.float32 else 8
+    _nnz_total = int(_prime.nnz) if _sp.issparse(_prime) else int(np.prod(_prime.shape))
+    _index_bytes = 4 if _nnz_total < 2**31 else 8
+    factor_bytes = 0
+    for matrix in (base.SM_prime, base.NS):
+        if _sp.issparse(matrix):
+            factor_bytes += (_value_bytes + _index_bytes) * int(matrix.nnz)                 + 8 * (sum(matrix.shape) + 2)
+        else:
+            factor_bytes += _value_bytes * int(np.prod(matrix.shape))
+    n_shards = max(1, int(n_shards))
+    workspace = _norm_workspace_bytes()
+    # Each shard holds one row block AND one column block of SM_prime (matvec
+    # needs rows, the adjoint needs columns), hence the factor of 2 -- the same
+    # accounting GpuSparseMV uses.
+    peak = int(np.ceil(2.0 * factor_bytes / n_shards)) + workspace         + 8 * 32 * sum(base.shape) + int(extra_workspace_bytes)
+    if device_id is None:
+        # Budget the card the fit will actually UPLOAD to, which is
+        # _resident_cv_devices()[0] == PHEASY_GPU_DEVICES[0], not
+        # PHEASY_GPU_DEVICE / cuda:0.  With PHEASY_GPU_DEVICES="2,3" the old
+        # code measured card 0 and then uploaded to card 2: the decision could
+        # abort on a card that was never used, or miss the real overflow.
+        try:
+            device_id = _resident_cv_devices()[0]
+        except Exception:
+            device_id = device()
+    # None means "cannot query" (no torch/CUDA, or the card is unqueryable);
+    # callers treat None as unknown, never as "fits".
+    free = _device_free_bytes(device_id)
+    budget = None if free is None else int(free * fraction)
+    return peak, budget, free, fraction
+
+
+def resident_twolevel_error_message(peak, budget):
+    """Actionable text for a resident-LASSO footprint overflow."""
+    return ("Resident two-level GPU estimate %d bytes exceeds budget %d bytes; no CPU fallback. "
+            "The resident backend must hold SM_prime AND NS (plus their CSR transposes) on ONE "
+            "device, so a large third-order problem can exceed a consumer card. Remedies: set "
+            "PHEASY_GPU_LASSO_RESIDENT=0 to use the two-level GPU-SM matvec instead (SM_prime "
+            "sharded across PHEASY_GPU_SM_NGPU cards, the path validated on this host), or "
+            "reduce the third-order cutoff, or use a card with more memory." % (peak, budget))
+
+
+def resident_device_ids():
+    """Device list for a resident (device-side) operator: single or sharded.
+
+    Priority: PHEASY_GPU_DEVICES / PHEASY_GPU_NGPU (the documented resident
+    knobs) > PHEASY_GPU_SM_DEVICES (the GPU-SM knob the production templates
+    already export, so a sharded resident solve needs no new variable) >
+    the single device().
+    """
+    raw = os.environ.get("PHEASY_GPU_DEVICES", "").strip()
+    count = os.environ.get("PHEASY_GPU_NGPU", "").strip()
+    if raw or count:
+        return [d.index for d in _resident_cv_devices()]
+    sm = os.environ.get("PHEASY_GPU_SM_DEVICES", "").strip()
+    if sm:
+        try:
+            ids = [int(x) for x in sm.split(",") if x.strip() != ""]
+        except ValueError:
+            raise ValueError("PHEASY_GPU_SM_DEVICES must contain integer device IDs") from None
+        if ids:
+            return list(dict.fromkeys(ids))
+    dev = device()
+    return [dev.index if dev.index is not None else 0]
+
+
+def _canonical_csr(matrix):
+    """tocsr + sum_duplicates + sort_indices on the HOST (cheap, one pass)."""
+    import scipy.sparse as sp
+    if not sp.issparse(matrix):
+        return matrix
+    csr = matrix.tocsr(copy=True)
+    csr.sum_duplicates()
+    csr.sort_indices()
+    return csr
+
+
+def _canonical_twolevel_host(A):
+    """Host-side canonical factors for the resident operator, built ONCE.
+
+    GpuTwoLevelOperator.upload() runs tocsr(copy=True)/sum_duplicates()/
+    sort_indices() over the WHOLE SM_prime and NS. Built per card, an N-card
+    resident fit pays (N-1) extra full host passes plus (N-1) transient host
+    arrays the size of the factors -- the same class of blow-up that OOM-killed
+    the large config (exit 137). Build it once, hand it to every replica, and
+    drop it as soon as the last card has uploaded.
+    """
+    import scipy.sparse as sp
+    base = getattr(A, "_twolevel_base", A)
+    prepared = []
+    for matrix in (base.SM_prime, base.NS):
+        if sp.issparse(matrix):
+            csr = matrix.tocsr(copy=True)
+            csr.sum_duplicates()
+            csr.sort_indices()
+            prepared.append(csr)
+        else:
+            prepared.append(matrix)
+    # The adjoint needs ROW slices of prime.T.  Building them as
+    # prime[:, c0:c1].T per shard costs an O(nnz) transpose PER SHARD (measured:
+    # the dominant cost of the resident upload phase -- 1h+ single-core on the
+    # c7 factors).  Row-slicing a canonical prime.T is O(rows), so prepare the
+    # transpose here, once.
+    prime_c = prepared[0]
+    prepared.append(prime_c.T.tocsr() if sp.issparse(prime_c) else None)
+    return tuple(prepared)
+
+
 def _device_free_bytes(dev):
     """Free (usable) VRAM in bytes on a specific CUDA device (None if unknown).
 
@@ -159,28 +328,33 @@ def _device_free_bytes(dev):
 def _multi_gpu_devices(min_free_bytes=0):
     """Device indices for fold-parallel CV, filtered by free VRAM.
 
-    PHEASY_GPU_DEVICES="1,2,4" pins an explicit list; otherwise all visible
-    devices are considered. Devices with usable VRAM < min_free_bytes are
-    dropped (so a busy shared GPU is skipped). Falls back to the single
-    device() when nothing qualifies.
+    PHEASY_GPU_DEVICES="1,2,4" pins an explicit list (caller order preserved,
+    duplicates removed -- two folds on one card would break the documented
+    "one fold per card" memory budget); otherwise all visible devices are
+    considered. A device whose usable VRAM cannot be measured, or is below
+    min_free_bytes, is dropped, so a busy or dead shared GPU is skipped.
+
+    If nothing qualifies the result is EMPTY and the caller must fail closed.
+    (An empty list used to be turned back into device(), i.e. straight back to
+    a card that had just failed the memory test; and an unavailable CUDA was
+    reported as device 0, which need not exist at all.)
     """
     import torch
     if not available():
-        return [0]
+        return []
     n = torch.cuda.device_count()
     if n <= 1:
-        return [0]
+        enough = min_free_bytes <= 0 or (_device_free_bytes(0) or 0) >= min_free_bytes
+        return [0] if enough else []
     raw = os.environ.get("PHEASY_GPU_DEVICES", "").strip()
     if raw:
         devs = [int(x) for x in raw.split(",") if x.strip() != ""]
     else:
         devs = list(range(n))
-    devs = [d for d in devs if 0 <= d < n]
+    devs = list(dict.fromkeys(d for d in devs if 0 <= d < n))
     if min_free_bytes > 0:
         devs = [d for d in devs
                 if (_device_free_bytes(d) or 0) >= min_free_bytes]
-    if not devs:
-        return [int(device().index)]
     return devs
 
 
@@ -219,12 +393,29 @@ def enabled():
 
 
 def device():
-    """CUDA device, read fresh from PHEASY_GPU_DEVICE each call (no caching)."""
+    """CUDA device, read fresh from PHEASY_GPU_DEVICE each call (no caching).
+
+    An explicit PHEASY_GPU_DEVICE is validated against the VISIBLE device
+    count, like _resident_cv_devices() already did; otherwise "cuda:9" on a
+    4-card box sailed through every entry point and then died deep inside
+    torch with an "Invalid device ordinal" that names nothing.
+    """
     import torch
     dev = os.environ.get("PHEASY_GPU_DEVICE", None)
-    if dev is not None:
-        return torch.device("cuda:%d" % int(dev))
-    return torch.device("cuda:0")
+    if dev is None:
+        return torch.device("cuda:0")
+    try:
+        idx = int(dev)
+    except ValueError:
+        raise ValueError("PHEASY_GPU_DEVICE must be an integer device index, got %r" % (dev,)) from None
+    if idx < 0:
+        raise ValueError("PHEASY_GPU_DEVICE must be nonnegative, got %d" % idx)
+    if torch.cuda.is_available():
+        n = torch.cuda.device_count()
+        if n and idx >= n:
+            raise ValueError("PHEASY_GPU_DEVICE must name a visible CUDA device "
+                             "(0..%d of %d visible), got %d" % (n - 1, n, idx))
+    return torch.device("cuda:%d" % idx)
 
 
 def _dtype():
@@ -267,19 +458,40 @@ def _is_dense(A):
 # CV splits (identical to optimizer._make_cv_splits so GPU and CPU agree)
 # ---------------------------------------------------------------------------
 def _make_cv_splits(n_samples, cv, random_state=None, group_size=None):
+    """Identical to optimizer._make_cv_splits (GPU and CPU CV must agree)."""
+    import warnings
     from sklearn.model_selection import GroupKFold, KFold
+    global _WARNED_UNGROUPED_CV, _WARNED_NO_SEED
     if cv is None or cv <= 1:
         cv = min(3, n_samples)
     cv = int(cv)
-    if group_size and group_size > 1 and n_samples % group_size == 0:
-        groups = np.arange(n_samples) // group_size
-        n_groups = int(groups[-1]) + 1
-        if n_groups >= 2:
-            eff_cv = int(min(cv, n_groups))
-            gkf = GroupKFold(n_splits=eff_cv)
-            return list(gkf.split(np.zeros(n_samples, dtype=np.int8),
-                                  np.zeros(n_samples, dtype=np.int8), groups))
+    if group_size and group_size > 1:
+        if n_samples % group_size == 0:
+            groups = np.arange(n_samples) // group_size
+            n_groups = int(groups[-1]) + 1
+            if n_groups >= 2:
+                eff_cv = int(min(cv, n_groups))
+                gkf = GroupKFold(n_splits=eff_cv)
+                return list(gkf.split(np.zeros(n_samples, dtype=np.int8),
+                                      np.zeros(n_samples, dtype=np.int8), groups))
+        elif not _WARNED_UNGROUPED_CV:
+            _WARNED_UNGROUPED_CV = True
+            warnings.warn(
+                "PHEASY_CV_GROUP_SIZE=%s does not divide n_samples=%d: grouped "
+                "cross-validation is impossible, so this fit falls back to "
+                "shuffled ROW-based KFold.  Rows of one configuration then appear "
+                "in both folds, which leaks information and biases alpha*/ridge "
+                "toward 0.  Fix PHEASY_CV_GROUP_SIZE (it must be 3*natom and must "
+                "divide the row count)." % (group_size, n_samples),
+                RuntimeWarning, stacklevel=2)
     cv = max(2, min(cv, n_samples))
+    if random_state is None and not _WARNED_NO_SEED:
+        _WARNED_NO_SEED = True
+        warnings.warn(
+            "CV splits use KFold(shuffle=True, random_state=None): the fold "
+            "assignment (and therefore alpha*, the CV curve and every reported "
+            "score) changes from run to run.  Pass --seed / PHEASY_SEED to make "
+            "the fit reproducible.", RuntimeWarning, stacklevel=2)
     kf = KFold(n_splits=cv, shuffle=True, random_state=random_state)
     return list(kf.split(np.arange(n_samples)))
 
@@ -345,7 +557,14 @@ def gpu_tsqr(A, y, block_rows=40000, diag_floor=1e-12):
     # Conservative estimate: current block/Q, merge workspaces, tree and margin.
     estimated_peak = 8 * (4 * min(m, block_rows) * (n + 1) +
                           (blocks.bit_length() + 16) * n * (n + 1)) + 64 * 1024**2
-    if estimated_peak > available_memory_bytes() * fraction:
+    _free_for_tsqr = available_memory_bytes()
+    if _free_for_tsqr is None:
+        # available_memory_bytes() returns None when mem_get_info raises (a
+        # dead or unqueryable card while torch.cuda.is_available() is still
+        # True). None * fraction raised TypeError before, so the intended gate
+        # never ran; fail closed like the resident path instead.
+        raise RuntimeError("Cannot query GPU memory for TSQR; refusing unchecked upload")
+    if estimated_peak > _free_for_tsqr * fraction:
         raise MemoryError("GPU TSQR estimated workspace exceeds memory budget")
     # Normalize only after the workspace gate; never expand whole factors.
     if sparse:
@@ -534,15 +753,33 @@ def _power_lipschitz(Gt, power_iters=15):
     FISTA inside cv_max_iter. The power_iters argument is kept for signature
     compatibility and ignored.
 
-    Note: eigvalsh is a full O(p^3) decomposition, called once per CV fold
-    (n_splits + 1 times per fit); p=3678 is acceptable. If this ever becomes
-    the bottleneck, fall back to a power iteration whose final line is the
-    Rayleigh quotient v . (G v) -- not ||G v||^2 -- with a small safety factor.
+    Note: eigvalsh is a full O(p^3) decomposition plus a p-by-p workspace,
+    called once per CV fold (n_splits + 1 times per fit). That is cheap at
+    p=3678 but not at the PHEASY_MAX_DENSE ceiling (p ~ 1e4), so beyond
+    PHEASY_LIPSCHITZ_POWER_P (default 8192) this falls back to the power
+    iteration described above: the Rayleigh quotient v . (G v) -- NOT
+    ||G v||^2 -- times a safety factor. An underestimate there is not fatal:
+    _fista_gram()/_fista_twolevel() enforce objective monotonicity and inflate
+    L if a step turns out to be too large.
     """
     import torch
-    if Gt.shape[0] == 0:
+    p = int(Gt.shape[0])
+    if p == 0:
         return 0.0
-    return float(torch.linalg.eigvalsh(Gt)[-1].item())
+    threshold = int(os.environ.get("PHEASY_LIPSCHITZ_POWER_P", "8192"))
+    if p <= threshold:
+        return float(torch.linalg.eigvalsh(Gt)[-1].item())
+    safety = float(os.environ.get("PHEASY_FISTA_LIPSCHITZ_SAFETY", "1.05"))
+    if not safety >= 1.0:
+        raise ValueError("PHEASY_FISTA_LIPSCHITZ_SAFETY must be >= 1")
+    gen = torch.Generator(device=Gt.device).manual_seed(0)
+    v = torch.randn(p, generator=gen, dtype=Gt.dtype, device=Gt.device)
+    v = v / torch.clamp(v.norm(), min=torch.finfo(Gt.dtype).tiny)
+    for _ in range(max(1, int(power_iters))):
+        w = Gt @ v
+        v = w / torch.clamp(w.norm(), min=torch.finfo(Gt.dtype).tiny)
+    rayleigh = float(torch.dot(v, Gt @ v).item())
+    return max(rayleigh * safety, 1e-12)
 
 
 def _soft_threshold_t(x, thr):
@@ -598,15 +835,20 @@ def _fista_gram(Gt, bt, alpha, x0=None, max_iter=3000, tol=1e-7,
 
     if lipschitz is None:
         lipschitz = _power_lipschitz(Gt)
-    step = 1.0 / max(float(lipschitz), 1e-12)
-    thr = float(alpha) * float(n_samples) * step
-    if penalty_weights is not None:
-        thr_vec = thr * torch.as_tensor(np.ascontiguousarray(penalty_weights),
-                                        dtype=Gt.dtype, device=Gt.device)
+    lipschitz = max(float(lipschitz), 1e-12)
+    step = 1.0 / lipschitz
+    # penalty = alpha * n_samples * w is INDEPENDENT of the step size, so the
+    # KKT certificate below stays valid when the monotonicity guard raises L.
+    if penalty_weights is None:
+        penalty = float(alpha) * float(n_samples)
+    elif isinstance(penalty_weights, torch.Tensor):
+        penalty = float(alpha) * float(n_samples) * penalty_weights.to(
+            device=Gt.device, dtype=Gt.dtype)
     else:
-        thr_vec = thr
-
-    penalty = thr_vec / step
+        penalty = float(alpha) * float(n_samples) * torch.as_tensor(
+            np.ascontiguousarray(penalty_weights, dtype=np.float64),
+            dtype=Gt.dtype, device=Gt.device)
+    thr_vec = penalty * step
     kkt_scale = torch.clamp(bt.abs().max(), min=torch.finfo(bt.dtype).tiny)
 
     def kkt_relative(coef):
@@ -615,11 +857,21 @@ def _fista_gram(Gt, bt, alpha, x0=None, max_iter=3000, tol=1e-7,
                                 torch.clamp(gradient.abs() - penalty, min=0.0))
         return float((violation.max() / kkt_scale).item())
 
+    def objective(coef):
+        """LASS objective up to the constant 0.5||y||^2 (step-size guard)."""
+        gx = Gt @ coef
+        return float((0.5 * torch.dot(coef, gx) - torch.dot(bt, coef)
+                      + (penalty * coef.abs()).sum()).item())
+
     converged = False
     kkt = float("inf")
     z = x.clone()
     t = 1.0
     x_prev = x.clone()
+    prev_f = None
+    n_inflate = 0
+    n_blowup = 0
+    x_finite = None
     n_iter = 0
     restart_every = int(os.environ.get("PHEASY_FISTA_RESTART_EVERY", "5"))
     restart_every = max(1, restart_every)
@@ -645,6 +897,47 @@ def _fista_gram(Gt, bt, alpha, x0=None, max_iter=3000, tol=1e-7,
         x = x_new
 
         if it % 20 == 19:
+            if not bool(torch.isfinite(x).all().item()):
+                # A step so large that the iterate overflowed.  Restart from the
+                # last finite iterate with a much larger L instead of returning
+                # NaN coefficients with only a warning (fail loud if even that
+                # does not recover).
+                n_blowup += 1
+                if x_finite is None or n_blowup > 3:
+                    raise RuntimeError(
+                        "GPU FISTA diverged (nonfinite iterate): the Lipschitz "
+                        "estimate is far too small. Raise "
+                        "PHEASY_FISTA_LIPSCHITZ_SAFETY or lower "
+                        "PHEASY_LIPSCHITZ_POWER_P so the exact estimate is used.")
+                x = x_finite.clone()
+                z = x.clone()
+                x_prev = x.clone()
+                t = 1.0
+                lipschitz = max(lipschitz * 8.0, 1e-12)
+                step = 1.0 / lipschitz
+                thr_vec = penalty * step
+                prev_f = None
+                n_inflate += 1
+                continue
+            x_finite = x.clone()
+            f_new = objective(x)
+            if prev_f is not None and f_new > prev_f + 1e-9 * (abs(prev_f) + 1e-300):
+                # Step too large: _power_lipschitz under-resolved lambda_max(G)
+                # (40 power iterations converge from below).  Halve the step,
+                # restart the momentum from the current iterate, and re-check.
+                # This is what the removed per-step backtracking certificate
+                # used to guarantee; sweeping to max_iter instead would return
+                # coefficients with converged=False.
+                lipschitz = max(lipschitz * 2.0, 1e-12)
+                step = 1.0 / lipschitz
+                thr_vec = penalty * step
+                z = x.clone()
+                t = 1.0
+                x_prev = x.clone()
+                prev_f = None
+                n_inflate += 1
+            else:
+                prev_f = f_new
             dx = (x - x_prev).norm()
             xn = torch.clamp(x.norm(), min=1.0)
             if bool((dx <= tol * xn).item()):
@@ -657,7 +950,8 @@ def _fista_gram(Gt, bt, alpha, x0=None, max_iter=3000, tol=1e-7,
         kkt = kkt_relative(x)
         converged = bool(np.isfinite(kkt) and kkt <= tol)
     if _info is not None:
-        _info.update(n_iter=n_iter, converged=converged, kkt_relative=kkt)
+        _info.update(n_iter=n_iter, converged=converged, kkt_relative=kkt,
+                     lipschitz=lipschitz, lipschitz_inflations=n_inflate)
     if not converged:
         import warnings
         warnings.warn("FISTA did not converge: iterations=%d, relative KKT=%g, tol=%g"
@@ -739,30 +1033,48 @@ class GpuLassoCV(object):
         best_mean = float("inf")
         best_x = None
         _cv_max_n_iter = 0
+        # [D1] "hit the cap" must mean "hit the cap WITHOUT converging": the
+        # periodic check runs at it % 20 == 19, so a fully converged fit can
+        # report n_iter == cv_max_iter and used to be flagged as a convergence
+        # problem on a perfectly converged path.
+        _cv_hit_cap = False
 
+        # [ACC] convert the penalty weights ONCE per fit, not once per
+        # (fold, alpha): with nalpha=100 and cv=5 the old code performed 600
+        # host->device transfers plus 600 device allocations of a p-vector
+        # inside the hot loop.
         pw = self.penalty_weights
+        if pw is not None and not isinstance(pw, torch.Tensor):
+            pw = torch.as_tensor(np.ascontiguousarray(pw, dtype=np.float64),
+                                 dtype=torch.float64, device=At.device)
 
         for a_i in range(n_alphas - 1, -1, -1):
             alpha = float(self.alphas[a_i])
             fold_mse = np.zeros(len(splits))
             for k, (tr, va) in enumerate(splits):
+                _fold_info = {}
                 coef, nit = _fista_gram(gram_folds[k][0], gram_folds[k][1], alpha,
                                         x0=x_folds[k], max_iter=cv_max_iter, tol=cv_tol,
                                         lipschitz=lip_folds[k], penalty_weights=pw,
-                                        n_samples=len(tr))
+                                        n_samples=len(tr), _info=_fold_info)
                 va_t = torch.as_tensor(np.asarray(va), dtype=torch.long, device=At.device)
                 pred = A_va_list[k] @ coef
                 x_folds[k] = coef
                 _cv_max_n_iter = max(_cv_max_n_iter, nit)
+                if nit >= cv_max_iter and not _fold_info.get("converged", False):
+                    _cv_hit_cap = True
                 err = pred - yt[va_t]
                 fold_mse[k] = float((err * err).mean().item())
             mse_path[a_i] = fold_mse
             mean = float(fold_mse.mean())
 
+            _full_info = {}
             x_full, nit = _fista_gram(G_full, b_full, alpha, x0=x_full,
                                       max_iter=cv_max_iter, tol=cv_tol,
                                       lipschitz=lip_full, penalty_weights=pw,
-                                      n_samples=n_samples)
+                                      n_samples=n_samples, _info=_full_info)
+            # Full-data warm-start solve: feeds the "max iterations" message but
+            # must not set the hit-cap flag (that is a CV-convergence diagnosis).
             _cv_max_n_iter = max(_cv_max_n_iter, nit)
             if mean <= best_mean:
                 best_mean = mean
@@ -773,7 +1085,6 @@ class GpuLassoCV(object):
         mean_path = mse_path.mean(axis=1)
         rtol = float(os.environ.get("PHEASY_LASSO_TIE_RTOL", "1e-9"))
         tied = np.flatnonzero(mean_path <= best_mean * (1.0 + rtol) + 1e-300)
-        _cv_hit_cap = _cv_max_n_iter >= cv_max_iter
         if tied.size > 1:
             if _cv_hit_cap:
                 print("[CV] WARNING: %d alphas tie at CV MSE %.6e (%.3e ... %.3e). "
@@ -892,6 +1203,13 @@ class GpuRidgeCV(object):
         min_free = footprint / frac if frac > 0 else footprint
         devs = _multi_gpu_devices(min_free_bytes=min_free)
         devs = devs[:len(splits)]
+        if not devs:
+            raise RuntimeError(
+                "GPU RIDGE CV: no CUDA device has the %.2f GB free required for one "
+                "fold (PHEASY_GPU_DEVICES=%r, PHEASY_GPU_MEM_FRACTION=%g); free a "
+                "card or lower the fraction instead of running on a card that "
+                "failed the memory test" %
+                (footprint / 1e9, os.environ.get("PHEASY_GPU_DEVICES", ""), frac))
         if len(devs) > 1:
             print("[GPU] RIDGE CV fold-parallel on %d device(s); fold footprint "
                   "~%.2f GB" % (len(devs), footprint / 1e9), flush=True)
@@ -1280,15 +1598,26 @@ class GpuSparseMV(object):
 
 
 class GpuTwoLevelOperator:
-    """CUDA-resident float64 SM_prime @ NS, without a product or Gram matrix.
+    """CUDA-resident SM_prime @ NS, without a product or Gram matrix.
 
-    Both factors and their CSR transposes live on one device. Allocation or
-    unsupported sparse-kernel errors propagate: this backend NEVER falls back.
-    Dense NS is supported; sparse NS is never densified. CV uses row masks so
-    folds do not duplicate the factors. Only setup uploads and public result
-    downloads cross the host boundary.
+    device_ids=[d] keeps the original single-device layout (both factors and
+    their CSR transposes on one device).  device_ids=[d0, d1, ...] SHARDS it:
+    SM_prime is split by rows for matvec and by columns for the adjoint, exactly
+    like the validated GpuSparseMV path, so each card holds ~2*nnz/G nonzeros
+    instead of the whole matrix -- the same code then runs on one card or on
+    many, and the per-card memory requirement falls by G.
+
+    Factor values follow the sensing-matrix dtype (float32 stays float32) and
+    indices are int32 while nnz fits; the old hard-coded float64/int64 doubled
+    both and is what made a 6.5 GB factor look like 29.5 GB of VRAM.
+
+    Allocation or unsupported sparse-kernel errors propagate: this backend NEVER
+    falls back.  Dense NS is supported; sparse NS is never densified.  CV uses
+    row masks so folds do not duplicate the factors.  Only setup uploads and
+    public result downloads cross the host boundary.
     """
-    def __init__(self, A, device_id=None, extra_workspace_bytes=0):
+    def __init__(self, A, device_id=None, extra_workspace_bytes=0, host_factors=None,
+                 device_ids=None):
         import scipy.sparse as sp
         if not enabled() or not available():
             raise RuntimeError("Resident two-level LASSO requires enabled CUDA; no CPU fallback")
@@ -1297,55 +1626,163 @@ class GpuTwoLevelOperator:
         if not hasattr(A, "SM_prime") or not hasattr(A, "NS"):
             raise TypeError("GpuTwoLevelOperator requires TwoLevelSM")
         self.torch = torch = _torch()
-        self.device = device() if device_id is None else torch.device(device_id)
+        if device_ids is None:
+            device_ids = [device() if device_id is None else device_id]
+        self._devs = [d if isinstance(d, torch.device) else torch.device(d)
+                      for d in device_ids]
+        if not self._devs:
+            raise ValueError("device_ids must name at least one CUDA device")
+        self._n_shards = len(self._devs)
+        self.device = self._devs[0]
         self.shape = A.shape
         if not sp.issparse(A.SM_prime):
             raise TypeError("Resident two-level SM_prime must be scipy sparse")
         fraction = float(os.environ.get("PHEASY_GPU_MEM_FRACTION", "0.8"))
         if not 0 < fraction <= 1:
             raise ValueError("PHEASY_GPU_MEM_FRACTION must be in (0, 1]")
-        factor_bytes = 0
-        for matrix in (A.SM_prime, A.NS):
-            if sp.issparse(matrix):
-                factor_bytes += 32 * int(matrix.nnz) + 8 * (sum(matrix.shape) + 2)
-            else:
-                factor_bytes += 8 * int(np.prod(matrix.shape))
-        workspace = max(1, int(os.environ.get("PHEASY_GPU_NORM_WORKSPACE_MB", "64"))) * 1024**2
-        # Extra factor-sized allowance covers CSR transpose conversion scratch;
-        # vector margin covers FISTA, masked folds, target and power iteration.
-        if not np.isfinite(extra_workspace_bytes) or extra_workspace_bytes < 0 or int(extra_workspace_bytes) != extra_workspace_bytes:
-            raise ValueError("extra_workspace_bytes must be a nonnegative integer")
-        self.estimated_peak_bytes = 2 * factor_bytes + workspace + 8 * 32 * sum(A.shape) + int(extra_workspace_bytes)
-        free = _device_free_bytes(self.device)
+        # Follow the factor dtype unless PHEASY_GPU_RESIDENT_DTYPE overrides it.
+        _dt_env = os.environ.get("PHEASY_GPU_RESIDENT_DTYPE", "auto").strip().lower()
+        if _dt_env in ("auto", ""):
+            self._value_dtype = (torch.float64 if A.SM_prime.dtype == np.float64
+                                 else torch.float32)
+        elif _dt_env in ("float64", "fp64", "double"):
+            self._value_dtype = torch.float64
+        elif _dt_env in ("float32", "fp32", "single"):
+            self._value_dtype = torch.float32
+        else:
+            raise ValueError("PHEASY_GPU_RESIDENT_DTYPE must be auto, float32 or float64")
+        self._index_dtype = (torch.int32 if int(A.SM_prime.nnz) < 2**31
+                             else torch.int64)
+        peak, budget, free, _fraction = resident_twolevel_estimate(
+            A, device_id=self.device,
+            extra_workspace_bytes=extra_workspace_bytes,
+            n_shards=self._n_shards)
+        self.estimated_peak_bytes = peak
         if free is None and torch.device(self.device).type == "cuda":
             raise RuntimeError("Cannot query resident CUDA memory budget; refusing unchecked upload")
-        if free is not None and self.estimated_peak_bytes > free * fraction:
-            raise MemoryError("Resident two-level GPU estimate %d bytes exceeds budget %d bytes; no CPU fallback" %
-                              (self.estimated_peak_bytes, int(free * fraction)))
+        if budget is not None and self.estimated_peak_bytes > budget:
+            raise ResidentFootprintError(resident_twolevel_error_message(
+                self.estimated_peak_bytes, budget))
+        for _dev in self._devs[1:]:
+            # Every shard must fit its own card: the footprint is per card, not
+            # for the whole group.
+            _free_other = _device_free_bytes(_dev)
+            if _free_other is None:
+                raise RuntimeError("Cannot query resident CUDA memory budget on %s; "
+                                   "refusing unchecked upload" % _dev)
+            if self.estimated_peak_bytes > _free_other * fraction:
+                raise ResidentFootprintError(resident_twolevel_error_message(
+                    self.estimated_peak_bytes, int(_free_other * fraction)))
 
-        def upload(matrix):
+        host_prime_t = None
+        if host_factors is None:
+            host_prime, host_ns = A.SM_prime, A.NS
+        else:
+            # [ACC] reuse the canonical host arrays built by
+            # _canonical_twolevel_host(); they are already tocsr'd, deduplicated
+            # and index-sorted, so the per-card host pass disappears.
+            host_prime, host_ns = host_factors[0], host_factors[1]
+            host_prime_t = host_factors[2] if len(host_factors) > 2 else None
+
+        def upload(matrix, dev, canonical=False):
             if not sp.issparse(matrix):
-                return torch.as_tensor(np.asarray(matrix), dtype=torch.float64, device=self.device)
-            csr = matrix.tocsr(copy=True)
-            csr.sum_duplicates()
-            csr.sort_indices()
-            # int64 avoids truncation on genuinely large factors.
+                # Dense NS: replicate on every shard so the two-level matvec never
+                # needs a cross-device round trip for it.
+                return torch.as_tensor(np.asarray(matrix), dtype=self._value_dtype,
+                                       device=dev)
+            if canonical:
+                # Already tocsr'd, deduplicated and index-sorted by
+                # _canonical_twolevel_host(): no second host copy.
+                csr = matrix
+            else:
+                csr = matrix.tocsr(copy=True)
+                csr.sum_duplicates()
+                csr.sort_indices()
+            # np.array(..., copy=True) guarantees fresh, owning, C-contiguous
+            # buffers: a column-sliced transpose hands back strided views of the
+            # parent's arrays and torch then refuses ("expected col_indices to be
+            # a contiguous tensor per batch").  GpuSparseMV never hit this because
+            # its int32 cast always copied.
+            _idx_np = np.int32 if self._index_dtype == torch.int32 else np.int64
+            _val_np = np.float32 if self._value_dtype == torch.float32 else np.float64
+            _check_cuda_csr_indices(csr)
+            # Mirror GpuSparseMV's proven construction: int32 metadata with
+            # dtype=/size= and no check_invariants (on a transposed slice that
+            # flag trips torch's "expected col_indices to be a contiguous tensor
+            # per batch" check).  _check_cuda_csr_indices above is the package's
+            # own int32-representability guard.
             return torch.sparse_csr_tensor(
-                torch.as_tensor(csr.indptr, dtype=torch.int64, device=self.device),
-                torch.as_tensor(csr.indices, dtype=torch.int64, device=self.device),
-                torch.as_tensor(csr.data, dtype=torch.float64, device=self.device),
-                size=csr.shape, device=self.device, check_invariants=True)
+                torch.as_tensor(np.array(csr.indptr, dtype=_idx_np, copy=True), device=dev),
+                torch.as_tensor(np.array(csr.indices, dtype=_idx_np, copy=True), device=dev),
+                torch.as_tensor(np.array(csr.data, dtype=_val_np, copy=True), device=dev),
+                size=csr.shape, dtype=self._value_dtype, device=dev)
 
+        self._R = []
+        self._T = []
         try:
-            self.prime = upload(A.SM_prime)
-            self.ns = upload(A.NS)
-            # Convert on device rather than allocating giant host CSR transposes.
-            self.prime_t = self.prime.transpose(0, 1).to_sparse_csr()
-            self.ns_t = (self.ns.T if self.ns.layout == torch.strided else
-                         self.ns.transpose(0, 1).to_sparse_csr())
-            self.scale = torch.ones(A.shape[1], dtype=torch.float64, device=self.device)
+            if self._n_shards == 1:
+                # Canonicalize the host matrices ONCE and build BOTH the matrix and
+                # its transpose on the host.  A device-side
+                # prime.transpose(0,1).to_sparse_csr() yields unsorted column
+                # indices, and cuSPARSE then refuses the SpMV ("operation not
+                # supported when calling cusparseSpMV_bufferSize") -- measured on
+                # the production 810M-nnz float32 factor.
+                _prime_c = _canonical_csr(host_prime)
+                self.prime = upload(_prime_c, self.device, canonical=True)
+                if sp.issparse(host_prime):
+                    self.prime_t = upload(_prime_c.T.tocsr(), self.device,
+                                          canonical=False)
+                else:
+                    self.prime_t = self.prime.transpose(0, 1).to_sparse_csr()
+            else:
+                # Sharded: rows for the matvec, columns for the adjoint.  Every
+                # output element is produced by exactly one card from its own
+                # block, so the concatenation is order-independent of G.
+                N, M = A.shape
+                # ROW split over N (prime rows) for the matvec, COLUMN split over
+                # prime's OWN column count (mid) for the adjoint.  Splitting the
+                # adjoint over the effective column count p was wrong: prime has
+                # only mid columns, so with p > mid every shard but the first got
+                # an empty block (rmatvec still looked right because block 0 then
+                # held every column, but column norms came out wrong).
+                _mid = int(host_prime.shape[1])
+                self._rs = np.linspace(0, N, self._n_shards + 1).astype(np.int64)
+                self._cs = np.linspace(0, _mid, self._n_shards + 1).astype(np.int64)
+                for i, dev in enumerate(self._devs):
+                    r0, r1 = int(self._rs[i]), int(self._rs[i + 1])
+                    c0, c1 = int(self._cs[i]), int(self._cs[i + 1])
+                    with torch.cuda.device(dev):
+                        # canonical=False is deliberate: the column-sliced
+                        # transpose must be re-sorted/deduplicated per shard,
+                        # otherwise cuSPARSE rejects the SpMV (see above).
+                        self._R.append(upload(host_prime[r0:r1], dev,
+                                              canonical=False))
+                        if host_prime_t is not None:
+                            # row slice of the precomputed canonical transpose:
+                            # O(rows) instead of an O(nnz) per-shard transpose.
+                            self._T.append(upload(host_prime_t[c0:c1], dev,
+                                                  canonical=False))
+                        else:
+                            self._T.append(upload(host_prime[:, c0:c1].T, dev,
+                                                  canonical=False))
+                        if i == 0:
+                            self.prime = None
+                            self.prime_t = None
+            self.ns = upload(host_ns, self.device, canonical=host_factors is not None)
+            if sp.issparse(host_ns):
+                # Same rule as prime_t: a DEVICE-side sparse transpose leaves
+                # unsorted column indices and cuSPARSE then refuses the SpMV
+                # ("operation not supported when calling cusparseSpMV_bufferSize").
+                # Measured: the whole 810M-nnz prime SpMV is fine, the transposed
+                # NS was the one that failed.
+                self.ns_t = upload(_canonical_csr(host_ns).T.tocsr(), self.device,
+                                   canonical=False)
+            else:
+                self.ns_t = self.ns.T
+            self.scale = torch.ones(A.shape[1], dtype=self._value_dtype, device=self.device)
             self.input_scale = (torch.ones_like(self.scale) if input_scale is None else
-                                torch.as_tensor(input_scale, dtype=torch.float64, device=self.device))
+                                torch.as_tensor(input_scale, dtype=self._value_dtype,
+                                                device=self.device))
             if not bool((torch.isfinite(self.input_scale) & (self.input_scale != 0)).all().item()):
                 raise ValueError("two-level column scales must be finite and nonzero")
         except Exception:
@@ -1357,6 +1794,10 @@ class GpuTwoLevelOperator:
         for name in ("prime", "ns", "prime_t", "ns_t", "scale", "input_scale"):
             if hasattr(self, name):
                 setattr(self, name, None)
+        for name in ("_R", "_T"):
+            shards = getattr(self, name, None)
+            if shards:
+                shards.clear()
 
 
     def _mm(self, matrix, vector):
@@ -1367,10 +1808,33 @@ class GpuTwoLevelOperator:
         return self.torch.sparse.mm(matrix, vector)
 
     def matvec(self, vector):
-        return self._mm(self.prime, self._mm(self.ns, vector / (self.scale * self.input_scale)))
+        x = vector / (self.scale * self.input_scale)
+        if self._n_shards == 1:
+            return self._mm(self.prime, self._mm(self.ns, x))
+        # Sharded: NS lives on the primary; the mid vector is broadcast to every
+        # card and the disjoint row blocks come back to the primary.  Per
+        # iteration this moves ~mid*4 bytes per card, not the factors.
+        t = self._mm(self.ns, x)
+        parts = []
+        for i, dev in enumerate(self._devs):
+            with self.torch.cuda.device(dev):
+                ti = t if dev == self.device else t.to(dev)
+                yi = self._R[i] @ ti
+                parts.append(yi if dev == self.device else yi.to(self.device))
+                del ti
+        return self.torch.cat(parts)
 
     def rmatvec(self, vector):
-        return self._mm(self.ns_t, self._mm(self.prime_t, vector)) / (self.scale * self.input_scale)
+        if self._n_shards == 1:
+            return self._mm(self.ns_t, self._mm(self.prime_t, vector)) / (self.scale * self.input_scale)
+        parts = []
+        for i, dev in enumerate(self._devs):
+            with self.torch.cuda.device(dev):
+                ui = vector if dev == self.device else vector.to(dev)
+                zi = self._T[i] @ ui
+                parts.append(zi if dev == self.device else zi.to(self.device))
+        z = self.torch.cat(parts)
+        return self._mm(self.ns_t, z) / (self.scale * self.input_scale)
 
     def norm_estimate(self, iters=10):
         """Cached spectral estimate for the current normalized operator."""
@@ -1384,35 +1848,86 @@ class GpuTwoLevelOperator:
         Bounded column blocks avoid sparse-sparse products and never allocate
         the full sensing matrix. Workspace is O(block*(n + mid + p)).
         """
+        if self._n_shards != 1:
+            return self._sharded_col_norms()
         torch = self.torch
         n, p = self.shape
-        budget = int(os.environ.get("PHEASY_GPU_NORM_WORKSPACE_MB", "512")) * 1024**2
-        if budget <= 0:
-            raise ValueError("PHEASY_GPU_NORM_WORKSPACE_MB must be positive")
+        budget = _norm_workspace_bytes()
         block = max(1, budget // max(8 * (n + self.ns.shape[0] + p) * 2, 1))
         norms = torch.empty_like(self.scale)
         for start in range(0, p, block):
             count = min(block, p - start)
-            basis = torch.zeros((p, count), dtype=torch.float64, device=self.device)
+            # Follow the factor dtype: an fp64 basis against fp32 factors is
+            # the same mixed-dtype failure the resident path hit (found by
+            # re-running this gate with float32 fixtures).
+            basis = torch.zeros((p, count), dtype=self._value_dtype, device=self.device)
             idx = torch.arange(count, device=self.device)
             basis[start + idx, idx] = 1
             cols = self._mm(self.prime, self._mm(self.ns, basis / (self.input_scale * self.scale)[:, None]))
             norms[start:start + count] = torch.linalg.vector_norm(cols, dim=0)
         return norms
 
+    def _sharded_col_norms(self):
+        """Exact column norms of the effective operator across shards.
+
+        Column j of the effective operator spans EVERY row, so each shard
+        accumulates squared entries over its own row block and the per-shard
+        results are SUMMED (concatenating them, as the matvec does, would be
+        wrong).  Accumulation is float64 even for float32 factors: the norms feed
+        --std scaling, where a relative error is not damped by the solve.
+        """
+        torch = self.torch
+        n, p = self.shape
+        budget = _norm_workspace_bytes()
+        block = max(1, budget // max(8 * (n + self.ns.shape[0] + p) * 2, 1))
+        total = torch.zeros(p, dtype=torch.float64, device=self.device)
+        for start in range(0, p, block):
+            count = min(block, p - start)
+            basis = torch.zeros((p, count), dtype=self._value_dtype,
+                                device=self.device)
+            idx = torch.arange(count, device=self.device)
+            basis[start + idx, idx] = 1
+            scaled = basis / (self.input_scale * self.scale)[:, None]
+            t = self._mm(self.ns, scaled)
+            partial = torch.zeros(count, dtype=torch.float64, device=self.device)
+            for i, dev in enumerate(self._devs):
+                with torch.cuda.device(dev):
+                    ti = t if dev == self.device else t.to(dev)
+                    # _mm (torch.sparse.mm), not the @ operator: for a 2-D dense
+                    # operand the sparse @ dense dispatch does NOT match the
+                    # single-device path (measured: 22x wrong column norms).
+                    cols = self._mm(self._R[i], ti).to(torch.float64)
+                    sq = torch.sum(cols * cols, dim=0)
+                    partial += sq if dev == self.device else sq.to(self.device)
+                    del ti, cols
+            total[start:start + count] = partial
+        # SQUARES were accumulated above: the single-device path returns the norm,
+        # not its square (measured 22x disagreement before this sqrt).  The result
+        # is cast back to the FACTOR dtype: normalize() assigns it to self.scale,
+        # and an fp64 scale would turn every later vector fp64 -- the mixed-dtype
+        # SpMM that cuSPARSE refuses (found by running this gate with fp32 data).
+        return torch.sqrt(total).to(self._value_dtype)
+
     def normalize(self):
         """Apply exact unit-L2 normalization and invalidate the spectral estimate."""
         torch = self.torch
-        norms = self.col_norms() * self.scale
-        self.scale = torch.where(norms < 1e-30, torch.ones_like(norms), norms)
+        norms = (self.col_norms() * self.scale).to(self._value_dtype)
+        self.scale = torch.where(norms < 1e-30, torch.ones_like(norms), norms).to(self._value_dtype)
         self._norma = None
         return self.scale
 
     def lipschitz(self):
-        """Power estimate; FISTA backtracking certifies every accepted step."""
+        """Initial step-size estimate for FISTA (Rayleigh * 1.05, 40 iters).
+
+        Not a certificate: 40 power iterations converge to lambda_max from
+        below, so the estimate is only an upper bound while (lambda2/lambda1)^40
+        is well under the 5 % margin. _fista_twolevel() enforces monotonicity of
+        the objective and inflates L if a step turns out too large.
+        """
         torch = self.torch
         gen = torch.Generator(device=self.device).manual_seed(0)
-        v = torch.randn(self.shape[1], generator=gen, dtype=torch.float64, device=self.device)
+        v = torch.randn(self.shape[1], generator=gen, dtype=self._value_dtype,
+                        device=self.device)
         for _ in range(40):
             v = self.rmatvec(self.matvec(v))
             v = v / torch.clamp(v.norm(), min=1e-30)
@@ -1457,9 +1972,9 @@ class GpuSubsetOperator:
             if indices is not None and (indices.ndim != 1 or bool(((indices < 0) | (indices >= bound)).any().item())):
                 raise ValueError("subset indices must be one-dimensional and in bounds")
         self.shape = (base.shape[0] if self.rows is None else self.rows.numel(), self.columns.numel())
-        self.column_scale = torch.ones(self.shape[1], dtype=torch.float64, device=self.device)
+        self.column_scale = torch.ones(self.shape[1], dtype=self._value_dtype, device=self.device)
         if column_scale is not None:
-            scale = torch.as_tensor(column_scale, dtype=torch.float64, device=self.device)
+            scale = torch.as_tensor(column_scale, dtype=self._value_dtype, device=self.device)
             if scale.shape != self.column_scale.shape or not bool((torch.isfinite(scale) & (scale >= 0)).all().item()):
                 raise ValueError("subset column scales must be finite, nonnegative, and match active columns")
             self.column_scale = torch.where(scale < 1e-30, torch.ones_like(scale), scale)
@@ -1499,7 +2014,9 @@ def solve_resident_subset(base, target, columns, rows=None, column_scale=None,
     if not np.isfinite(ridge_alpha) or ridge_alpha < 0:
         raise ValueError("Ridge alpha must be finite and nonnegative")
     view = GpuSubsetOperator(base, columns, rows, column_scale)
-    y = base.torch.as_tensor(target, dtype=base.torch.float64, device=base.device).reshape(-1)
+    y = base.torch.as_tensor(target,
+                             dtype=getattr(base, "_value_dtype", None) or base.torch.float64,
+                             device=base.device).reshape(-1)
     if y.numel() != base.shape[0]:
         raise ValueError("subset target must match full operator row count")
     if view.rows is not None:
@@ -1526,15 +2043,16 @@ def _iterative_ridge_tensor(A, y, alpha, atol=1e-8, btol=1e-8, maxiter=5000, row
     """Augmented CGLS with CUDA coefficient output."""
     torch = A.torch
     dev = A.device
-    y = torch.as_tensor(y, dtype=torch.float64, device=dev).reshape(-1)
-    mask = torch.ones(A.shape[0], dtype=torch.float64, device=dev)
+    _vd = getattr(A, "_value_dtype", None) or torch.float64
+    y = torch.as_tensor(y, dtype=_vd, device=dev).reshape(-1)
+    mask = torch.ones(A.shape[0], dtype=_vd, device=dev)
     if rows is not None:
         mask.zero_(); mask[torch.as_tensor(rows, dtype=torch.long, device=dev)] = 1
     if not np.isfinite(alpha) or alpha < 0:
         raise ValueError("Ridge alpha must be finite and nonnegative")
     sa = float(np.sqrt(alpha))
     if penalty_scale is not None:
-        scale = torch.as_tensor(penalty_scale, dtype=torch.float64, device=dev)
+        scale = torch.as_tensor(penalty_scale, dtype=getattr(A, "_value_dtype", None) or torch.float64, device=dev)
         if scale.shape != (A.shape[1],) or not bool((torch.isfinite(scale) & (scale > 0)).all().item()):
             raise ValueError("penalty_scale must be finite positive and match coefficient count")
         sa = sa / scale
@@ -1558,7 +2076,12 @@ def _operator_norm_estimate(A, iters=10):
     """Deterministic matrix-free spectral estimate, not SciPy's Frobenius estimate."""
     t = A.torch
     gen = t.Generator(device=A.device).manual_seed(0)
-    v = t.randn(A.shape[1], generator=gen, dtype=t.float64, device=A.device)
+    # Follow the FACTOR dtype: a hard-coded float64 probe vector against float32
+    # factors is a mixed-dtype SpMM that cuSPARSE rejects ("matA (CUDA_R_32F) and
+    # matB (CUDA_R_64F) ... is not supported").  This was the LAST fp64 operand in
+    # the resident path -- iterative_lstsq() calls norm_estimate() before its loop.
+    v = t.randn(A.shape[1], generator=gen,
+                dtype=getattr(A, "_value_dtype", None) or t.float64, device=A.device)
     tiny = t.finfo(v.dtype).tiny
     v = v / t.linalg.vector_norm(v).clamp_min(tiny)
     for _ in range(iters):
@@ -1579,7 +2102,13 @@ def _iterative_lstsq_tensor(A, y, atol=1e-8, btol=1e-8, maxiter=5000):
     device = getattr(A, "device", None)
     if torch is None or device is None or torch.device(device).type != "cuda":
         raise RuntimeError("GPU iterative least-squares requires a CUDA operator")
-    y = torch.as_tensor(y, dtype=torch.float64, device=device).reshape(-1)
+    # The iteration vectors must follow the FACTOR dtype: the resident operator
+    # now keeps float32 factors for an fp32 sensing matrix (PHEASY_SM_DTYPE=float32,
+    # the production setting), and cuSPARSE refuses a mixed-dtype SpMM
+    # ("matA (CUDA_R_32F) and matB (CUDA_R_64F) ... is not supported").  Hard-coded
+    # float64 here is what made the resident GPU path unusable on fp32 input.
+    _vd = getattr(A, "_value_dtype", None) or torch.float64
+    y = torch.as_tensor(y, dtype=_vd, device=device).reshape(-1)
     if y.numel() != A.shape[0]:
         raise ValueError("least-squares target length does not match operator")
     if not bool(torch.isfinite(y).all().item()):
@@ -1687,7 +2216,9 @@ def _fista_twolevel(A, y, alpha, x0, max_iter, tol, lipschitz, rows=None, penalt
     x = torch.zeros(A.shape[1], dtype=y.dtype, device=y.device) if x0 is None else x0.clone()
     z = x.clone()
     momentum = torch.ones((), dtype=y.dtype, device=y.device)
-    L = lipschitz.clone()
+    L = torch.as_tensor(lipschitz, dtype=y.dtype, device=y.device).clone()
+    if not bool(torch.isfinite(L).item()) or float(L) <= 0:
+        raise ValueError("FISTA step estimate must be finite and positive")
 
     def kkt(coef):
         gradient = A.rmatvec((A.matvec(coef) - y) * mask)
@@ -1697,15 +2228,17 @@ def _fista_twolevel(A, y, alpha, x0, max_iter, tol, lipschitz, rows=None, penalt
 
     converged = False
     n_iter = 0
+    prev_f = None
+    n_inflate = 0
     for it in range(int(max_iter)):
         n_iter = it + 1
         residual = (A.matvec(z) - y) * mask
         grad = A.rmatvec(residual)
-        # lipschitz() returns Rayleigh*1.05 (40 power iterations, 5% margin), so
-        # the per-step backtracking certificate always accepts on the first try
-        # (measured: 1 inflate over 800 iterations) and costs an extra matvec.
-        # Trust L and drop the certificate; the periodic KKT check below still
-        # catches a diverged (nonfinite) certificate.
+        # lipschitz() returns Rayleigh*1.05 from 40 power iterations, which
+        # converge to lambda_max from BELOW: it is a step estimate, not a
+        # certificate.  The per-step backtracking was dropped for speed, so the
+        # periodic monotonicity guard below is what keeps a too-large step from
+        # quietly drifting to max_iter (see the KKT/nonfinite check as well).
         candidate = z - grad / L
         x_new = candidate.sign() * torch.clamp(candidate.abs() - penalty_vec / L, min=0)
         restart = torch.dot(z - x_new, x_new - x) > 0
@@ -1717,13 +2250,29 @@ def _fista_twolevel(A, y, alpha, x0, max_iter, tol, lipschitz, rows=None, penalt
             certificate = kkt(x)
             if not bool(torch.isfinite(certificate).item()):
                 raise RuntimeError("Resident FISTA diverged (nonfinite KKT certificate); Lipschitz estimate too small")
+            rx = (A.matvec(x) - y) * mask
+            f_new = float((0.5 * torch.dot(rx, rx)
+                           + (penalty_vec * x.abs()).sum()).item())
+            if prev_f is not None and f_new > prev_f + 1e-9 * (abs(prev_f) + 1e-300):
+                # Step too large: inflate L, restart the momentum from the
+                # current iterate.  (One measured inflation over 800 iterations
+                # on the reference problems, so this costs nothing when L is
+                # already adequate.)
+                L = L * 2.0
+                z = x.clone()
+                momentum = torch.ones((), dtype=y.dtype, device=y.device)
+                prev_f = None
+                n_inflate += 1
+            else:
+                prev_f = f_new
             if bool((certificate <= tol).item()):
                 converged = True
                 break
     certificate = kkt(x)
     value = float(certificate.item())
     converged = bool(np.isfinite(value) and value <= tol)
-    info = dict(n_iter=n_iter, converged=converged, kkt_relative=value)
+    info = dict(n_iter=n_iter, converged=converged, kkt_relative=value,
+                lipschitz=float(L), lipschitz_inflations=n_inflate)
     if not converged:
         import warnings
         warnings.warn("Resident FISTA did not converge: iterations=%d, relative KKT=%g, tol=%g" %
@@ -1865,13 +2414,55 @@ class GpuTwoLevelLassoCV(GpuLassoCV):
             raise ValueError("alphas must be nonempty, finite and nonnegative")
         if self.max_iter < 1 or self.tol <= 0:
             raise ValueError("max_iter and tol must be positive")
-        print("[gpu_resident] uploading factors shape=%s; CUDA required, no CPU fallback" % (A.shape,), flush=True)
-        op = GpuTwoLevelOperator(A, device_id=devices[0])
-        owned.append(op)
-        print("[gpu_resident] factors ready device=%s dtype=float64 estimated_peak_bytes=%d elapsed=%.2fs" %
-              (op.device, op.estimated_peak_bytes, time.monotonic() - started), flush=True)
+        splits = _make_cv_splits(A.shape[0], self.cv, self.rand_seed, self.group_size)
+        devices = devices[:max(1, len(splits))]
+        print("[gpu_resident] uploading factors shape=%s on %d device(s); CUDA required, no CPU fallback"
+              % (A.shape, len(devices)), flush=True)
+        # [ACC] canonicalize the host factors ONCE and upload every card from
+        # the same arrays: a replica used to re-run tocsr(copy=True)/
+        # sum_duplicates()/sort_indices() over the whole SM_prime and NS, i.e.
+        # one extra full host pass plus a transient host-RAM spike the size of
+        # the factors per card.  The canonical copy is released as soon as the
+        # last card has uploaded (the device copies are independent).
+        host_factors = _canonical_twolevel_host(A)
+        replicas = []
+        try:
+            try:
+                op = GpuTwoLevelOperator(A, device_id=devices[0],
+                                         host_factors=host_factors)
+                owned.append(op)
+                for dev in devices[1:]:
+                    with _resident_device_context(dev):
+                        replica = GpuTwoLevelOperator(A, device_id=dev,
+                                                      host_factors=host_factors)
+                        owned.append(replica)
+                        replicas.append(replica)
+            except ResidentFootprintError as _exc:
+                # A FULL replica does not fit on every selected card.  Instead of
+                # dropping the whole CV to the CPU FISTA path (what used to
+                # happen), shard ONE operator across the same devices: folds then
+                # run sequentially, but every fold solve stays on the GPU.  The
+                # debias subset solve works unchanged because GpuSubsetOperator
+                # delegates to base.matvec/rmatvec.
+                for _o in owned:
+                    _o.close()
+                owned.clear()
+                del replicas[:]
+                print("[gpu_resident] full per-card replica does not fit (%s); "
+                      "falling back to ONE sharded operator across %d device(s) "
+                      "-- CV folds run sequentially, all solves stay on the GPU"
+                      % (_exc, len(devices)), flush=True)
+                op = GpuTwoLevelOperator(A, device_ids=list(devices),
+                                         host_factors=host_factors)
+                owned.append(op)
+        finally:
+            host_factors = None
+        print("[gpu_resident] factors ready on %d device(s) primary=%s shards=%d "
+              "dtype=%s estimated_peak_bytes=%d elapsed=%.2fs" %
+              (len(devices), op.device, op._n_shards, op._value_dtype,
+               op.estimated_peak_bytes, time.monotonic() - started), flush=True)
         torch = op.torch
-        yt = torch.as_tensor(np.asarray(y).ravel(), dtype=torch.float64, device=op.device)
+        yt = torch.as_tensor(np.asarray(y).ravel(), dtype=op._value_dtype, device=op.device)
         if yt.numel() != A.shape[0] or not bool(torch.isfinite(yt).all().item()):
             raise ValueError("target shape or finite values invalid")
         if self.standardize:
@@ -1885,7 +2476,7 @@ class GpuTwoLevelLassoCV(GpuLassoCV):
         pilot_info = None
         if self.adaptive:
             pilot, pilot_info = iterative_lstsq(op, yt, atol=min(self.tol, 1e-8), btol=min(self.tol, 1e-8), maxiter=self.max_iter)
-            pilot = torch.as_tensor(pilot, dtype=torch.float64, device=op.device)
+            pilot = torch.as_tensor(pilot, dtype=op._value_dtype, device=op.device)
             penalty_weights_t = torch.pow(pilot.abs() + self.eps, -self.gamma)
             if not bool(torch.isfinite(penalty_weights_t).all().item()):
                 raise RuntimeError("Resident GPU ALASSO pilot produced nonfinite penalty weights")
@@ -1908,7 +2499,6 @@ class GpuTwoLevelLassoCV(GpuLassoCV):
             amax = float(torch.max(torch.abs(g)).item()) / A.shape[0]
             if amax > 0 and np.isfinite(amax):
                 self.alphas = np.logspace(np.log10(amax) - self.decades, np.log10(amax), max(self.nalpha, len(self.alphas)))
-        splits = _make_cv_splits(A.shape[0], self.cv, self.rand_seed, self.group_size)
         cv_tol = float(os.environ.get("PHEASY_CV_TOL", str(max(self.tol, 1e-3))))
         # CV only needs the MSE *ranking* across alphas, not a tight solution per
         # alpha. The mid-grid alphas (the sparse->dense transition) converge
@@ -1918,18 +2508,15 @@ class GpuTwoLevelLassoCV(GpuLassoCV):
         cv_cap = int(os.environ.get("PHEASY_CV_MAX_ITER", str(min(self.max_iter, 400))))
         if cv_cap < 1 or cv_tol <= 0:
             raise ValueError("CV max_iter and tol must be positive")
-        # Replicate factors once per card, never once per fold. Copy primary
-        # normalization and power estimate to keep numerical setup identical.
-        # Every selected card must fit the FULL factors (preflighted on upload).
-        devices = devices[:max(1, len(splits))]
+        # Factors were replicated once per card at upload time, never once per
+        # fold. Copy primary normalization and power estimate to keep numerical
+        # setup identical. Every selected card fit the FULL factors (preflighted
+        # on its own upload).
         resources = [(op, yt, L)]
-        for dev in devices[1:]:
-            with _resident_device_context(dev):
-                replica = GpuTwoLevelOperator(A, device_id=dev)
-                owned.append(replica)
-                replica.scale = op.scale.to(dev).clone()
-                replica._norma = None
-                resources.append((replica, yt.to(dev), L.to(dev)))
+        for replica, dev in zip(replicas, devices[1:]):
+            replica.scale = op.scale.to(dev).clone()
+            replica._norma = None
+            resources.append((replica, yt.to(dev), L.to(dev)))
         self.cv_devices_ = [str(dev) for dev in devices]
         print("[gpu_resident] dynamic CV devices=%s folds=%d primary=%s" %
               (self.cv_devices_, len(splits), op.device), flush=True)
@@ -1968,7 +2555,13 @@ class GpuTwoLevelLassoCV(GpuLassoCV):
         mse = torch.stack([result[0].to(op.device) for result in results], dim=1)
         self.cv_solver_info_ = [result[1] for result in results]
         self.cv_fold_devices_ = [result[2] for result in results]
-        max_cv_iterations = max((info["n_iter"] for infos in self.cv_solver_info_ for info in infos), default=0)
+        _cv_infos = [info for infos in self.cv_solver_info_ for info in infos]
+        max_cv_iterations = max((info["n_iter"] for info in _cv_infos), default=0)
+        # [D1] "hit the cap" means "hit the cap without converging": a fold that
+        # converges exactly at the cap used to be reported as a convergence
+        # problem.  Mirror the dense path's definition.
+        _cv_hit_cap = any(info["n_iter"] >= cv_cap and not info.get("converged", False)
+                          for info in _cv_infos)
         for replica in owned[1:]:
             replica.close()
         resources.clear()
@@ -1978,6 +2571,19 @@ class GpuTwoLevelLassoCV(GpuLassoCV):
         # Match iterative selection: ascending argmin chooses the smallest
         # alpha on exact ties. Near-tie tolerance is diagnostic only.
         best_i = int(torch.argmin(means).item())
+        # PHEASY_LASSO_1SE: one-standard-error rule, mirroring GpuLassoCV and
+        # _reselect_alpha. It used to be ignored here, so the knob silently did
+        # nothing on the path the shipped GPU runner actually uses.
+        if os.environ.get("PHEASY_LASSO_1SE", "0").lower() in ("1", "true", "yes"):
+            means_cpu = _to_numpy(means, np.float64)
+            mse_cpu = _to_numpy(mse, np.float64)
+            se = float(mse_cpu[best_i].std(ddof=1) / np.sqrt(mse_cpu.shape[1])) \
+                if mse_cpu.shape[1] > 1 else 0.0
+            cand = np.flatnonzero(means_cpu <= means_cpu[best_i] + se)
+            best_i = int(cand[np.argmax(self.alphas[cand])])
+            print("[gpu_resident] PHEASY_LASSO_1SE: alpha* moved to %.6e "
+                  "(1 SE = %.3e above the CV minimum)" %
+                  (float(self.alphas[best_i]), se), flush=True)
         rtol = float(os.environ.get("PHEASY_LASSO_TIE_RTOL", "1e-9"))
         tied = means <= means[best_i] * (1 + rtol) + 1e-300
         self.alpha_ = float(self.alphas[best_i])
@@ -2005,16 +2611,37 @@ class GpuTwoLevelLassoCV(GpuLassoCV):
             device=str(op.device), dtype="float64", stage="regularized_refit_before_debias", tol=float(self.tol))
         self._alpha_at_min = best_i == 0
         self._alpha_at_min_flat = self._alpha_at_min and int(tied.sum().item()) > 1
-        self._alpha_at_min_hitcap = self._alpha_at_min_flat and max_cv_iterations >= cv_cap
+        self._alpha_at_min_hitcap = self._alpha_at_min_flat and _cv_hit_cap
         if retain_operator:
             # Keep the primary operator resident so the post-fit OLS debias can reuse
             # its factors (solve_resident_subset) instead of re-uploading the support.
             self._operator = op
             owned.clear()
         if self._alpha_at_min:
+            # Same four-way diagnosis as the dense path (it used to collapse
+            # into one generic sentence, losing the "lower PHEASY_CV_TOL / raise
+            # PHEASY_CV_MAX_ITER" guidance on the path the shipped runner uses).
             import warnings
-            warnings.warn("Resident LASSO selected grid minimum%s" %
-                          (" on a flat CV tail" if self._alpha_at_min_flat else ""), RuntimeWarning, stacklevel=2)
+            if self._alpha_at_min_hitcap:
+                warnings.warn(
+                    "Resident LASSO alpha* %.3e sits at the grid MINIMUM via a tie "
+                    "on a FLAT CV tail AND FISTA hit cv_max_iter (%d): this is a "
+                    "CONVERGENCE problem (lower PHEASY_CV_TOL / raise "
+                    "PHEASY_CV_MAX_ITER), not a model-density conclusion."
+                    % (self.alpha_, cv_cap), RuntimeWarning, stacklevel=2)
+            elif self._alpha_at_min_flat:
+                warnings.warn(
+                    "Resident LASSO alpha* %.3e sits at the grid MINIMUM on a flat "
+                    "CV tail, but FISTA already converged (max %d iters < %d): "
+                    "alpha* is not well-determined by CV (not a convergence problem)."
+                    % (self.alpha_, max_cv_iterations, cv_cap), RuntimeWarning, stacklevel=2)
+            else:
+                warnings.warn(
+                    "Resident LASSO alpha* %.3e sits at the grid MINIMUM; the CV "
+                    "curve is still falling at the low end, so widening the grid "
+                    "only pushes alpha* toward OLS. Treat this fit as effectively "
+                    "unregularized (compare with OLS/RFE)."
+                    % self.alpha_, RuntimeWarning, stacklevel=2)
         # Do not retain VRAM after the fit. Predict and optional debias use the
         # ordinary public host interface, explicitly outside the resident stage.
         return self

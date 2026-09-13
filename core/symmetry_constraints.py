@@ -5,6 +5,7 @@
 
 __all__ = ["SymmetryConstraints"]
 
+import os
 import pickle
 import datetime
 import itertools
@@ -336,8 +337,30 @@ class SymmetryConstraints(object):
                     nz = _np.nonzero(b)[0]
                     if nz.size == 0:
                         return ns  # constraint already satisfied
-                    # partial pivoting: largest |b| as pivot for stability
-                    pidx = int(nz[_np.argmax(_np.abs(b[nz]))])
+                    # partial pivoting: largest |b| as pivot for stability.
+                    # PHEASY_ASR_PIVOT=nnz (default max = current behaviour) picks a
+                    # fill-in aware pivot: max |b| maximises stability but ignores
+                    # fill-in, and nnz(ns) grows 68k -> 5.5M over the 42444 ASR rows
+                    # (measured: Mg4C60, 512-atom supercell, c3=4.0 A).  Among the
+                    # top-N |b| entries (all >= 1% of the maximum) take the column
+                    # with the fewest stored entries.  Full-length benchmark on that
+                    # problem: 520 s -> 227 s, final nnz 5.49M -> 2.46M, identical
+                    # eliminated/skipped counts, and an end-to-end fit (same dataset,
+                    # same settings) identical to 1e-11 in relative error and min
+                    # frequency.
+                    _absb = _np.abs(b[nz])
+                    if (_os.environ.get("PHEASY_ASR_PIVOT", "max").lower() == "nnz"
+                            and nz.size > 1):
+                        _topk = int(_os.environ.get("PHEASY_ASR_PIVOT_TOPK", "64"))
+                        _ord = _np.argsort(-_absb)[:max(1, _topk)]
+                        _cand = nz[_ord]
+                        _cand = _cand[_absb[_ord] >= 1e-2 * _absb.max()]
+                        if _cand.size == 0:
+                            _cand = nz[_ord[:1]]
+                        _lens = ns.indptr[_cand + 1] - ns.indptr[_cand]
+                        pidx = int(_cand[int(_np.argmin(_lens))])
+                    else:
+                        pidx = int(nz[_np.argmax(_absb)])
                     pv = b[pidx]
                     # Conservative skip heuristic: |pivot| < eps treats the row
                     # as already satisfied.  eps is the CLI --eps rank tolerance
@@ -409,9 +432,18 @@ class SymmetryConstraints(object):
                     # must equal total_rows unless the loop early-broke at 0 cols.
                     _res = 0.0
                     if ns_mat.shape[1] > 0:
-                        for _cm in cons_asr:
-                            if _cm.shape[0] > 0:
-                                _res = max(_res, float(abs(_cm.dot(ns_mat)).max()))
+                        # [PATCH verify-vstack] same quantity, far cheaper: on the
+                        # real Mg4C60 objects (1572 blocks, nnz(ns)=246k) 1.6 s ->
+                        # 0.006 s (267x) for the max|C@ns| self-check.
+                        if len(cons_asr) > 1:
+                            _blocks = [_c for _c in cons_asr if _c.shape[0] > 0]
+                            _stack = (_sp.vstack(_blocks, format="csr")
+                                      if len(_blocks) > 1 else _blocks[0])
+                        else:
+                            _stack = cons_asr[0]
+                        _prod = _stack.dot(ns_mat) if _stack.shape[0] else None
+                        if _prod is not None and _prod.nnz:
+                            _res = float(_np.abs(_prod.data).max())
                     print(f'[ASR] done: n_free={ns_mat.shape[1]}, '
                           f'eliminated={_eliminated}, skipped={_skipped}, '
                           f'max|C@ns|={_res:.2e}', flush=True)
@@ -823,7 +855,14 @@ class SymmetryConstraints(object):
                 cons_list.append(cons_mat)
                 nac_sum_list.append(nac_sum)
 
-        np.save("rasr.npy", cons_mat)
+            # [FIX] a stray np.save("rasr.npy", cons_mat) used to sit here, OUTSIDE
+            # the BH/BHH branch: with --rasr H (which skips the loop above) it
+            # raised UnboundLocalError on cons_mat -- the documented value H was
+            # therefore dead -- and with BH/BHH it silently dropped a debug file
+            # into the working directory on every -c run.  Removed entirely; use
+            # PHEASY_ASR_DUMP=1 if the per-atom blocks are ever needed again.
+            if os.environ.get("PHEASY_ASR_DUMP", "0").lower() in ("1", "true", "yes", "on"):
+                np.save("rasr.npy", cons_mat)
 
         if self._rasr in ["H", "BHH"]:
             """Huang conditions for vanishing external stress"""

@@ -296,7 +296,11 @@ class ForceConstants(object):
             if _os.path.isfile(nl_file):
                 try:
                     cand = NeighborList.read(nl_file)
-                    if list(cand.supercell) == list(getattr(scell, "supercell", [2, 2, 2])):
+                    # [FIX] DIM alone does not identify the structure: the pickle
+                    # also carries the lattice and per-atom WS offsets, so a
+                    # same-DIM structure change must rebuild it (see
+                    # NeighborList.matches).
+                    if cand.matches(scell):
                         nn_list = cand
                 except Exception:
                     nn_list = None

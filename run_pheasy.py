@@ -283,10 +283,13 @@ class WorkFlow(object):
 
         if os.path.isfile(self.NeighborListFile):
             nn_list = NeighborList.read(self.NeighborListFile)
-            if list(nn_list.supercell) != settings.DIM:
+            # [FIX] only DIM was compared, so a same-DIM structure change (POSCAR
+            # edited in place, run directory copied) silently reused the stale
+            # lattice / WS offsets / neighbour distances from the old structure.
+            if not nn_list.matches(self.scell):
                 logger.warning(
-                    "System dimension defined in neighbor list file"
-                    + " is not consistent with DIM."
+                    "neighbor_list.pkl was built from a different structure "
+                    "(lattice, atom positions or DIM differ); rebuilding it."
                 )
                 nn_list = NeighborList(
                     self.scell, self.pcell.symops["equivalent_atoms"]
@@ -311,6 +314,99 @@ class WorkFlow(object):
         self.cutoffs = cutoffs
         self.nn_list = nn_list
 
+    def _cache_fingerprint(self):
+        """Fingerprint of everything that shapes cs.pkl / ns_*.npz.
+
+        The fit stage (-f) never rebuilds anything: it consumes whatever cached
+        artefacts sit in the directory, and nothing used to compare them with
+        the settings actually requested.  Passing a different --c2/--c3/--nbody/
+        --symprec to -c or -f therefore silently reused the OLD cluster space /
+        null space and returned force constants for the old model, with exit 0.
+        """
+        settings = self.settings
+
+        def _content_sig(name):
+            # CONTENT, not mtime: -s rewrites SPOSCAR, so an mtime-based
+            # fingerprint would differ between stages and flag a perfectly good
+            # cache as stale.
+            try:
+                import hashlib as _hashlib
+                with open(name, "rb") as _fh:
+                    return _hashlib.sha256(_fh.read()).hexdigest()[:32]
+            except OSError:
+                return None
+
+        return {
+            "max_order": int(settings.MAX_ORDER),
+            "nbody": sorted(int(x) for x in settings.NBODY),
+            # The RAW CUT settings (not self.cutoffs): the resolved values are
+            # only available in the stages that build the neighbour list, so
+            # they are not comparable across stages.
+            "cuts": {str(n): (None if getattr(settings, "CUT" + str(n), None) is None
+                              else float(getattr(settings, "CUT" + str(n))))
+                     for n in range(2, int(settings.MAX_ORDER) + 1)},
+            "dim": [int(x) for x in settings.DIM],
+            "symprec": float(getattr(settings, "SYMPREC", float("nan"))),
+            "eps": float(settings.EPS),
+            "crys_basis": bool(settings.CRYS_BASIS),
+            # rasr / do_rasr / nac are deliberately NOT part of the fingerprint:
+            # the shipped driver passes them only on the FIT command line, so a
+            # cached cluster space / null space is always built with them at their
+            # defaults and comparing them here produced a false "stale cache"
+            # refusal on every run (measured on the c2=7.0 fit).  They cannot have
+            # shaped the cache, so they must not gate it.
+            "poscar": _content_sig("POSCAR"),
+            "sposcar": _content_sig("SPOSCAR"),
+        }
+
+    def _check_cache_fingerprint(self, path, what):
+        """Return True when the cached artefact is certified for these settings.
+
+        A missing sidecar is reported but tolerated (it would otherwise break
+        every existing directory); a present-but-different sidecar is fatal,
+        because that is the silent-wrong-model case.  Re-run the stage that
+        builds it (or set PHEASY_ALLOW_STALE_CACHE=1 for diagnostics).
+        """
+        import json as _json
+        meta_path = path + ".meta.json"
+        if not os.path.isfile(meta_path):
+            logger.warning(
+                "%s (%s) has no sidecar %s.meta.json: cannot certify that it "
+                "matches the requested cutoffs/settings. Re-run the stage that "
+                "builds it if anything changed." % (path, what, path))
+            return True
+        try:
+            with open(meta_path) as _fh:
+                old = _json.load(_fh)
+        except Exception as _e:
+            logger.warning("%s is unreadable (%s); ignoring it" % (meta_path, _e))
+            return True
+        now = self._cache_fingerprint()
+        # Compare only the keys this build writes: a sidecar produced by an
+        # earlier version carries extra keys (e.g. rasr/do_rasr/nac used to be
+        # fingerprinted), which made the plain dict comparison fail with an EMPTY
+        # diff list -- a false "stale cache" refusal on every run.
+        diff = [k for k in now if old.get(k) != now[k]]
+        if diff:
+            logger.error(
+                "%s (%s) was built for DIFFERENT settings: %s changed. Refusing "
+                "to reuse it. Re-run the stage that builds it (e.g. -s / -c), or "
+                "set PHEASY_ALLOW_STALE_CACHE=1 to use it anyway (diagnostics "
+                "only -- the result would describe the old model)." % (path, what, diff))
+            if os.environ.get("PHEASY_ALLOW_STALE_CACHE", "0").lower() not in ("1", "true", "yes", "on"):
+                raise RuntimeError(
+                    "stale %s: %s differ from the settings used to build it"
+                    % (what, diff))
+        return True
+
+    def _write_cache_fingerprint(self, path):
+        import json as _json
+        try:
+            with open(path + ".meta.json", "w") as _fh:
+                _json.dump(self._cache_fingerprint(), _fh, indent=1, sort_keys=True)
+        except Exception as _e:
+            logger.warning("could not write %s.meta.json (%s)" % (path, _e))
+
     def run_cluster_expansion(self):
         """Generate cluster-orbit space CS_full."""
         settings = self.settings
@@ -332,6 +428,7 @@ class WorkFlow(object):
             )
             CS_full = CS_generator.generate_represent_clusters_with_orbit()
             CS_full.write(self.ClusterSpaceFile)
+            self._write_cache_fingerprint(self.ClusterSpaceFile)
             end_time_sub = datetime.datetime.now()
             time_cost = end_time_sub - start_time_sub
             logger.info(
@@ -344,6 +441,7 @@ class WorkFlow(object):
                     "Reading and generating cluster space from file, "
                     + f"up to {settings.MAX_ORDER}-order."
                 )
+                self._check_cache_fingerprint(self.ClusterSpaceFile, "cluster space")
                 CS_full = ClusterSpace.read(self.ClusterSpaceFile)
                 CS_full.print_cluster_space_info()
             else:
@@ -362,6 +460,7 @@ class WorkFlow(object):
                 )
                 CS_full = CS_generator.generate_represent_clusters_with_orbit()
                 CS_full.write(self.ClusterSpaceFile)
+                self._write_cache_fingerprint(self.ClusterSpaceFile)
 
         self.CS_full = CS_full
 
@@ -388,6 +487,10 @@ class WorkFlow(object):
                 eps=settings.EPS,
             )
             self.NS_full = symmetry_constraints.impose_symmtery_constaints(self.CS_full)
+            # Provenance for the -f stage: it loads ns_harm.npz / ns_anharm*.npz
+            # with no metadata at all, so a different --c2/--c3/--eps/--rasr
+            # silently reused the old basis.
+            self._write_cache_fingerprint("ns_harm.npz")
             if settings.WRITE_SYM_CONS:
                 symmetry_constraints.write(self.ConstraintsFile)
 
@@ -403,6 +506,8 @@ class WorkFlow(object):
                 logger.info(
                     "Reconstructing null space of symmetry constraints from file."
                 )
+                if os.path.isfile("ns_harm.npz"):
+                    self._check_cache_fingerprint("ns_harm.npz", "null space")
                 self.NS_full = SymmetryConstraints.construct_null_space_restart(
                     settings.MAX_ORDER
                 )
@@ -496,7 +601,10 @@ class WorkFlow(object):
                     )
                     for n in range(settings.NDATA):
                         filename = filename_pattern.format(n + 1)
-                        disp_scell = move_atoms_simple(self.scell, settings.U_VAL)
+                        disp_scell = move_atoms_simple(
+                            self.scell, settings.U_VAL,
+                            seed=None if settings.RAND_SEED is None
+                            else int(settings.RAND_SEED) + n)
                         disp_scell.automatic_write(filename, file_format)
                         u_vecs = disp_scell.get_atomic_displacements()
                         logger.info(
@@ -693,9 +801,21 @@ class WorkFlow(object):
                 with open("force_matrix.pkl", "rb") as file:
                      f_matrix = pickle.load(file)
                      f_matrix_use = []
+                     _n_avail = int(f_matrix.shape[0])
+                     if _n_avail < settings.NDATA:
+                         logger.warning("- force_matrix.pkl holds %d of %d requested "
+                                        "configurations; using the first %d"
+                                        % (_n_avail, settings.NDATA, _n_avail))
                      for n in range(settings.NDATA):
-                        if n >= f_matrix.shape[0]:
+                        if n >= _n_avail:
                             break
+                        # [FIX] --exclude was applied to SM_prime only: FM kept all
+                        # NDATA configurations, so the fit died with "Shape
+                        # mismatch: a and b should have the same number of rows".
+                        # The pre-pickle reader did filter here; the filter was
+                        # lost in the move to force_matrix.pkl.
+                        if (n + 1) in ex_set:
+                            continue
                         f_matrix_new = f_matrix[n,:,:]
                         f_matrix_use.append(f_matrix_new)
                 FM = np.vstack(f_matrix_use).flatten().astype(_sm_dtype())
@@ -1330,6 +1450,18 @@ class WorkFlow(object):
                 ).format(settings.MODEL)
                 logger.error(_msg)
                 raise ValueError(_msg)
+            # Safety default.  The 3*natom rows of one configuration are highly
+            # correlated, so an UNGROUPED cross-validation puts rows of the same
+            # configuration into both folds -- that leaks, biases the selected
+            # alpha toward 0 (measured on Mg4C60: alpha* pinned at the grid
+            # minimum, 8.2 % relative error) and inflates the reported CV score.
+            # Group by configuration unless the caller set it explicitly.
+            if not os.environ.get("PHEASY_CV_GROUP_SIZE"):
+                _gs = 3 * self.scell.get_global_number_of_atoms()
+                os.environ["PHEASY_CV_GROUP_SIZE"] = str(_gs)
+                logger.info("Cross-validation grouped by configuration "
+                            "(PHEASY_CV_GROUP_SIZE=%d); set that variable to "
+                            "override." % _gs)
             rank = SM.shape[1]
             optimizer.fit(SM, FM)
             fit_results = optimizer.results
@@ -1440,6 +1572,51 @@ class WorkFlow(object):
                     raise RuntimeError("fit did not meet convergence acceptance criteria: %s" % _status)
                 logger.warning("PHEASY_ALLOW_UNACCEPTED_FIT=1: writing diagnostic, uncertified force constants")
 
+            # [fit-alignment] GATE, evaluated BEFORE anything is written.
+            # The model must reproduce the forces config-by-config; a correlation
+            # below PHEASY_ALIGN_MIN_CORR (default 0.99) means the dataset is in a
+            # different supercell atom order than the sensing matrix (pheasy groups
+            # supercell atoms per primitive atom; ASE repeat() interleaves per
+            # image -- see AGENTS.md), or the data/model is broken.  This used to
+            # be a log WARNING printed AFTER the IFC files had been written, so a
+            # batch pipeline published wrong force constants and still exited 0.
+            _align_min = float(os.environ.get("PHEASY_ALIGN_MIN_CORR", "0.99"))
+            _align_n = int(os.environ.get("PHEASY_ALIGN_CONFIGS", "5"))
+            _worst = None
+            try:
+                if FM is not None:
+                    _n3 = 3 * natoms
+                    _n_cfg = SM.shape[0] // _n3
+                    _fit_prediction = np.asarray(optimizer.predict(SM)).ravel()
+                    _worst = 1.0
+                    for _k in np.linspace(0, _n_cfg - 1, max(1, min(_align_n, _n_cfg))).astype(int):
+                        _r = slice(int(_k) * _n3, (int(_k) + 1) * _n3)
+                        _fp = _fit_prediction[_r]
+                        _fa = FM[_r]
+                        _c = float(np.corrcoef(_fa, _fp)[0, 1])
+                        _worst = min(_worst, _c)
+                        if _c < _align_min:
+                            logger.warning("[fit] config %d corr=%.4f -- possible "
+                                          "supercell atom-order mismatch" % (_k, _c))
+            except Exception as _e:
+                _worst = None
+                logger.warning("[fit] alignment check could NOT run (%s) -- "
+                              "atom order UNVERIFIED" % _e)
+            if _worst is not None and _worst < _align_min:
+                logger.error("[fit] worst per-config force correlation %.4f < %.4f: the "
+                             "dataset and the sensing matrix disagree on the supercell "
+                             "atom order (or the data/model is broken); refusing to "
+                             "write force constants. Re-prepare the dataset in the "
+                             "pheasy atom order, or set PHEASY_ALLOW_UNALIGNED_FIT=1 "
+                             "for diagnostic output only." % (_worst, _align_min))
+                if os.environ.get("PHEASY_ALLOW_UNALIGNED_FIT", "0").lower() not in ("1", "true", "yes", "on"):
+                    raise RuntimeError(
+                        "post-fit alignment check failed (worst per-config force "
+                        "correlation %.4f < %.4f); refusing to write force constants"
+                        % (_worst, _align_min))
+            elif _worst is not None:
+                logger.info("[fit] alignment check OK (worst corr=%.4f)" % _worst)
+
             if settings.FIX_FC2:
                 APhi = NS_anharm.dot(fit_results["coef"])
                 np.savez_compressed(self.AForceConstantArrayFile, Phi=APhi)
@@ -1450,35 +1627,6 @@ class WorkFlow(object):
                 Phi = self.NS_full.dot(fit_results["coef"])
                 np.savez_compressed(self.ForceConstantArrayFile, Phi=Phi)
                 FC_model.set_force_constants(Phi)
-
-            # [fit-alignment] post-fit sanity: the model must reproduce the
-            # forces config-by-config. corr < 0.99 = atom-order mismatch
-            # (pheasy groups supercell atoms per primitive atom; ASE
-            # repeat() interleaves per image -- see AGENTS.md). Cheap.
-            try:
-                if Phi is not None and FM is not None:
-                    _n3 = 3 * natoms
-                    _n_cfg = SM.shape[0] // _n3
-                    _fit_prediction = np.asarray(optimizer.predict(SM)).ravel()
-                    _worst = 1.0
-                    for _k in np.linspace(0, _n_cfg - 1, min(5, _n_cfg)).astype(int):
-                        _r = slice(int(_k) * _n3, (int(_k) + 1) * _n3)
-                        _fp = _fit_prediction[_r]
-                        _fa = FM[_r]
-                        _c = float(np.corrcoef(_fa, _fp)[0, 1])
-                        _worst = min(_worst, _c)
-                        if _c < 0.99:
-                            logger.warning("[fit] config %d corr=%.4f -- possible "
-                                          "supercell atom-order mismatch" % (_k, _c))
-                    if _worst < 0.99:
-                        logger.warning("[fit] low force correlation (worst corr=%.4f); "
-                                       "check atom order, data quality and model residuals" % _worst)
-                    else:
-                        logger.info("[fit] alignment check OK (worst corr=%.4f over %d "
-                                    "sampled configs)" % (_worst, min(5, _n_cfg)))
-            except Exception as _e:
-                logger.warning("[fit] alignment check could NOT run (%s) -- "
-                              "atom order UNVERIFIED" % _e)
 
             # [FIX P22] phi.npz (written just above) already carries the full
             # IFC vector; fc*.hdf5 is only its expansion over atom triplets and

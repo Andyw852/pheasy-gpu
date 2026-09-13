@@ -808,6 +808,41 @@ class NeighborList(object):
         with open(filename, "wb") as fd:
             pickle.dump(self, fd)
 
+    def matches(self, scell, eps=1e-8):
+        """True when this list was built from the given supercell.
+
+        The pickle carries the lattice, scaled positions, WS offsets and
+        neighbour distances computed at BUILD time, but callers only compared
+        DIM, so editing POSCAR in place (or copying a run directory) silently
+        reused Wigner-Seitz offsets and neighbour distances from the OLD
+        structure -- and every cluster/symmetry/ASR constraint afterwards was
+        built from mixed geometry.
+
+        Positions are compared modulo a lattice translation (wrapping is not a
+        structural change); atom ORDER is significant because ws_offsets and
+        nn_dists are per-atom.
+        """
+        try:
+            if (list(np.asarray(self._supercell).ravel())
+                    != list(np.asarray(scell.supercell).ravel())):
+                return False
+            cell_new = np.asarray(scell.cell.real, dtype=float)
+            cell_old = np.asarray(self._cell, dtype=float)
+            if cell_old.shape != cell_new.shape:
+                return False
+            if not np.allclose(cell_old, cell_new, rtol=0.0, atol=eps):
+                return False
+            pos_old = np.asarray(self._positions, dtype=float)
+            pos_new = np.asarray(scell.scaled_positions, dtype=float)
+            if pos_old.shape != pos_new.shape:
+                return False
+            delta = pos_old - pos_new
+            delta -= np.round(delta)
+            return bool(np.allclose(delta, 0.0, rtol=0.0, atol=eps))
+        except Exception:
+            # Anything unexpected means "cannot certify" -> rebuild.
+            return False
+
     @staticmethod
     def read(filename="neighbor_list.pkl"):
         """Read and create NeighborList object from pickle file.

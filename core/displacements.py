@@ -23,7 +23,7 @@ from pheasy_gpu.structure.atoms import Atoms
 from pheasy_gpu.basic_io import logger
 
 
-def move_atoms_simple(struct, u_val):
+def move_atoms_simple(struct, u_val, seed=None):
     """Randomly move each atom in supercell by a magnitude of displacement.
 
     It will displace all of atoms in the input supercell in a random
@@ -45,7 +45,12 @@ def move_atoms_simple(struct, u_val):
 
     natoms = struct.get_global_number_of_atoms()
     disp_struct = deepcopy(struct)
-    u_vecs = np.random.uniform(-1, 1, (natoms, 3))
+    # [FIX] the global np.random stream was used, and NOTHING in the package seeds
+    # it, so the randomly displaced configurations -- i.e. the entire fit input --
+    # were not reproducible from --seed, although basic_io --help promises they
+    # are.  seed=None keeps the legacy behaviour for library callers.
+    _rng = np.random if seed is None else np.random.default_rng(int(seed))
+    u_vecs = _rng.uniform(-1, 1, (natoms, 3))
     u_vecs = u_val * u_vecs / np.linalg.norm(u_vecs, axis=1).reshape(-1, 1)
     disp_struct.positions += u_vecs
     disp_struct.set_atomic_displacements(u_vecs)
