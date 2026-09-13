@@ -991,10 +991,56 @@ class WorkFlow(object):
                 else:
                     # PATCH (fix_fc2 path): parallel sparse.dot + disk cache for
                     # SM = SM3_prime @ NS_anharm. Same logic as simultaneous path.
-                    import numpy as _np_p, os as _os_p
+                    import numpy as _np_p, os as _os_p, json as _json_p
                     _SM_F = 'sm_dense_fixfc2.npy'
+                    _SM_META_F = _SM_F + '.meta.json'
                     _exp_fix = (SM3_prime.shape[0], NS_anharm.shape[1])
                     _force_fix = _os_p.environ.get('FORCE_REBUILD','false').lower()=='true'
+                    # [FIX P02b] The main sm_dense.npy cache got a provenance
+                    # sidecar in [FIX P02]; this fix_fc2 variant kept the old
+                    # shape+dtype-only key, so a copy of the directory, a new
+                    # displacement set or a different cutoff silently reused a
+                    # stale SM and produced a confident wrong fit. Hash the
+                    # source file stat plus head/tail digests of both factors.
+                    def _fix_fp():
+                        import hashlib as _hl
+
+                        def _digest(obj, limit=4096):
+                            _h = _hl.sha256()
+                            if _sp_p.issparse(obj):
+                                _h.update(str(getattr(obj, 'format', '?')).encode())
+                                for _n in ('data', 'indices', 'indptr', 'row', 'col'):
+                                    _b = getattr(obj, _n, None)
+                                    if _b is None:
+                                        continue
+                                    _b = _np_p.asarray(_b).ravel()
+                                    _h.update(_np_p.ascontiguousarray(_b[:limit]).tobytes())
+                                    _h.update(_np_p.ascontiguousarray(_b[-limit:]).tobytes())
+                            else:
+                                _b = _np_p.asarray(obj).ravel()
+                                _h.update(_np_p.ascontiguousarray(_b[:limit]).tobytes())
+                                _h.update(_np_p.ascontiguousarray(_b[-limit:]).tobytes())
+                            return _h.hexdigest()
+
+                        _src = getattr(self, 'SensingMatrixFile', 'sm_prime.npz')
+                        try:
+                            _st = _os_p.stat(_src)
+                            _src_sig = [_src, int(_st.st_size), int(_st.st_mtime_ns)]
+                        except OSError:
+                            _src_sig = [_src, -1, -1]
+                        return {
+                            'src': _src_sig,
+                            'smp3_shape': list(SM3_prime.shape),
+                            'smp3_nnz': int(getattr(SM3_prime, 'nnz', -1)),
+                            'smp3_digest': _digest(SM3_prime),
+                            'ns_shape': list(NS_anharm.shape),
+                            'ns_digest': _digest(NS_anharm),
+                            'excluded_configs': sorted(ex_set),
+                            'dtype': _np_p.dtype(_np_p.float32).name,
+                            'ndata': int(settings.NDATA),
+                        }
+
+                    _fp_fix = _fix_fp()
                     _hit_fix = (not _force_fix) and _os_p.path.exists(_SM_F)
                     if _hit_fix:
                         try:
@@ -1007,6 +1053,22 @@ class WorkFlow(object):
                                 del _chk
                         except Exception as _e:
                             print(f'[SM-cache fix_fc2] read fail: {_e}, rebuild', flush=True)
+                            _hit_fix = False
+                    if _hit_fix:
+                        try:
+                            with open(_SM_META_F) as _fh:
+                                _fp_old_fix = _json_p.load(_fh)
+                        except Exception:
+                            _fp_old_fix = None
+                        if _fp_old_fix != _fp_fix:
+                            if _fp_old_fix is None:
+                                print('[SM-cache fix_fc2] no fingerprint sidecar '
+                                      f'({_SM_META_F}), rebuild to be safe', flush=True)
+                            else:
+                                _diff_fix = [k for k in _fp_fix
+                                             if _fp_old_fix.get(k) != _fp_fix[k]]
+                                print(f'[SM-cache fix_fc2] STALE: source changed '
+                                      f'{_diff_fix}, rebuild', flush=True)
                             _hit_fix = False
                     if _hit_fix:
                         import time as _ts
@@ -1042,6 +1104,8 @@ class WorkFlow(object):
                               f'({SM.nbytes/1e9:.1f} GB)...', flush=True)
                         try:
                             _np_p.save(_SM_F, SM)
+                            with open(_SM_META_F, 'w') as _fh:   # [FIX P02b]
+                                _json_p.dump(_fp_fix, _fh)
                             print(f'[SM-cache fix_fc2] saved in {_ts.time()-_t0:.1f}s', flush=True)
                         except Exception as _e:
                             print(f'[SM-cache fix_fc2] save fail: {_e}', flush=True)

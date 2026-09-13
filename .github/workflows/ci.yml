@@ -1,0 +1,48 @@
+name: CI
+
+# CPU-only CI.
+#
+# What this runs: install the package, a syntax/undefined-name lint gate, and an
+# import smoke test.
+#
+# What this does NOT run: the dev/ suite.  dev/ mixes CPU-only unit tests with
+# tests that require a live CUDA device, a multi-GPU host and a prepared pheasy
+# dataset (sm_prime.npz / fm1d.npz); GitHub runners have none of those, so a
+# bare `pytest` here would be red for reasons unrelated to the change.  The
+# suite is run on the 3x RTX 3090 host instead -- see GPU.md ("GPU acceleration
+# status") for the counts and the command line.
+#
+# The previous revision called `conda env update --file environment.yml`, but no
+# environment.yml exists in this repository, so the job failed at its first
+# step.  Dependencies are declared once, in pyproject.toml.
+
+on: [push, pull_request]
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    strategy:
+      max-parallel: 5
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up Python 3.11
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        python -m pip install -e .
+        python -m pip install flake8 pytest
+    - name: Lint with flake8
+      run: |
+        # stop the build if there are Python syntax errors or undefined names
+        flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+        # exit-zero treats all errors as warnings.
+        flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+    - name: Import smoke test (no CUDA, no dataset)
+      run: |
+        python -c "import pheasy_gpu, pheasy_gpu.core.optimizer, pheasy_gpu.core.gpu_backend; print('import ok')"
+    - name: Compile every module
+      run: python -m compileall -q core interface structure run_pheasy.py
