@@ -1149,30 +1149,6 @@ def _ridge_solve(A, y, alpha, x0=None):
         atol = float(_lsmr_tol("PHEASY_LSQR_ATOL", 1e-8))
         btol = float(_lsmr_tol("PHEASY_LSQR_BTOL", 1e-8))
         maxiter = int(os.environ.get("PHEASY_LSQR_MAXITER", "5000"))
-        if os.environ.get("PHEASY_RIDGE_OP_PROBE") == "1" \
-                and not globals().get("_RIDGE_OP_PROBED"):
-            globals()["_RIDGE_OP_PROBED"] = True
-            import time as _tp
-            _prng = np.random.default_rng(0)
-            _t0p = _tp.time()
-            _v = _prng.standard_normal(op.shape[1])
-            _v /= float(np.linalg.norm(_v))
-            _lam = 0.0
-            for _i in range(30):
-                _wv = np.asarray(op.rmatvec(op.matvec(_v)), dtype=np.float64).ravel()
-                _nv = float(np.linalg.norm(_wv))
-                if _nv == 0.0:
-                    break
-                _v = _wv / _nv
-                _lam = _nv
-            _acc = []
-            for _i in range(20):
-                _z = _prng.integers(0, 2, size=op.shape[1]).astype(np.float64) * 2.0 - 1.0
-                _az = np.asarray(op.matvec(_z), dtype=np.float64).ravel()
-                _acc.append(float(np.dot(_az, _az)))
-            print("[RIDGE-OP] shape=%s sigma_max=%.6e ||op||_F~%.6e ||b||=%.6e (%.1fs)"
-                  % (op.shape, float(np.sqrt(_lam)), float(np.sqrt(np.mean(_acc))),
-                     float(np.linalg.norm(y_aug)), _tp.time() - _t0p), flush=True)
         import time as _tr
         _t_r = _tr.time()
         res = _lsmr(op, y_aug, atol=atol, btol=btol, maxiter=maxiter, x0=x0)
