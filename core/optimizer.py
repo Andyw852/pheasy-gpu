@@ -3241,11 +3241,24 @@ class Optimizer(object):
                         else:
                             errs = [_fold_rmse(a, k) for k in range(len(splits))]
                         mse_path[j] = errs
+                        # ||c|| rides along for free: _fold_rmse already kept the
+                        # fold coefficients in warm[], and printing their norms
+                        # gives the ||c(alpha)|| half of the L-curve without
+                        # solving anything extra.  Without it the ridge knee can
+                        # only be read off the CV curve, which -- as measured on
+                        # the c6.5/c3=4.5 fit -- has no turning point at all,
+                        # while the actual tolerance drifts 7.7x looser as alpha
+                        # falls (LSMR's normA is a partial bidiagonalisation sum
+                        # that loses orthogonality in float32, so istop=2 is not
+                        # the certificate it looks like).
                         print("[RIDGE-CV] alpha %d/%d = %.3e | fold_mse %s | mean %.6e"
-                              " | %.1fs (total %.1fs)"
+                              " | ||c|| %s | %.1fs (total %.1fs)"
                               % (j + 1, len(alphas), float(a),
                                  " ".join("%.6e" % float(e) for e in errs),
-                                 float(np.mean(errs)), _time.time() - _t_one,
+                                 float(np.mean(errs)),
+                                 " ".join("n/a" if c is None else "%.4e" % float(np.linalg.norm(c))
+                                          for c in warm),
+                                 _time.time() - _t_one,
                                  _time.time() - _t_alpha0), flush=True)
                 best_alpha = float(alphas[int(np.argmin(mse_path.mean(axis=1)))])
                 # L-curve.  The CV curve says which alpha predicts best; it does
