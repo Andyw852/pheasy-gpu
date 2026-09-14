@@ -1113,15 +1113,33 @@ def _ridge_solve(A, y, alpha, x0=None):
             try:
                 from . import gpu_backend as _gb
                 if _gb.enabled() and _gb.available():
-                    gpu_op = _gb.GpuTwoLevelOperator(A)
-                    try:
-                        coef, info = _gb.iterative_ridge(
-                            gpu_op, y64, alpha,
-                            atol=float(_lsmr_tol("PHEASY_LSQR_ATOL", 1e-8)),
-                            btol=float(_lsmr_tol("PHEASY_LSQR_BTOL", 1e-8)),
-                            maxiter=int(os.environ.get("PHEASY_LSQR_MAXITER", "5000")))
-                    finally:
-                        gpu_op.close()
+                    # Build the resident operator ONCE per operator object, not once
+                    # per (alpha, fold).  The CV sweep calls _ridge_solve
+                    # len(alphas) x len(folds) times -- 21 on the c6.5/c3=4.5 fit --
+                    # and every build uploads the whole factor set, so a per-call
+                    # build makes the resident path slower than CPU LSMR no matter
+                    # how fast CGLS is.  The operator is intentionally NOT closed
+                    # here: it lives as long as the fold operator that produced it
+                    # (one per CV fold), which bounds the residency at len(folds)
+                    # replicas instead of len(alphas) x len(folds) uploads.
+                    #
+                    # device_ids spreads the factors over the selected cards.  The
+                    # sharded layout is the one the matvec/rmatvec/col-norm gates
+                    # cover; omitting it silently pinned resident RIDGE to one card
+                    # while PHEASY_GPU_SM used three.
+                    gpu_op = getattr(A, "_gpu_ridge_op", None)
+                    if gpu_op is None:
+                        gpu_op = _gb.GpuTwoLevelOperator(
+                            A, device_ids=_gb.resident_device_ids())
+                        try:
+                            A._gpu_ridge_op = gpu_op
+                        except Exception:
+                            pass          # read-only operator: fall back to rebuild
+                    coef, info = _gb.iterative_ridge(
+                        gpu_op, y64, alpha,
+                        atol=float(_lsmr_tol("PHEASY_LSQR_ATOL", 1e-8, A)),
+                        btol=float(_lsmr_tol("PHEASY_LSQR_BTOL", 1e-8, A)),
+                        maxiter=int(os.environ.get("PHEASY_LSQR_MAXITER", "5000")))
                     A._gpu_solver_info = _iterative_solver_info(info, "GPU CGLS-RIDGE")
                     return np.asarray(coef, dtype=np.float64)
             except Exception as exc:
