@@ -2069,6 +2069,16 @@ def _iterative_ridge_tensor(A, y, alpha, atol=1e-8, btol=1e-8, maxiter=5000, row
             self.shape = (A.shape[0] + A.shape[1], A.shape[1])
             self.torch = torch
             self.device = dev
+            # Carry the factor dtype through the wrapper.  _iterative_lstsq_tensor
+            # (and _operator_norm_estimate, which norm_estimate() calls before the
+            # loop) both read getattr(A, "_value_dtype", None) or torch.float64 --
+            # without this the augmented operator fell back to float64 while
+            # GpuTwoLevelOperator keeps float32 factors for an fp32 sensing matrix,
+            # so every A.matvec() became a mixed-dtype torch.sparse.mm and cuSPARSE
+            # rejected it with "operation not supported".  That is what killed
+            # PHEASY_GPU_RIDGE_RESIDENT=1 on the c6.5/c3=4.5 fit (twice), and it is
+            # the same omission as GpuSubsetOperator._value_dtype.
+            self._value_dtype = _vd
         def norm_estimate(self, iters=10):
             if getattr(self, "_norma", None) is None:
                 self._norma = _operator_norm_estimate(self, iters)
