@@ -2990,16 +2990,38 @@ class Optimizer(object):
             try:
                 from . import gpu_backend as _gb
                 jacobi = _use_jacobi
-                if ridge > 0 or jacobi:
-                    self._ols_gpu_fallback_reason = "Resident OLS does not implement ridge/Jacobi options; preserving CPU semantics"
-                if _gb.enabled() and ridge <= 0 and not jacobi:
+                # Jacobi is now implemented ON the resident operator rather than
+                # used as a reason to skip it.  Jacobi is an exact change of
+                # variables: solve (A D) z = y with D = diag(1/||A[:,j]||), then
+                # x = D z.  GpuTwoLevelOperator.matvec already computes
+                # A (v / scale) and rmatvec computes (A^T u) / scale, i.e. it IS
+                # the scaled operator once scale holds the column norms -- so the
+                # GPU CGLS runs on the same well-conditioned system the CPU path
+                # builds, and only the back-transform x = z / scale is added here.
+                # Skipping instead (the old behaviour) left the resident OLS
+                # unreachable under the default configuration, because Jacobi
+                # defaults ON for matrix-free input.
+                if ridge > 0:
+                    self._ols_gpu_fallback_reason = "Resident OLS does not implement the ridge option; preserving CPU semantics"
+                if _gb.enabled() and ridge <= 0:
                     _dev_ids = _gb.resident_device_ids()
-                    gpu_op = _gb.GpuTwoLevelOperator(getattr(X, "_twolevel_base", X),
-                                                     device_ids=_dev_ids)
+                    base = getattr(X, "_twolevel_base", X)
+                    gpu_op = _gb.GpuTwoLevelOperator(base, device_ids=_dev_ids)
+                    _coln = None
                     try:
+                        if jacobi:
+                            _coln = np.asarray(X.col_norms(), dtype=np.float64).ravel()
+                            if _coln.shape != (base.shape[1],) or not np.all(np.isfinite(_coln)) or np.any(_coln <= 0):
+                                raise ValueError("Jacobi column norms must be finite, positive and complete")
+                            gpu_op.scale = gpu_op.torch.as_tensor(
+                                _coln, dtype=gpu_op._value_dtype, device=gpu_op.device)
                         coef, info = _gb.iterative_lstsq(gpu_op, y, atol=atol, btol=btol, maxiter=maxiter)
                     finally:
                         gpu_op.close()
+                    if _coln is not None:
+                        coef = np.asarray(coef, dtype=np.float64).ravel() / _coln
+                    if isinstance(info, dict):
+                        info = dict(info, jacobi_applied=bool(jacobi))
                     self._ols_lsmr_info = info
                     return coef
             except Exception as exc:
