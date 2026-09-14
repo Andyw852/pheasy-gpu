@@ -2505,7 +2505,11 @@ class _RFECVBase:
                     try:
                         adapter = (resident_backend.GpuCSRResidentOperator if sp.issparse(A)
                                    else resident_backend.GpuTwoLevelOperator)
-                        resident_A = adapter(A, extra_workspace_bytes=index_cache_bytes)
+                        resident_A = adapter(
+                            A, extra_workspace_bytes=index_cache_bytes,
+                            **({"device_ids": resident_backend.resident_device_ids()}
+                               if adapter is not resident_backend.GpuCSRResidentOperator
+                               else {}))
                         resident_y = resident_backend._to_torch(y, torch.float64)
                         # Probe sparse kernels during setup, before any elimination.
                         resident_A.rmatvec(resident_A.matvec(resident_y.new_zeros(n_features)))
@@ -2518,10 +2522,20 @@ class _RFECVBase:
             else:
                 resident_reason = "resident RFE requires dense, scipy sparse or TwoLevel input and n_jobs=1"
 
-        if (resident_reason is not None and _is_linear_operator(A)
-                and not resident_reason.startswith("resident RFE requires")
-                and (os.environ.get("PHEASY_GPU_RFE_RESIDENT", "").lower() in ("1", "true", "yes", "on") or _gpu_required())):
-            raise RuntimeError("GPU RFE resident solve failed with fallback disabled: %s" % resident_reason)
+        # A resident RFE that cannot be set up must fail loudly under GPU-required
+        # mode rather than quietly produce cpu_rfe coefficients.  The old guard
+        # deliberately excluded the "resident RFE requires ..." reasons -- n_jobs=1
+        # being the common one -- so a misconfigured run reported
+        # execution_backend="cpu_rfe" with no diagnostic anywhere, and the only way
+        # to notice was to read the solver field in the results dict.
+        _rfe_resident_requested = (
+            os.environ.get("PHEASY_GPU_RFE_RESIDENT", "").lower()
+            in ("1", "true", "yes", "on") or _gpu_required())
+        if resident_reason is not None and _is_linear_operator(A) and _rfe_resident_requested:
+            raise RuntimeError(
+                "GPU RFE resident solve failed with fallback disabled: %s "
+                "(set PHEASY_GPU_RFE_RESIDENT=0 to allow the CPU solver)"
+                % resident_reason)
 
         full_fit_coef = None
         resident_norms = None
