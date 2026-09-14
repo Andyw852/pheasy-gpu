@@ -45,7 +45,31 @@ def _sm_precision():
     return np.float64
 
 
-def _lsmr_tol(name, default):
+def _array_precision(A):
+    """Precision actually carried by the operator's stored data.
+
+    PHEASY_SM_DTYPE is only a proxy for it and an unreliable one: SM_prime's
+    float32 is hard-coded in run_pheasy.py in ~30 places with no binding to that
+    variable, so a production run can perfectly well have the variable unset and
+    a float32 matrix -- exactly the case where the floor is needed.  Read the
+    array in hand instead: the two-level operator exposes SM_prime, anything else
+    exposes dtype.
+    """
+    for obj in (getattr(A, "SM_prime", None), A):
+        dt = getattr(obj, "dtype", None)
+        if dt is None:
+            continue
+        try:
+            return np.dtype(dt).type
+        except TypeError:
+            pass
+    name = os.environ.get("PHEASY_SM_DTYPE")
+    if name is not None and str(name).strip().lower() in ("float32", "f32", "single"):
+        return np.float32
+    return np.float64
+
+
+def _lsmr_tol(name, default, A=None):
     """atol/btol, raised to the floor the working precision can actually reach.
 
     scipy's LSMR stops when normar <= atol*normA*normr (and normr <= btol*normb).
@@ -59,7 +83,7 @@ def _lsmr_tol(name, default):
     running thousands of useless iterations.
     """
     want = float(os.environ.get(name, str(default)))
-    dt = _sm_precision()
+    dt = _array_precision(A)
     floor = 10.0 * float(np.finfo(dt).eps)
     if want < floor:
         warnings.warn(
@@ -1125,8 +1149,19 @@ def _ridge_solve(A, y, alpha, x0=None):
         atol = float(_lsmr_tol("PHEASY_LSQR_ATOL", 1e-8))
         btol = float(_lsmr_tol("PHEASY_LSQR_BTOL", 1e-8))
         maxiter = int(os.environ.get("PHEASY_LSQR_MAXITER", "5000"))
+        import time as _tr
+        _t_r = _tr.time()
         res = _lsmr(op, y_aug, atol=atol, btol=btol, maxiter=maxiter, x0=x0)
         _iterative_solver_info(res, "LSMR")
+        # scipy returns (x, istop, itn, normr, normar, norma, conda, normx).
+        # istop is the whole diagnosis: 1/2 = a stopping test was met, 7 = the
+        # iteration cap was hit (i.e. alpha never entered the solve and the cost
+        # is independent of alpha), 5 = conda overflowed.
+        print("[RIDGE-LSMR] alpha=%.6e istop=%d iters=%d normr=%.3e normar=%.3e "
+              "norma=%.3e conda=%.3e warm=%s %.2fs"
+              % (float(alpha), int(res[1]), int(res[2]), float(res[3]),
+                 float(res[4]), float(res[5]), float(res[6]),
+                 "yes" if x0 is not None else "no", _tr.time() - _t_r), flush=True)
         return np.asarray(res[0], dtype=np.float64)
     if _gpu_dense(A):
         return np.asarray(_gpu().ridge_solve(_to_dense_f64(A), y64, alpha), dtype=np.float64)
