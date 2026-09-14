@@ -69,6 +69,22 @@ def _array_precision(A):
     return np.float64
 
 
+def _resident_value_dtype(op, torch):
+    """The dtype the resident operator's stored data actually carries.
+
+    Every vector handed to a resident matvec has to use it: the factors are
+    float32 whenever PHEASY_SM_DTYPE=float32 (the production setting), and a
+    float64 operand turns the sparse product into a mixed-dtype cuSPARSE SpMM,
+    which is rejected with "matA (CUDA_R_32F) and matB (CUDA_R_64F) with
+    different value types is not supported" -- the failure that kept resident RFE
+    from ever starting, and earlier took out resident ridge.  Three separate
+    omissions of this same rule have been found (GpuSubsetOperator._value_dtype,
+    the ridge Augmented wrapper, and a hard-coded float64 target here), so it
+    lives in one place now.
+    """
+    return getattr(op, "_value_dtype", None) or torch.float64
+
+
 def _lsmr_tol(name, default, A=None):
     """atol/btol, raised to the floor the working precision can actually reach.
 
@@ -2510,7 +2526,19 @@ class _RFECVBase:
                             **({"device_ids": resident_backend.resident_device_ids()}
                                if adapter is not resident_backend.GpuCSRResidentOperator
                                else {}))
-                        resident_y = resident_backend._to_torch(y, torch.float64)
+                        # Follow the FACTOR dtype, not a literal.  This adapter keeps
+                        # the operator's own precision (float32 when PHEASY_SM_DTYPE
+                        # is float32, the production setting), so a hard-coded
+                        # float64 target turns the setup probe below into
+                        # torch.sparse.mm(float32_csr, float64_dense) and cuSPARSE
+                        # rejects it:
+                        #   matA (CUDA_R_32F) and matB (CUDA_R_64F) with different
+                        #   value types is not supported
+                        # That is why resident RFE never started at any scale.  Same
+                        # omission as GpuSubsetOperator._value_dtype (7190139) and the
+                        # ridge Augmented wrapper (694e1fd).
+                        _vd = getattr(resident_A, "_value_dtype", None) or torch.float64
+                        resident_y = resident_backend._to_torch(y, _vd)
                         # Probe sparse kernels during setup, before any elimination.
                         resident_A.rmatvec(resident_A.matvec(resident_y.new_zeros(n_features)))
                         resident_operator = True
@@ -2566,7 +2594,7 @@ class _RFECVBase:
         def resident_column_norms():
             nonlocal resident_norms
             if resident_norms is None:
-                resident_norms = torch.as_tensor(col_norms, dtype=torch.float64, device=resident_A.device)
+                resident_norms = torch.as_tensor(col_norms, dtype=_resident_value_dtype(resident_A, torch), device=resident_A.device)
             return resident_norms.index_select(0, cached_column_tensor)
 
         def solve(col_idx, row_idx=None, download=True):
@@ -2629,7 +2657,7 @@ class _RFECVBase:
             view = resident_backend.GpuSubsetOperator(
                 resident_A, resident_columns(cols), None if rows is None else resident_rows(rows))
             resident_subset_builds += 1
-            return view.matvec(torch.as_tensor(coef, dtype=torch.float64, device=resident_A.device))
+            return view.matvec(torch.as_tensor(coef, dtype=_resident_value_dtype(resident_A, torch), device=resident_A.device))
 
         def predict_subset(cols, rows, coef):
             if resident_operator:
@@ -2640,7 +2668,7 @@ class _RFECVBase:
             if rows is not None:
                 ri = resident_rows(rows)
                 subset = subset.index_select(0, ri)
-            ct = torch.as_tensor(coef, dtype=torch.float64, device=resident_A.device)
+            ct = torch.as_tensor(coef, dtype=_resident_value_dtype(resident_A, torch), device=resident_A.device)
             return resident_backend._to_numpy(subset @ ct, np.float64)
 
         def residual_squares(cols, rows, coef):
@@ -2653,7 +2681,7 @@ class _RFECVBase:
                 ri = resident_rows(rows)
                 subset = subset.index_select(0, ri)
                 target = target.index_select(0, ri)
-            ct = torch.as_tensor(coef, dtype=torch.float64, device=resident_A.device)
+            ct = torch.as_tensor(coef, dtype=_resident_value_dtype(resident_A, torch), device=resident_A.device)
             return (subset @ ct - target).square()
 
         def score_subset(cols, rows, coef):
