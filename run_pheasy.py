@@ -707,7 +707,17 @@ class WorkFlow(object):
         else:
             if settings.FIT_IFC:
                 logger.info("Reconstructing sensing (displacement) matrix from file.")
-                self.SM_prime = spmat.load_npz(self.SensingMatrixFile)
+                # [SM index dtype] scipy writes this CSR with int64 COLUMN
+                # indices whenever indptr needs int64 (c3=5.0: nnz 3.57e9, so
+                # 26.6 GiB of index buffers where 13.3 GiB suffice, held for the
+                # whole fit).  core.sparse_io streams the npz members and narrows
+                # the indices to int32; PHEASY_SM_INDEX_DTYPE=int64 restores the
+                # old layout verbatim.
+                try:
+                    from pheasy_gpu.core.sparse_io import load_csr as _load_csr
+                except ImportError:                    # flat-layout checkout
+                    from core.sparse_io import load_csr as _load_csr
+                self.SM_prime = _load_csr(self.SensingMatrixFile)
 
     def run_fit_force_constants(self):
         """Fit interatomic force constants."""
@@ -1194,7 +1204,7 @@ class WorkFlow(object):
                     # 于是 RFE 总是走 dense 分支物化 sm_dense.npy (大 cutoff 下数百 GB),
                     # 所有 sparse / two-level 的内存优化对新接口全部失效。
                     _model_up = settings.MODEL.upper().replace('_', '-')
-                    _is_rfe = (_model_up == 'RFE') or (
+                    _is_rfe = (_model_up in ('RFE', 'RFE-OLS')) or (
                         _os_p.environ.get('PHEASY_USE_RFE','').lower() in ('1','true','yes'))
                     _is_rfe_tsqr = (_model_up in ('RFE-OLS-TSQR', 'RFE-TSQR')) or (
                         _os_p.environ.get('PHEASY_USE_RFE_TSQR','').lower() in ('1','true','yes'))
@@ -1205,15 +1215,51 @@ class WorkFlow(object):
                     _is_ols = (settings.MODEL.upper() == "OLS")
                     _ols_twolevel = _os_p.environ.get('PHEASY_OLS_TWOLEVEL','1').lower() in ('1','true','yes')
                     # [PATCH rfe-twolevel] RFE 也可走两级 matvec (PHEASY_RFE_TWOLEVEL=1)
-                    _rfe_twolevel = _os_p.environ.get('PHEASY_RFE_TWOLEVEL','0').lower() in ('1','true','yes')
+                    # [PATCH rfe-twolevel-auto] RFE two-level dispatch.  The
+                    # materialized SM is faster per matvec, but its construction
+                    # plus the per-fold row slices are the memory hog that
+                    # OOM-killed RFE on the large Mg8C120 cutoffs.  Default =
+                    # AUTO: go matrix-free when the sensing matrix is big;
+                    # PHEASY_RFE_TWOLEVEL=0/1 forces the choice and
+                    # PHEASY_RFE_TWOLEVEL_NNZ_MAX tunes the auto threshold
+                    # (default 5e8 nonzeros ~ 6 GiB of float32 CSR).
+                    _rfe_tl_env = _os_p.environ.get('PHEASY_RFE_TWOLEVEL')
+                    if _rfe_tl_env is not None:
+                        _rfe_twolevel = _rfe_tl_env.lower() in ('1', 'true', 'yes')
+                    else:
+                        try:
+                            _rfe_nnz = int(SM_prime.nnz)
+                        except AttributeError:
+                            _rfe_nnz = int(getattr(SM_prime, 'size', 0))
+                        _rfe_nnz_max = int(float(_os_p.environ.get(
+                            'PHEASY_RFE_TWOLEVEL_NNZ_MAX', '5e8')))
+                        _rfe_twolevel = _rfe_nnz > _rfe_nnz_max
+                        if _rfe_twolevel:
+                            print('[SM-twolevel auto] RFE: SM_prime nnz=%d > %d; '
+                                  'using the matrix-free two-level path to avoid '
+                                  'materializing SM (set PHEASY_RFE_TWOLEVEL=0 to '
+                                  'force the materialized path).'
+                                  % (_rfe_nnz, _rfe_nnz_max), flush=True)
                     # [PATCH lasso-twolevel] LASSO/ALASSO/RIDGE 也可走两级 matvec
                     # (PHEASY_LASSO_TWOLEVEL=1)。默认关: 两级 matvec 每次是两次稀疏乘,
                     # 仅当稀疏乘积 SM 本身也放不下内存时才划算。
                     _is_lasso_family = (settings.MODEL.upper() in ('LASSO', 'ALASSO', 'RIDGE'))
                     _lasso_twolevel = _os_p.environ.get('PHEASY_LASSO_TWOLEVEL','0').lower() in ('1','true','yes')
+                    # [ARDR-GRAM / RVM-GRAM] ARDR and the fast RVM consume a
+                    # matrix-free TwoLevelSM: their updates only need X^T X and
+                    # X^T y, which optimizer._build_gram_matrix builds from
+                    # SM_prime and NS. Without this the CLI materializes
+                    # sm_dense.npy and defeats the point on a large system.
+                    _model_name = settings.MODEL.upper()
+                    _is_gram = _model_name in ('ARDR', 'RVM')
+                    _gram_twolevel = (
+                        _os_p.environ.get('PHEASY_ARDR_TWOLEVEL','1').lower() in ('1','true','yes')
+                        if _model_name == 'ARDR' else
+                        _os_p.environ.get('PHEASY_RVM_TWOLEVEL','1').lower() in ('1','true','yes'))
                     _twolevel = ((_is_ols and _ols_twolevel)
                                  or ((_is_rfe or _is_rfe_tsqr) and _rfe_twolevel)
-                                 or (_is_lasso_family and _lasso_twolevel))
+                                 or (_is_lasso_family and _lasso_twolevel)
+                                 or (_is_gram and _gram_twolevel))
                     _use_sparse = (
                         (not _is_rfe_tsqr or _rfe_twolevel)
                         and (
@@ -1221,6 +1267,7 @@ class WorkFlow(object):
                             or (_is_rfe_tsqr and _rfe_twolevel)
                             or (_is_lasso_family and (_lasso_sparse or _lasso_twolevel))
                             or (_is_ols and _ols_twolevel)
+                            or (_is_gram and _gram_twolevel)
                         )
                     )
                     if _use_sparse:
@@ -1495,10 +1542,20 @@ class WorkFlow(object):
                 logger.info("Fitting force constants via Adaptive LASSO (ALASSO).")
             elif settings.MODEL.upper() == "OLS":
                 logger.info("Fitting force constants via the ordinary least-square.")
-            elif settings.MODEL.upper() == "RFE":
+            elif settings.MODEL.upper() in ("RFE", "RFE-OLS"):
                 logger.info(
-                    "Fitting force constants via Recursive Feature Elimination (RFE) "
+                    "Fitting force constants via Recursive Feature Elimination (RFE-OLS) "
                     "with OLS base estimator (scale-invariant importance, grouped CV).")
+            elif settings.MODEL.upper() == "ARDR":
+                logger.info(
+                    "Fitting force constants via Automatic Relevance Determination "
+                    "Regression (ARDR; sklearn ARDRegression, threshold_lambda=%s)."
+                    % os.environ.get("PHEASY_ARDR_THRESHOLD", "1e4"))
+            elif settings.MODEL.upper() == "RVM":
+                logger.info(
+                    "Fitting force constants via the fast marginal-likelihood RVM "
+                    "(Tipping & Faul 2003; active-set, no p x p factorization, "
+                    "lambda_t=%s)." % os.environ.get("PHEASY_RVM_THRESHOLD", "1e4"))
             elif settings.MODEL.upper() in ("RFE-OLS-TSQR", "RFE_TSQR", "RFE-TSQR"):
                 logger.info(
                     "Fitting force constants via strict OLS + RFE "
@@ -1510,7 +1567,8 @@ class WorkFlow(object):
             else:
                 _msg = (
                     "Unknown linear model for fitting force constants: {!r}. "
-                    "Expected one of OLS, LASSO, ALASSO, RFE, RFE-OLS-TSQR, RIDGE."
+                    "Expected one of OLS, LASSO, ALASSO, RVM, ARDR, RFE, RFE-OLS, "
+                    "RFE-OLS-TSQR, RIDGE."
                 ).format(settings.MODEL)
                 logger.error(_msg)
                 raise ValueError(_msg)
@@ -1527,6 +1585,24 @@ class WorkFlow(object):
                             "(PHEASY_CV_GROUP_SIZE=%d); set that variable to "
                             "override." % _gs)
             rank = SM.shape[1]
+            # Name the on-disk adjoint cache from the sensing matrix FILE identity.
+            # The resident upload's expensive host step is transposing SM_prime
+            # (measured 155.2 s at nnz 1.127e9) and the result is identical for every
+            # fit that reuses the same matrix, so it can be kept across processes.
+            # Only the directory is opt-in; the key has to come from here because the
+            # matrix is already in memory and hashing 9 GB to name the cache would
+            # cost more than the transpose it saves.
+            try:
+                if os.environ.get("PHEASY_HT_CACHE_DIR", "").strip() \
+                        and not os.environ.get("PHEASY_HT_CACHE_KEY", "").strip():
+                    for _cand in ("sm_prime.npz", "sm_dense.npy"):
+                        if os.path.exists(_cand):
+                            _st = os.stat(_cand)
+                            os.environ["PHEASY_HT_CACHE_KEY"] = "%s|%d|%d" % (
+                                os.path.abspath(_cand), _st.st_size, int(_st.st_mtime))
+                            break
+            except Exception:
+                pass
             optimizer.fit(SM, FM)
             fit_results = optimizer.results
             fit_metrics = optimizer.metrics
@@ -1549,7 +1625,15 @@ class WorkFlow(object):
                     return _v
                 except TypeError:
                     return repr(_v)
-            _gpu_env = {k: os.environ[k] for k in sorted(os.environ) if k.startswith("PHEASY_GPU") or k.startswith("PHEASY_USE_GPU") or k.startswith("PHEASY_OLS") or k.startswith("PHEASY_LSQR") or k.startswith("PHEASY_CV") or k in ("CUDA_VISIBLE_DEVICES", "PHEASY_SM_DTYPE")}
+            # Every PHEASY_* setting is a reproducibility input, not just the GPU
+            # ones: the list used to be a prefix whitelist (PHEASY_GPU/USE_GPU/
+            # OLS/LSQR/CV) and therefore omitted the knobs that decide a VERDICT
+            # (PHEASY_CGLS_PROBE_START, PHEASY_CGLS_STALL_POINTS,
+            # PHEASY_FISTA_AUTO_FLOOR, PHEASY_ALASSO_PILOT_TOL) and the ones that
+            # decide host memory (PHEASY_HOST_FACTOR_CACHE).  A manifest that
+            # cannot explain why a fit stopped is not a reproducibility manifest.
+            _gpu_env = {k: os.environ[k] for k in sorted(os.environ)
+                        if k.startswith("PHEASY_") or k == "CUDA_VISIBLE_DEVICES"}
             _versions = {}
             try:
                 from importlib import metadata as _imeta
@@ -1609,12 +1693,39 @@ class WorkFlow(object):
                     logger.info("- alpha_max: {:.3e}".format(float(_used_alpha[-1])))
                 logger.info("- alpha_opt: {}".format(fit_results["alpha"]))
                 logger.info("- RMSE_CV: {} eV/A".format(fit_metrics["rmse_path_mean"]))
-            elif settings.MODEL.upper() in ("RFE", "RFE-OLS-TSQR", "RFE_TSQR", "RFE-TSQR"):
+            elif settings.MODEL.upper() in ("RFE", "RFE-OLS", "RFE-OLS-TSQR", "RFE_TSQR", "RFE-TSQR"):
                 # [FIX P05] TSQR 原来没有汇总分支, 明明算了 CV 却不打印。
                 logger.info("- RFE finished after {} rounds.".format(fit_results["n_iter"]))
                 logger.info("- ridge_alpha: {}".format(fit_results["alpha"]))
                 logger.info("- best CV RMSE: {} eV/A".format(fit_metrics["rmse_path_mean"]))
                 logger.info("- selected features: {} of {}".format(
+                    int(np.count_nonzero(fit_results["coef"])),
+                    fit_results["coef"].shape[0]))
+            elif settings.MODEL.upper() == "ARDR":
+                logger.info("- ARDR converged after {} evidence iterations.".format(
+                    fit_results.get("n_iter")))
+                logger.info("- pruning threshold lambda_t: {}".format(
+                    fit_results.get("ardr_threshold")))
+                # The matrix-free Gram path has no hold-out folds; its reported
+                # score is the in-sample RMSE, so do not mislabel it as CV.
+                _ardr_info = fit_results.get("regularized_solver_info") or {}
+                _cv_skip = _ardr_info.get("cv_skipped")
+                logger.info("- {} RMSE: {} eV/A".format(
+                    "in-sample (Gram mode, no CV)" if _cv_skip else "best CV",
+                    fit_metrics["rmse_path_mean"]))
+                logger.info("- selected features: {} of {} (zero-precision pruned)".format(
+                    int(np.count_nonzero(fit_results["coef"])),
+                    fit_results["coef"].shape[0]))
+            elif settings.MODEL.upper() == "RVM":
+                logger.info("- fast RVM converged after {} active-set steps.".format(
+                    fit_results.get("n_iter")))
+                logger.info("- noise precision beta: {}".format(
+                    fit_results.get("rvm_beta")))
+                _rvm_info = fit_results.get("regularized_solver_info") or {}
+                logger.info("- {} RMSE: {} eV/A".format(
+                    "in-sample (Gram mode, no CV)" if _rvm_info.get("cv_skipped") else "best CV",
+                    fit_metrics["rmse_path_mean"]))
+                logger.info("- selected features: {} of {} (evidence-pruned)".format(
                     int(np.count_nonzero(fit_results["coef"])),
                     fit_results["coef"].shape[0]))
             elif settings.MODEL.upper() == "RIDGE":

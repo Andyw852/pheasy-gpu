@@ -47,8 +47,39 @@ Design notes
   control.
 """
 import os
+import time
 
 import numpy as np
+
+
+def _lasso_grid_helpers():
+    """[FIX P46] shared auto-grid policy, imported lazily.
+
+    core/optimizer.py owns the rule (span floor for overdetermined problems +
+    span-independent density); importing it at module scope would tie this
+    backend to the optimizer's import order, so resolve it on first use.
+    """
+    from .optimizer import lasso_grid_min_decades, lasso_alpha_grid
+    return lasso_grid_min_decades, lasso_alpha_grid
+
+
+def _lasso_grid(amax, anchor, decades, nalpha, n_samples, n_features):
+    """Grid from the KKT threshold amax down to the P46-floored bottom.
+
+    anchor is the threshold the bottom is measured from (min of the weighted and
+    unweighted KKT thresholds for ALASSO, amax itself for plain LASSO).
+    """
+    min_decades, make_grid = _lasso_grid_helpers()
+    dec = min_decades(n_samples, n_features, decades)
+    lo = float(anchor) * 10.0 ** (-float(dec))
+    if dec > float(decades):
+        print("[gpu_resident] alpha grid widened from %.1f to %.1f decades below "
+              "the KKT threshold (overdetermined %d x %d; PHEASY_LASSO_GRID_FLOOR=0 "
+              "restores the old span): a 4-decade grid pins alpha* to its own "
+              "bottom on high-SNR data." % (float(decades), dec, n_samples,
+                                            n_features), flush=True)
+    return make_grid(lo, float(amax), nalpha)
+
 
 __all__ = [
     "available",
@@ -163,6 +194,24 @@ def _norm_workspace_bytes():
     return value * 1024**2
 
 
+def _csr_device_bytes(matrix, value_bytes, n_shards=1):
+    """CUDA CSR bytes for ONE card's copy of a scipy matrix (or of one shard).
+
+    The index width is decided PER BLOCK, exactly as GpuTwoLevelOperator.upload()
+    does: a block with fewer than 2**31 nonzeros is cast to int32.  Sharding a
+    3.57e9-nnz float32 matrix therefore still uses 4-byte indices on each card,
+    while a SINGLE replica of it genuinely needs int64.  Reading the width off
+    the global nnz made the c3=5.0 sharded pre-flight 1.43x too large (22.5e9 B
+    against the operator's real 16.9e9 B) and rejected GPU-sized fits.
+    """
+    nnz = int(matrix.nnz)
+    shards = max(1, int(n_shards))
+    per_block = -(-nnz // shards)          # ceil
+    index_bytes = 4 if per_block < 2**31 else 8
+    return ((int(value_bytes) + index_bytes) * nnz
+            + 8 * (sum(int(x) for x in matrix.shape) + 2))
+
+
 def resident_twolevel_estimate(A, device_id=None, extra_workspace_bytes=0, n_shards=1):
     """Estimate the resident two-level footprint WITHOUT uploading anything.
 
@@ -199,20 +248,31 @@ def resident_twolevel_estimate(A, device_id=None, extra_workspace_bytes=0, n_sha
     # happily.  int32 indices are used while nnz fits in int32.
     _prime = base.SM_prime
     _value_bytes = 4 if getattr(_prime, "dtype", None) is not None and _prime.dtype == np.float32 else 8
-    _nnz_total = int(_prime.nnz) if _sp.issparse(_prime) else int(np.prod(_prime.shape))
-    _index_bytes = 4 if _nnz_total < 2**31 else 8
-    factor_bytes = 0
-    for matrix in (base.SM_prime, base.NS):
-        if _sp.issparse(matrix):
-            factor_bytes += (_value_bytes + _index_bytes) * int(matrix.nnz)                 + 8 * (sum(matrix.shape) + 2)
-        else:
-            factor_bytes += _value_bytes * int(np.prod(matrix.shape))
     n_shards = max(1, int(n_shards))
-    workspace = _norm_workspace_bytes()
-    # Each shard holds one row block AND one column block of SM_prime (matvec
-    # needs rows, the adjoint needs columns), hence the factor of 2 -- the same
-    # accounting GpuSparseMV uses.
-    peak = int(np.ceil(2.0 * factor_bytes / n_shards)) + workspace         + 8 * 32 * sum(base.shape) + int(extra_workspace_bytes)
+    # Per-card device bytes: SM_prime is sharded (int32 indices per BLOCK),
+    # NS is replicated whole (its own width).  The old code multiplied ONE
+    # global (_value_bytes + _index_bytes) by the FULL nnz and divided by
+    # n_shards, so the c3=5.0 sharded estimate came out 22.5e9 B where the
+    # operator's own per-block budget is 16.9e9 B (1.43x), and every float32
+    # sharded fit was pre-flighted against a number the GPU cannot reach.
+    if _sp.issparse(_prime):
+        _prime_bytes = _csr_device_bytes(_prime, _value_bytes, n_shards)
+    else:
+        _prime_bytes = _value_bytes * int(np.prod(_prime.shape))
+    if _sp.issparse(base.NS):
+        # NS and NS.T both live on the PRIMARY card (the sharded layout keeps the
+        # two-level matvec local), and the peak is compared against every card.
+        _ns_bytes = 2 * _csr_device_bytes(base.NS, _value_bytes, 1)
+    else:
+        _ns_bytes = _value_bytes * int(np.prod(base.NS.shape))
+    # Each shard holds one ROW block and one COLUMN block of SM_prime (matvec
+    # needs rows, the adjoint needs columns), hence the factor of 2; each pair
+    # also needs the same 10% SpMV workspace _cuda_spmv_block_budget reserves.
+    _pair = 2.0 * _prime_bytes / n_shards
+    _spmv_workspace = max(256 << 20, int(np.ceil(_pair)) // 10)
+    peak = (int(np.ceil(_pair)) + _spmv_workspace + _ns_bytes
+            + _norm_workspace_bytes() + 8 * 32 * sum(base.shape)
+            + int(extra_workspace_bytes))
     if device_id is None:
         # Budget the card the fit will actually UPLOAD to, which is
         # _resident_cv_devices()[0] == PHEASY_GPU_DEVICES[0], not
@@ -226,7 +286,18 @@ def resident_twolevel_estimate(A, device_id=None, extra_workspace_bytes=0, n_sha
     # None means "cannot query" (no torch/CUDA, or the card is unqueryable);
     # callers treat None as unknown, never as "fits".
     free = _device_free_bytes(device_id)
-    budget = None if free is None else int(free * fraction)
+    # [FIX R1] Budget the memory this fit could actually use, not the leftover
+    # AFTER this process has already taken what it needs.  The residency decision
+    # is taken more than once per run and the operator may already be resident when
+    # it is re-taken; the live factors then count as used and shrink the budget.
+    # Measured at c3=5.0: the identical estimate 88029528920 bytes was compared
+    # against 23643429273 (22.02 GiB, before the upload) and then against
+    # 2505749427 (2.33 GiB, after ~21 GB/card of our own sharded factors were
+    # resident), and the second verdict demoted a GPU-sized CV to CPU FISTA.
+    # `own` is this process own live device memory -- the very factors this
+    # estimate describes -- so it is headroom here, not another user memory.
+    available = _device_available_bytes(device_id)
+    budget = None if available is None else int(available * fraction)
     return peak, budget, free, fraction
 
 
@@ -275,7 +346,279 @@ def _canonical_csr(matrix):
     return csr
 
 
-def _canonical_twolevel_host(A):
+def _mem_trace(tag):
+    """Host RSS/VmHWM after a phase, when PHEASY_MEM_TRACE=1.
+
+    The 129 GB host peak of the c3=5.0 resident phase was invisible until the
+    kernel OOM-killed it.  VmHWM is the only number that says how close the host
+    came to the limit, and the per-phase deltas say WHICH copy caused it.  Off by
+    default: one /proc read per phase.
+    """
+    if os.environ.get("PHEASY_MEM_TRACE", "0").lower() not in ("1", "true", "yes", "on"):
+        return
+    try:
+        rss = hwm = float("nan")
+        with open("/proc/self/status") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    rss = int(line.split()[1]) / 1048576.0
+                elif line.startswith("VmHWM:"):
+                    hwm = int(line.split()[1]) / 1048576.0
+        print("[mem] %-34s RSS=%.2f HWM=%.2f GiB" % (tag, rss, hwm), flush=True)
+    except Exception:
+        pass
+
+
+def _factor_host_bytes(matrix):
+    """Resident host bytes of a sparse factor (None/0 for a dense or missing one)."""
+    if matrix is None or not hasattr(matrix, "data"):
+        return 0
+    total = int(matrix.data.nbytes)
+    for name in ("indices", "indptr"):
+        arr = getattr(matrix, name, None)
+        if arr is not None:
+            total += int(arr.nbytes)
+    return total
+
+
+def _eager_adjoint_fits(prime_c):
+    """Is there host room for the eager transpose ON TOP of what is resident?
+
+    The eager adjoint adds one more full copy of prime's arrays.  Ask for twice
+    that (so the run still has room to finish) plus the same headroom the factor
+    retention rule uses.  Unknown MemAvailable means NO -- never guess.
+    """
+    avail = _host_available_bytes()
+    if avail is None:
+        return False
+    return avail >= 2 * _factor_host_bytes(prime_c) + _HOST_FACTOR_CACHE_HEADROOM
+
+
+class _AdjointBlocks:
+    """Row blocks of prime.T, built on demand instead of materialised.
+
+    prime.T of a canonical CSR is a CSC *view*: scipy shares indptr, indices and
+    data (test_scipy_adjoint_view_is_shared asserts the sharing), so HOLDING it
+    costs nothing.  Every consumer of the adjoint wants row blocks -- one per
+    shard for the sharded resident layout, or the whole matrix for a single
+    replica -- and each block costs one O(nnz) filtered pass plus the block
+    itself (measured 1.8 s/block at nnz 2.2e8, i.e. ~2 min for all four shards at
+    the c3=5.0 size).  Materialising the whole transpose up front instead costs a
+    FULL second copy of the factors (42.84 GB at c3=5.0) held for the entire host
+    phase; together with the canonical copy, that was the 129 GB peak that made
+    the c3=5.0 resident fit need a fully idle box.
+
+    The on-disk adjoint cache (PHEASY_HT_CACHE_DIR) remains the explicit opt-in
+    for paying that transpose once across runs.
+    """
+
+    __slots__ = ("_prime", "_view", "shape", "dtype", "nnz")
+
+    def __init__(self, prime_c):
+        import scipy.sparse as sp
+        if not sp.issparse(prime_c):
+            raise TypeError("_AdjointBlocks requires a sparse prime")
+        self._prime = prime_c
+        self._view = prime_c.T
+        # A scipy that copied here would silently double the host footprint, so
+        # fail loudly instead of pretending the fix applied.
+        if not (np.shares_memory(self._view.data, prime_c.data)
+                and np.shares_memory(self._view.indices, prime_c.indices)):
+            raise RuntimeError(
+                "scipy materialises csr.T (buffers are not shared), so the lazy "
+                "adjoint cannot save host memory; set PHEASY_TWOLEVEL_ADJOINT=eager")
+        self.shape = tuple(int(x) for x in self._view.shape)
+        self.dtype = prime_c.dtype
+        self.nnz = int(prime_c.nnz)
+
+    @property
+    def resident_bytes(self):
+        """Extra resident host bytes: zero -- the view shares prime's arrays."""
+        return 0
+
+    def block(self, c0, c1):
+        """Canonical CSR for rows [c0, c1) of the adjoint (a PRIVATE copy)."""
+        b = self._view[int(c0):int(c1)].tocsr()
+        if not b.has_canonical_format:
+            b.sum_duplicates()
+            b.sort_indices()
+        return b
+
+    def materialize(self):
+        """The whole adjoint as a canonical CSR (one full copy; single replica only)."""
+        adj = self._view.tocsr()
+        if not adj.has_canonical_format:
+            adj.sum_duplicates()
+            adj.sort_indices()
+        return adj
+
+    def toarray(self):
+        """Dense adjoint. Diagnostics/tests ONLY -- 1e11 elements at c3=5.0."""
+        return self.materialize().toarray()
+
+    def __getitem__(self, key):
+        if not isinstance(key, slice) or key.step not in (None, 1):
+            raise TypeError("the lazy adjoint supports step-1 row slices only")
+        c0, c1, _ = key.indices(self.shape[0])
+        return self.block(c0, c1)
+
+    def __len__(self):
+        return self.shape[0]
+
+    def __repr__(self):
+        return "<lazy adjoint blocks shape=%s nnz=%d>" % (self.shape, self.nnz)
+
+
+def _make_adjoint(prime_c, mode):
+    """The adjoint for a canonical sparse prime: lazy blocks or an eager CSR."""
+    import scipy.sparse as sp
+    if not sp.issparse(prime_c):
+        return None
+    return _prime_adjoint(prime_c) if mode == "eager" else _AdjointBlocks(prime_c)
+
+
+_SPARSE_IO = None
+
+
+def _sparse_io():
+    """core.sparse_io, imported lazily (numpy/scipy/zipfile only, no cycle)."""
+    global _SPARSE_IO
+    if _SPARSE_IO is None:
+        try:
+            from . import sparse_io as _mod
+        except (ImportError, ValueError):
+            try:
+                from pheasy_gpu.core import sparse_io as _mod
+            except (ImportError, ValueError):
+                # Loaded standalone (dev tools use spec_from_file_location).
+                import importlib.util as _ilu
+                _path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                     "sparse_io.py")
+                _spec = _ilu.spec_from_file_location("sparse_io", _path)
+                _mod = _ilu.module_from_spec(_spec)
+                _spec.loader.exec_module(_mod)
+        _SPARSE_IO = _mod
+    return _SPARSE_IO
+
+
+def _canonical_block(matrix):
+    """Canonicalize a block that is ALREADY a private copy (a fresh slice).
+
+    A row slice of a canonical CSR is sorted but not marked canonical, and the
+    old call sites passed canonical=False, which paid ANOTHER full block copy
+    (tocsr(copy=True)) per shard just to re-canonicalise it.  The slices this is
+    called on are freshly allocated by scipy's _get_submatrix (copy=True), so
+    sum_duplicates()/sort_indices() can run in place.
+    """
+    import scipy.sparse as sp
+    if not sp.issparse(matrix):
+        return matrix
+    block = matrix.tocsr()          # no copy: already CSR
+    # canonical_format() is scipy's check without the int64 upcast that a
+    # narrow (int32 indices + int64 indptr) block would otherwise pay.
+    _sio = _sparse_io()
+    if not _sio.canonical_format(block):
+        _sio.canonicalize(block)
+    return block
+
+
+def _balanced_shard_edges(nnz_per_index, n_shards):
+    """Split boundaries that equalise NONZEROS per shard, not index counts.
+
+    np.linspace splits by row/column COUNT, which is only fair when the nonzeros
+    are spread evenly.  The c3=5.0 factors are not: shard 0 of the uniform split
+    needed 19.00 GiB of CUDA CSR for two blocks whose average share was 22.54 GB
+    of host factors, i.e. the first quarter of the rows AND columns carried most
+    of the matrix.  A single fat shard then decides both the host transient and
+    the per-card VRAM (and makes the even-split footprint estimate a lie).
+    Equal-nnz boundaries keep every shard at ~nnz/G.
+    """
+    n = int(len(nnz_per_index))
+    if n_shards <= 1 or n == 0:
+        return np.array([0, n], dtype=np.int64)
+    counts = np.asarray(nnz_per_index, dtype=np.int64)
+    cum = np.cumsum(counts)
+    total = int(cum[-1])
+    edges = [0]
+    for k in range(1, int(n_shards)):
+        target = total * k // int(n_shards)
+        e = int(np.searchsorted(cum, target, side="left")) + 1
+        e = max(e, edges[-1] + 1)
+        e = min(e, n - (int(n_shards) - k))
+        edges.append(e)
+    edges.append(n)
+    return np.array(edges, dtype=np.int64)
+
+
+def _col_nnz_counts(indices, n_cols):
+    """Per-column nonzero counts of a CSR matrix, chunked (no nnz-sized temp)."""
+    counts = np.zeros(int(n_cols), dtype=np.int64)
+    step = 1 << 24
+    for s in range(0, int(indices.size), step):
+        counts += np.bincount(indices[s:s + step], minlength=int(n_cols))
+    return counts
+
+
+def _row_shard_edges(prime, n_shards):
+    """Edges over prime's ROWS that equalise nonzeros (matvec blocks)."""
+    import scipy.sparse as sp
+    if not sp.issparse(prime) or _shard_balance_off():
+        return np.linspace(0, prime.shape[0], int(n_shards) + 1).astype(np.int64)
+    return _balanced_shard_edges(np.diff(prime.indptr), n_shards)
+
+
+def _col_nnz_cached(prime):
+    """Per-column nonzero counts of prime, computed at most once per object.
+
+    Kept separate from _col_shard_edges because the count-based GPU pre-flight
+    needs the same numbers even when the balanced edges are switched off.
+    """
+    counts = getattr(prime, "_pheasy_col_nnz", None)
+    if counts is None or int(counts.size) != int(prime.shape[1]):
+        counts = _col_nnz_counts(prime.indices, prime.shape[1])
+        try:
+            prime._pheasy_col_nnz = counts   # one O(nnz) scan per prime
+        except Exception:
+            pass
+    return counts
+
+
+def _col_shard_edges(prime, n_shards):
+    """Edges over prime's COLUMNS that equalise nonzeros (adjoint blocks)."""
+    import scipy.sparse as sp
+    if not sp.issparse(prime) or _shard_balance_off():
+        return np.linspace(0, prime.shape[1], int(n_shards) + 1).astype(np.int64)
+    return _balanced_shard_edges(_col_nnz_cached(prime), n_shards)
+
+
+def _shard_balance_off():
+    return os.environ.get("PHEASY_SHARD_BALANCE", "1").lower() in ("0", "false", "no", "off")
+
+
+def _canonical_csr_inplace(matrix):
+    """Canonicalize WITHOUT a second full copy when that is safe.
+
+    upload() only needs a canonical CSR and canonicalizing is mathematically the
+    identity, so the 42.84 GB tocsr(copy=True) that used to sit next to the raw
+    factors is pure overhead.  scipy's has_canonical_format is a VERIFIED
+    compiled check (csr_has_canonical_format), so an already-canonical factor set
+    -- the shipped sm_prime.npz is one -- costs one O(nnz) scan and no allocation
+    at all.  Set PHEASY_HOST_FACTOR_INPLACE=0 for the copying behaviour.
+    """
+    import scipy.sparse as sp
+    if not sp.issparse(matrix):
+        return matrix
+    if os.environ.get("PHEASY_HOST_FACTOR_INPLACE", "1").lower() in ("0", "false", "no", "off"):
+        return _canonical_csr(matrix)
+    if matrix.format != "csr":
+        matrix = matrix.tocsr()
+    _sio = _sparse_io()
+    if not _sio.canonical_format(matrix):
+        _sio.canonicalize(matrix)
+    return matrix
+
+
+def _canonical_twolevel_host(A, adjoint=None):
     """Host-side canonical factors for the resident operator, built ONCE.
 
     GpuTwoLevelOperator.upload() runs tocsr(copy=True)/sum_duplicates()/
@@ -284,26 +627,220 @@ def _canonical_twolevel_host(A):
     arrays the size of the factors -- the same class of blow-up that OOM-killed
     the large config (exit 137). Build it once, hand it to every replica, and
     drop it as soon as the last card has uploaded.
+
+    Two further host copies used to make the c3=5.0 phase need ~129 GB: the
+    canonical tocsr(copy=True) of an already-canonical sm_prime.npz (removed by
+    _canonical_csr_inplace) and the eager prime.T.tocsr() adjoint.  The adjoint is
+    now lazy by default (see _AdjointBlocks) and only materialised when
+    PHEASY_TWOLEVEL_ADJOINT=eager/auto asks for it.
     """
     import scipy.sparse as sp
     base = getattr(A, "_twolevel_base", A)
-    prepared = []
-    for matrix in (base.SM_prime, base.NS):
-        if sp.issparse(matrix):
-            csr = matrix.tocsr(copy=True)
-            csr.sum_duplicates()
-            csr.sort_indices()
-            prepared.append(csr)
-        else:
-            prepared.append(matrix)
-    # The adjoint needs ROW slices of prime.T.  Building them as
-    # prime[:, c0:c1].T per shard costs an O(nnz) transpose PER SHARD (measured:
-    # the dominant cost of the resident upload phase -- 1h+ single-core on the
-    # c7 factors).  Row-slicing a canonical prime.T is O(rows), so prepare the
-    # transpose here, once.
-    prime_c = prepared[0]
-    prepared.append(prime_c.T.tocsr() if sp.issparse(prime_c) else None)
+    _mem_trace("canonical_twolevel_host enter")
+    prepared = [_canonical_csr_inplace(base.SM_prime),
+                _canonical_csr_inplace(base.NS)]
+    _mem_trace("canonical factors (no copy if already canonical)")
+    _env_mode = os.environ.get("PHEASY_TWOLEVEL_ADJOINT", "").strip()
+    mode = (adjoint or _env_mode or "lazy").strip().lower()
+    if adjoint is None and not _env_mode and sp.issparse(prepared[0]):
+        # PHEASY_HT_CACHE_DIR exists to pay the transpose ONCE and reuse it from
+        # disk, which is meaningless for a lazy view: honour the configured
+        # cache by materialising the adjoint (the cache then applies as before).
+        _cdir, _cpath = _ht_cache_location(prepared[0])
+        if _cpath is not None:
+            mode = "eager"
+    if mode in ("eager", "full", "materialized", "1", "true", "yes", "on"):
+        resolved = "eager"
+    elif mode in ("auto",):
+        resolved = "eager" if _eager_adjoint_fits(prepared[0]) else "lazy"
+    elif mode in ("lazy", "deferred", "view", "0", "false", "no", "off"):
+        resolved = "lazy"
+    else:
+        raise ValueError(
+            "PHEASY_TWOLEVEL_ADJOINT must be lazy (default), eager or auto; got %r" % mode)
+    prepared.append(_make_adjoint(prepared[0], resolved))
+    _mem_trace("adjoint policy=%s (resolved %s)" % (mode, resolved))
     return tuple(prepared)
+
+
+def _ht_cache_location(prime):
+    """(dir, path) for the cached adjoint, or (None, None) when caching is off.
+
+    The transpose is the expensive host step of a resident upload (measured 155.2 s
+    for nnz 1.127e9 on the MgC factors) and it is the SAME matrix for every fit that
+    reuses the same sensing matrix, so it is worth keeping on disk.  The cache is
+    keyed by an IDENTITY THE CALLER KNOWS -- the file the factors came from plus its
+    size and mtime (PHEASY_HT_CACHE_KEY) -- because the matrix itself is already in
+    memory by then and hashing 9 GB to name the cache would cost more than the
+    transpose it is meant to save.  Caching stays OFF unless PHEASY_HT_CACHE_DIR is
+    set (9 GB per entry) and PHEASY_HT_CACHE=0 can veto it.
+    """
+    import scipy.sparse as sp
+    cdir = os.environ.get("PHEASY_HT_CACHE_DIR", "").strip()
+    key = os.environ.get("PHEASY_HT_CACHE_KEY", "").strip()
+    if not cdir or not key:
+        return None, None
+    if os.environ.get("PHEASY_HT_CACHE", "1").lower() in ("0", "false", "no", "off"):
+        return None, None
+    if not sp.issparse(prime):
+        return None, None
+    import hashlib
+    tag = hashlib.sha256(("%s|%s|%s|%s" % (key, prime.shape, prime.nnz, prime.dtype)).encode()).hexdigest()[:24]
+    try:
+        os.makedirs(cdir, exist_ok=True)
+    except Exception:
+        return None, None
+    return cdir, os.path.join(cdir, "prime_t_%s.npz" % tag)
+
+
+def _prime_adjoint(prime):
+    """Canonical prime.T, from the disk cache when it is there, else transposed once.
+
+    Only the three CSR arrays are stored, uncompressed (np.savez): compression of a
+    9 GB factor set would cost more CPU than the transpose it replaces, and the load
+    is what the cache is for.  A cache entry is trusted only if its shape and nnz
+    match the matrix in hand, so a stale or truncated file is rebuilt rather than
+    uploaded as the wrong operator.
+    """
+    import scipy.sparse as sp
+    _cdir, path = _ht_cache_location(prime)
+    if path is not None and os.path.exists(path):
+        try:
+            t0 = time.monotonic()
+            with np.load(path) as z:
+                indptr, indices, data = z["indptr"], z["indices"], z["data"]
+                shape = tuple(int(x) for x in z["shape"])
+            # The entry holds the ADJOINT, so its shape is prime.shape reversed.
+            _want = tuple(reversed(tuple(prime.shape)))
+            if shape == _want and len(data) == int(prime.nnz):
+                adj = sp.csr_matrix((data, indices, indptr), shape=shape)
+                print("[host] adjoint from disk cache %s (%.1fs, nnz=%d)"
+                      % (os.path.basename(path), time.monotonic() - t0, adj.nnz), flush=True)
+                return adj
+            print("[host] ignoring stale adjoint cache (shape %s vs %s, nnz %d vs %d)"
+                  % (shape, tuple(prime.shape), len(data), int(prime.nnz)), flush=True)
+        except Exception as exc:
+            print("[host] ignoring unreadable adjoint cache %s: %s"
+                  % (os.path.basename(path), exc), flush=True)
+    _t0 = time.monotonic()
+    adj = prime.T.tocsr()
+    print("[host] built adjoint host-side in %.1fs (nnz=%d%s)"
+          % (time.monotonic() - _t0, adj.nnz,
+             ", disk cache off" if path is None else ""), flush=True)
+    if path is not None:
+        try:
+            t0 = time.monotonic()
+            # np.savez appends ".npz" when the name lacks it, so the temporary
+            # name must carry the extension or os.replace cannot find it.
+            tmp = path + ".tmp-%d.npz" % os.getpid()
+            np.savez(tmp, indptr=adj.indptr, indices=adj.indices, data=adj.data,
+                     shape=np.asarray(adj.shape))
+            os.replace(tmp, path)
+            print("[host] wrote adjoint cache %s (%.1fs, %.2f GiB)"
+                  % (os.path.basename(path), time.monotonic() - t0,
+                     (adj.data.nbytes + adj.indices.nbytes) / 2**30), flush=True)
+        except Exception as exc:
+            print("[host] could not write adjoint cache: %s" % exc, flush=True)
+    return adj
+
+
+# Smallest canonical factor set worth retaining on the operator: below this the
+# extra transpose is cheap to rebuild, so holding ~2x the factors in host RAM buys
+# nothing (see twolevel_host_factors).
+_HOST_FACTOR_CACHE_MIN_BYTES = 256 * 1024 ** 2
+# Free host memory that must remain AFTER the retained factors, for the fit itself
+# (host factor copies, CV index arrays, metrics).  Retention is not allowed to eat
+# the room the run needs to finish.
+_HOST_FACTOR_CACHE_HEADROOM = 8 * 1024 ** 3
+
+
+def _host_available_bytes():
+    """MemAvailable from /proc/meminfo in bytes, or None if unreadable."""
+    try:
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except Exception:
+        pass
+    return None
+
+
+def twolevel_host_factors(A, cache=None):
+    """Canonical host factors for a resident operator, reused from A when kept.
+
+    GpuTwoLevelOperator built from RAW factors pays, PER SHARD, one O(nnz)
+    column-slice transpose for the adjoint (prime[:, c0:c1].T).  The resident
+    LASSO path already avoids that by handing every replica the canonical set
+    from _canonical_twolevel_host(), but RIDGE / OLS / the column-norm pass built
+    their own operator from the raw factors.  Measured on the MgC operator
+    (454656x69487, nnz(SM_prime) 1.127e9, 2 shards, one idle pair of cards): the
+    per-shard transposes cost 251.7 s, one canonical copy plus transpose 167.6 s
+    (of which .T.tocsr() 155.2 s and the tocsr copy 16.8 s), and __init__ as a
+    whole was 456.9 s of a 1298.8 s full-scale RIDGE fit.  So duplication of the
+    adjoint transpose -- not the upload -- is what scales with the shard count:
+    ~84 s at 2 shards, ~460 s at 5, for a fit whose solves are ~350 s.  The
+    remaining seconds are per-shard tocsr/dedupe/sort and the H2D copies, which
+    the canonical factors do not remove.
+
+    Keeping the canonical set costs a full copy of the factors plus the
+    transpose in host RAM (measured 18.2 GiB for that operator), so retention is
+    a HOST MEMORY decision, not a speed one: it is stored on the operator -- so
+    that a second operator over the same factors (RIDGE then OLS, or a repeated
+    fit) uploads with no host pass at all -- only while MemAvailable can afford
+    roughly twice what it adds.  PHEASY_HOST_FACTOR_CACHE=0 disables retention,
+    =1 forces it; the default ("auto") keeps it only under that headroom.
+
+    Returning the factors is always safe; only the caching is conditional.
+    """
+    base = getattr(A, "_twolevel_base", A)
+    cached = getattr(base, "_canonical_host_factors", None)
+    if cached is not None:
+        return cached
+    factors = _canonical_twolevel_host(base)
+    want = os.environ.get("PHEASY_HOST_FACTOR_CACHE", "auto") if cache is None else cache
+    if isinstance(want, str):
+        _w = want.strip().lower()
+        if _w in ("0", "false", "no", "off"):
+            keep = False
+        elif _w in ("1", "true", "yes", "on"):
+            keep = True
+        else:
+            added = 0
+            for m in factors:
+                if m is None:
+                    continue
+                if hasattr(m, "data"):
+                    added += int(m.data.nbytes) + int(
+                        getattr(m, "indices", np.zeros(0, dtype=np.int32)).nbytes)
+                else:
+                    # A lazy adjoint (_AdjointBlocks) shares prime's buffers, so
+                    # retaining it adds nothing and the headroom rule below must
+                    # not pretend it is another full factor set.
+                    added += int(getattr(m, "resident_bytes", 0))
+            avail = _host_available_bytes()
+            # Retention only pays when the factor set is big enough for the
+            # duplicate transpose to be worth holding at all, and when the host can
+            # afford the copy PLUS the headroom the rest of the fit still needs.
+            # Below the floor the transpose is cheap to rebuild, so there is
+            # nothing to keep; without the headroom term a host that is merely
+            # large enough for twice the factors would keep them and then run the
+            # fit itself out of memory.
+            keep = bool(added >= _HOST_FACTOR_CACHE_MIN_BYTES
+                        and avail is not None
+                        and avail >= 2 * added + _HOST_FACTOR_CACHE_HEADROOM)
+            if keep:
+                print("[host] keeping canonical resident factors (%.2f GiB; "
+                      "MemAvailable %.1f GiB)" % (added / 2**30, avail / 2**30),
+                      flush=True)
+    else:
+        keep = bool(want)
+    if keep:
+        try:
+            base._canonical_host_factors = factors
+        except Exception:
+            pass
+    return factors
 
 
 def _device_free_bytes(dev):
@@ -323,6 +860,37 @@ def _device_free_bytes(dev):
         return int(free + reusable)
     except Exception:
         return None
+
+
+def _device_own_bytes(dev):
+    """Device bytes this process currently holds as live tensors (None if unknown)."""
+    t = _torch()
+    if t is None:
+        return None
+    try:
+        if not t.cuda.is_available():
+            return None
+        return int(t.cuda.memory_allocated(dev))
+    except Exception:
+        return None
+
+
+def _device_available_bytes(dev):
+    """Bytes this process could use on `dev`, counting what it already holds.
+
+    _device_free_bytes() answers "how much room is left for someone else", which
+    is the wrong question once this process's own operator is resident: the live
+    factors are reported as used.  The residency checks below are re-taken while
+    the factors they describe may already be uploaded, so they must add this
+    process's own live bytes back; otherwise the identical fit is called too big
+    the second time it is asked.  Memory held by OTHER processes stays excluded:
+    it is in neither the free pool nor our own allocation.
+    """
+    free = _device_free_bytes(dev)
+    if free is None:
+        return None
+    own = _device_own_bytes(dev)
+    return free if own is None else free + own
 
 
 def _multi_gpu_devices(min_free_bytes=0):
@@ -448,6 +1016,19 @@ def _to_numpy(t, dtype=np.float64):
     if hasattr(t, "detach"):
         t = t.detach().cpu()
     return np.asarray(t, dtype=dtype)
+
+
+def _csr_major_indices(matrix):
+    """Row index of every stored element, in the matrix's OWN index dtype.
+
+    scipy's tocoo() expands indptr through a compiled routine that requires
+    indptr and indices to share ONE dtype, so it raises "Output dtype not
+    compatible with inputs" for the narrow sensing-matrix layout (int32 column
+    indices + int64 indptr, see core/sparse_io.py).  numpy expands the same
+    thing and does not care about the mixed widths.
+    """
+    return np.repeat(np.arange(matrix.shape[0], dtype=matrix.indices.dtype),
+                     np.diff(matrix.indptr))
 
 
 def _is_dense(A):
@@ -921,7 +1502,8 @@ def _fista_gram(Gt, bt, alpha, x0=None, max_iter=3000, tol=1e-7,
                 continue
             x_finite = x.clone()
             f_new = objective(x)
-            if prev_f is not None and f_new > prev_f + 1e-9 * (abs(prev_f) + 1e-300):
+            if prev_f is not None and f_new > prev_f + (_FISTA_F_REFINE * float(
+                    torch.finfo(Gt.dtype).eps)) * (abs(prev_f) + 1e-300):
                 # Step too large: _power_lipschitz under-resolved lambda_max(G)
                 # (40 power iterations converge from below).  Halve the step,
                 # restart the momentum from the current iterate, and re-check.
@@ -1386,11 +1968,15 @@ def load_sensing_matrix(sm_prime, ns_harm, ns_anharm, n_rows, dtype=np.float64):
         # refcount; empty_cache() returns the block to the driver.
         del spt, crow, ccol, cval
         torch.cuda.empty_cache()
-        smc = sm.tocoo()
-        idx = torch.as_tensor(np.vstack([smc.row, smc.col]), dtype=torch.long,
+        # [SM int32] sm can carry int32 indices with an int64 indptr (the narrow
+        # sensing-matrix layout, see core/sparse_io.py) and scipy's
+        # tocoo()/expandptr rejects that mix ("Output dtype not compatible with
+        # inputs"), so expand indptr here in sm's own index dtype instead.
+        _rows = _csr_major_indices(sm)
+        idx = torch.as_tensor(np.vstack([_rows, sm.indices]), dtype=torch.long,
                               device=device())
-        vals = torch.as_tensor(smc.data, dtype=torch.float64, device=device())
-        spt = torch.sparse_coo_tensor(idx, vals, smc.shape,
+        vals = torch.as_tensor(sm.data, dtype=torch.float64, device=device())
+        spt = torch.sparse_coo_tensor(idx, vals, sm.shape,
                                       device=device()).coalesce()
         SM = torch.sparse.mm(spt, NSt)
     return _to_numpy(SM, dtype)
@@ -1427,10 +2013,27 @@ def _cuda_spmv_block_budget(row_block, transpose_block, value_itemsize):
     device-selection average is only a hint; this actual block budget decides
     whether a pair is safe to upload to its selected card.
     """
-    resident = (_cuda_csr_bytes(row_block, value_itemsize)
-                + _cuda_csr_bytes(transpose_block, value_itemsize))
-    vectors = sum(sum(block.shape) for block in (row_block, transpose_block)) \
-        * int(value_itemsize)
+    return _cuda_spmv_block_budget_counts(
+        row_block.shape, row_block.nnz, transpose_block.shape,
+        transpose_block.nnz, value_itemsize)
+
+
+def _cuda_spmv_block_budget_counts(row_shape, row_nnz, trans_shape, trans_nnz,
+                                   value_itemsize):
+    """Same accounting as _cuda_spmv_block_budget, from COUNTS instead of blocks.
+
+    The upload path needs the verdict BEFORE it materialises the blocks: a
+    c3=5.0 shard's row block and column block are 10.7 GB each on the host, so
+    holding both just to compute a budget doubled the host transient (21.4 GB of
+    the measured 66.76 GiB peak) on top of keeping two 10.7 GB numpy buffers
+    alive through the upload.  Both entry points share this one formula, so the
+    count-based pre-flight can never drift from the block-based one.
+    """
+    _vi = int(value_itemsize)
+    resident = ((int(row_nnz) + int(trans_nnz)) * (_vi + 4)
+                + (int(row_shape[0]) + int(trans_shape[0]) + 2) * 4)
+    vectors = (sum(int(x) for x in row_shape)
+               + sum(int(x) for x in trans_shape)) * _vi
     workspace = max(256 << 20, (resident + vectors + 9) // 10)
     return resident + vectors + workspace
 
@@ -1469,8 +2072,14 @@ class GpuSparseMV(object):
             raise RuntimeError("no usable CUDA device")
         self._devs = devs
         G = len(devs)
-        self._rs = np.linspace(0, N, G + 1).astype(np.int64)
-        self._cs = np.linspace(0, M, G + 1).astype(np.int64)
+        # Equal-NNZ boundaries, not equal index counts: the c3=5.0 factors put
+        # most of their nonzeros in the first uniform quarter, so shard 0 needed
+        # 19.00 GiB of CUDA CSR while the even-split estimate said 22.54 GB for a
+        # shard's whole host footprint (see _balanced_shard_edges).
+        self._rs = _row_shard_edges(sm_prime, G)
+        self._cs = _col_shard_edges(sm_prime, G)
+        _mem_trace("GpuSparseMV nnz-balanced row edges %s (N=%d)"
+                   % ([int(x) for x in self._rs], int(self._rs[-1])))
         self._R = []
         self._T = []
         # [low-mem] per-block column slices instead of one full transpose:
@@ -1479,13 +2088,28 @@ class GpuSparseMV(object):
         # shared box (exit 137, three times). Column slices are ~97 s per
         # 13275-col block (8 min total vs the transpose) but peak ~75 GB.
         try:
+            # Nonzero counts per row/column: the per-shard budget below needs
+            # them, and asking for them here costs one O(nnz) pass instead of
+            # materialising both blocks first.
+            _row_counts = np.diff(sm_prime.indptr)
+            _col_counts = _col_nnz_cached(sm_prime)
             for i, d in enumerate(devs):
                 dev = t.device("cuda:%d" % d)
-                Ri = sm_prime[self._rs[i]:self._rs[i + 1]].tocsr()
-                _check_cuda_csr_indices(Ri)
-                Ti = sm_prime[:, self._cs[i]:self._cs[i + 1]].T.tocsr()
-                _check_cuda_csr_indices(Ti)
-                required = _cuda_spmv_block_budget(Ri, Ti, self._value_itemsize)
+                r0, r1 = int(self._rs[i]), int(self._rs[i + 1])
+                c0, c1 = int(self._cs[i]), int(self._cs[i + 1])
+                _row_nnz = int(_row_counts[r0:r1].sum())
+                _col_nnz = int(_col_counts[c0:c1].sum())
+                # Per-block host footprint.  This loop is the only host-memory
+                # step of the GPU-SM path, so the trace says whether a kill came
+                # from the blocks or from somewhere upstream.
+                _mem_trace("GpuSparseMV host blocks %d/%d (nnz %d+%d)"
+                           % (i + 1, G, _row_nnz, _col_nnz))
+                # Pre-flight from COUNTS, before either block exists: at c3=5.0
+                # they are 10.7 GB each, so building both just to measure doubled
+                # this loop's transient for no benefit.
+                required = _cuda_spmv_block_budget_counts(
+                    (r1 - r0, M), _row_nnz, (c1 - c0, N), _col_nnz,
+                    self._value_itemsize)
                 free = _device_free_bytes(d)
                 if free is not None and required > free:
                     raise MemoryError(
@@ -1496,10 +2120,17 @@ class GpuSparseMV(object):
                         % (d, required / 2**30, free / 2**30))
                 # [X2/M1] pin the thread-local current device while creating
                 # the sparse tensors: cuSPARSE handles/workspace follow it.
+                # Build, upload and RELEASE one block at a time so the two
+                # 10.7 GB host blocks never coexist.
                 with t.cuda.device(d):
+                    Ri = sm_prime[r0:r1].tocsr()
+                    _check_cuda_csr_indices(Ri)
                     self._R.append(self._csr_to_torch(Ri, dev))
+                    del Ri
+                    Ti = sm_prime[:, c0:c1].T.tocsr()
+                    _check_cuda_csr_indices(Ti)
                     self._T.append(self._csr_to_torch(Ti, dev))
-                del Ri, Ti
+                    del Ti
         except Exception:
             # A failure on card k must release cards 0..k before CPU fallback.
             self.close()
@@ -1670,9 +2301,15 @@ class GpuTwoLevelOperator:
             if _free_other is None:
                 raise RuntimeError("Cannot query resident CUDA memory budget on %s; "
                                    "refusing unchecked upload" % _dev)
-            if self.estimated_peak_bytes > _free_other * fraction:
+            # [FIX R2] same own-bytes accounting as device 0 (see
+            # _device_available_bytes): a replica may already be resident here.
+            _avail_other = _device_available_bytes(_dev)
+            if _avail_other is None:
+                _avail_other = _free_other
+            _budget_other = int(_avail_other * fraction)
+            if self.estimated_peak_bytes > _budget_other:
                 raise ResidentFootprintError(resident_twolevel_error_message(
-                    self.estimated_peak_bytes, int(_free_other * fraction)))
+                    self.estimated_peak_bytes, _budget_other))
 
         host_prime_t = None
         if host_factors is None:
@@ -1703,7 +2340,14 @@ class GpuTwoLevelOperator:
             # parent's arrays and torch then refuses ("expected col_indices to be
             # a contiguous tensor per batch").  GpuSparseMV never hit this because
             # its int32 cast always copied.
-            _idx_np = np.int32 if self._index_dtype == torch.int32 else np.int64
+            # Index width is PER BLOCK, not per matrix: the sharded layout
+            # uploads ~nnz/G per card, so the c3=5.0 matrix (3.57e9 nnz, int64 at
+            # full size) ships int32 metadata from its 892M-nnz shards.  Reading
+            # the width off the GLOBAL nnz sent int64 indices instead -- +4 B/nnz,
+            # +3.57 GB of VRAM per card, the same class of dtype doubling this
+            # class's docstring warns about.  _check_cuda_csr_indices below still
+            # guards int32 representability of THIS block.
+            _idx_np = np.int32 if int(csr.nnz) < 2**31 else np.int64
             _val_np = np.float32 if self._value_dtype == torch.float32 else np.float64
             _check_cuda_csr_indices(csr)
             # Mirror GpuSparseMV's proven construction: int32 metadata with
@@ -1711,10 +2355,18 @@ class GpuTwoLevelOperator:
             # flag trips torch's "expected col_indices to be a contiguous tensor
             # per batch" check).  _check_cuda_csr_indices above is the package's
             # own int32-representability guard.
+            # The VALUE array needs no host copy when it is already the device
+            # dtype and C-contiguous (torch.as_tensor with a device transfers
+            # straight from the scipy buffer) -- at c3=5.0 a shard block is
+            # 10.7 GB, so the redundant copy showed up in the HWM.  The strided
+            # case (column-sliced transpose) still takes the copying path.
+            _data = csr.data
+            if _data.dtype != _val_np or not _data.flags.c_contiguous:
+                _data = np.array(_data, dtype=_val_np, copy=True)
             return torch.sparse_csr_tensor(
                 torch.as_tensor(np.array(csr.indptr, dtype=_idx_np, copy=True), device=dev),
                 torch.as_tensor(np.array(csr.indices, dtype=_idx_np, copy=True), device=dev),
-                torch.as_tensor(np.array(csr.data, dtype=_val_np, copy=True), device=dev),
+                torch.as_tensor(_data, device=dev),
                 size=csr.shape, dtype=self._value_dtype, device=dev)
 
         self._R = []
@@ -1727,13 +2379,30 @@ class GpuTwoLevelOperator:
                 # indices, and cuSPARSE then refuses the SpMV ("operation not
                 # supported when calling cusparseSpMV_bufferSize") -- measured on
                 # the production 810M-nnz float32 factor.
-                _prime_c = _canonical_csr(host_prime)
-                self.prime = upload(_prime_c, self.device, canonical=True)
-                if sp.issparse(host_prime):
-                    self.prime_t = upload(_prime_c.T.tocsr(), self.device,
-                                          canonical=False)
+                if host_prime_t is not None:
+                    # Caller supplied canonical factors, so the adjoint already
+                    # exists: uploading it costs nothing extra, while rebuilding
+                    # it here transposed a second copy of prime (measured 155.2 s
+                    # on the MgC factor, nnz 1.127e9).  _canonical_twolevel_host
+                    # only fills this slot for a SPARSE prime, and its .T.tocsr()
+                    # is index-sorted, which is what upload(canonical=True)
+                    # promises.  A LAZY adjoint (_AdjointBlocks) has to be
+                    # materialised for this layout: a single replica needs the
+                    # whole adjoint on one card, there is no block to defer.
+                    self.prime = upload(host_prime, self.device, canonical=True)
+                    if hasattr(host_prime_t, "materialize"):
+                        host_prime_t = host_prime_t.materialize()
+                    self.prime_t = upload(host_prime_t, self.device,
+                                          canonical=True)
                 else:
-                    self.prime_t = self.prime.transpose(0, 1).to_sparse_csr()
+                    _prime_c = _canonical_csr_inplace(host_prime)
+                    self.prime = upload(_prime_c, self.device, canonical=True)
+                    if sp.issparse(host_prime):
+                        self.prime_t = upload(
+                            _canonical_block(_prime_c.T), self.device,
+                            canonical=True)
+                    else:
+                        self.prime_t = self.prime.transpose(0, 1).to_sparse_csr()
             else:
                 # Sharded: rows for the matvec, columns for the adjoint.  Every
                 # output element is produced by exactly one card from its own
@@ -1746,25 +2415,56 @@ class GpuTwoLevelOperator:
                 # an empty block (rmatvec still looked right because block 0 then
                 # held every column, but column norms came out wrong).
                 _mid = int(host_prime.shape[1])
-                self._rs = np.linspace(0, N, self._n_shards + 1).astype(np.int64)
-                self._cs = np.linspace(0, _mid, self._n_shards + 1).astype(np.int64)
+                # Equal-NNZ boundaries over prime's rows (matvec) and prime's own
+                # columns (adjoint); a uniform split put most of the c3=5.0
+                # nonzeros -- and therefore the whole host transient and VRAM
+                # requirement -- on one card.
+                self._rs = _row_shard_edges(host_prime, self._n_shards)
+                self._cs = _col_shard_edges(host_prime, self._n_shards)
+                # Nonzero counts per row/column, so the per-shard budget below
+                # needs no materialised block at all.
+                _row_counts = np.diff(host_prime.indptr)
+                _col_counts = _col_nnz_cached(host_prime)
                 for i, dev in enumerate(self._devs):
                     r0, r1 = int(self._rs[i]), int(self._rs[i + 1])
                     c0, c1 = int(self._cs[i]), int(self._cs[i + 1])
+                    # Per-SHARD pre-flight, which the uniform estimate cannot give:
+                    # the even-split number describes the average shard, so a fat
+                    # shard used to reach the allocator with no check at all.  Count
+                    # instead of materialise: the two blocks are 10.7 GB each at
+                    # c3=5.0, and building them just to measure was half the host
+                    # transient this loop is trying to avoid.
+                    _row_nnz = int(_row_counts[r0:r1].sum())
+                    _col_nnz = int(_col_counts[c0:c1].sum())
+                    _need = _cuda_spmv_block_budget_counts(
+                        (r1 - r0, _mid), _row_nnz, (c1 - c0, N), _col_nnz,
+                        self._item_bytes())
+                    _avail = _device_available_bytes(dev)
+                    if _avail is not None and _need > int(_avail):
+                        raise ResidentFootprintError(resident_twolevel_error_message(
+                            _need, int(_avail)))
+                    _mem_trace("resident shard %d/%d host blocks (nnz %d+%d, need %.2f GiB)"
+                               % (i + 1, self._n_shards, _row_nnz, _col_nnz,
+                                  _need / 2 ** 30))
                     with torch.cuda.device(dev):
-                        # canonical=False is deliberate: the column-sliced
-                        # transpose must be re-sorted/deduplicated per shard,
-                        # otherwise cuSPARSE rejects the SpMV (see above).
-                        self._R.append(upload(host_prime[r0:r1], dev,
-                                              canonical=False))
+                        # Build, upload and RELEASE one block at a time.  Holding
+                        # both through the upload measured +21.4 GB on the real
+                        # c3=5.0 factors (the blocks are 10.7 GB each) on top of
+                        # the 42.84 GB factor set, for no benefit: the budget above
+                        # already answered the fit question.  _canonical_block
+                        # canonicalizes IN PLACE on a freshly sliced (privately
+                        # owned) buffer, and a lazy adjoint costs one O(nnz)
+                        # filtered pass per shard, so the full 42.84 GB transpose
+                        # never exists in RAM.
+                        _Rb = _canonical_block(host_prime[r0:r1])
+                        self._R.append(upload(_Rb, dev, canonical=True))
+                        del _Rb
                         if host_prime_t is not None:
-                            # row slice of the precomputed canonical transpose:
-                            # O(rows) instead of an O(nnz) per-shard transpose.
-                            self._T.append(upload(host_prime_t[c0:c1], dev,
-                                                  canonical=False))
+                            _Tb = _canonical_block(host_prime_t[c0:c1])
                         else:
-                            self._T.append(upload(host_prime[:, c0:c1].T, dev,
-                                                  canonical=False))
+                            _Tb = _canonical_block(host_prime[:, c0:c1].T)
+                        self._T.append(upload(_Tb, dev, canonical=True))
+                        del _Tb
                         if i == 0:
                             self.prime = None
                             self.prime_t = None
@@ -1775,8 +2475,8 @@ class GpuTwoLevelOperator:
                 # ("operation not supported when calling cusparseSpMV_bufferSize").
                 # Measured: the whole 810M-nnz prime SpMV is fine, the transposed
                 # NS was the one that failed.
-                self.ns_t = upload(_canonical_csr(host_ns).T.tocsr(), self.device,
-                                   canonical=False)
+                self.ns_t = upload(_canonical_block(_canonical_csr_inplace(host_ns).T),
+                                   self.device, canonical=True)
             else:
                 self.ns_t = self.ns.T
             self.scale = torch.ones(A.shape[1], dtype=self._value_dtype, device=self.device)
@@ -1800,6 +2500,11 @@ class GpuTwoLevelOperator:
                 shards.clear()
 
 
+
+    def _item_bytes(self):
+        """Bytes per factor VALUE on the device (int32 indices are fixed at 4)."""
+        return 4 if self._value_dtype == self.torch.float32 else 8
+
     def _mm(self, matrix, vector):
         if matrix.layout == self.torch.strided:
             return matrix @ vector
@@ -1814,6 +2519,21 @@ class GpuTwoLevelOperator:
         # Sharded: NS lives on the primary; the mid vector is broadcast to every
         # card and the disjoint row blocks come back to the primary.  Per
         # iteration this moves ~mid*4 bytes per card, not the factors.
+        #
+        # Measured, and worth knowing before "using more cards": on THIS host the
+        # sharded operator is a MEMORY tool, not a speed tool.  The two half-SpMMs
+        # do overlap (interleaved medians on idle cards: 5.45 ms for both halves
+        # against 10.60 ms for the same work on one card), but the mandatory
+        # broadcast and collect cost ~5.5 ms because there is NO peer access
+        # between any pair of cards here (torch.cuda.can_device_access_peer is
+        # False for every pair), so each cross-card copy is staged through host
+        # memory and lands on the critical path: the whole matvec then costs
+        # 10.90 ms (old loop), 10.93 ms (same loop issuing the remote shard on its
+        # own stream with non_blocking copies -- bit-identical output, no gain),
+        # and 10.61 ms on ONE card doing the entire matrix.  The 1/2/3/4-shard
+        # sweep agrees: 22.50/23.02/24.15/24.73 ms per matvec+rmatvec pair.
+        # Shard for VRAM, and prefer one card per fit with folds/alphas spread
+        # across cards instead.
         t = self._mm(self.ns, x)
         parts = []
         for i, dev in enumerate(self._devs):
@@ -1842,29 +2562,78 @@ class GpuTwoLevelOperator:
             self._norma = _operator_norm_estimate(self, iters)
         return self._norma
 
+    def _norm_block_budget(self):
+        """Workspace for one column block, using the room the device has.
+
+        The block width decides how many times the factors are re-read, and that
+        dominates the cost: measured on the MgC operator (36864x69487, 91.4M nnz,
+        2 x RTX3090), 409 passes took 23.0s, 26 passes 12.5s and 7 passes 11.6s.
+        PHEASY_GPU_NORM_WORKSPACE_MB (512 MB) is a FLOOR here; the device can
+        usually spare far more for a transient buffer.  Results are unaffected:
+        the accumulation order moves only the last float32 digits (1.1e-07
+        between the 512 MB and 32 GB runs).
+        """
+        budget = _norm_workspace_bytes()
+        try:
+            free = _device_free_bytes(self.device)
+        except Exception:
+            free = None
+        if free:
+            budget = max(budget, min(int(free * _NORM_BLOCK_FREE_FRACTION),
+                                     _NORM_BLOCK_MAX_BYTES))
+        return budget
+
     def col_norms(self):
         """Exact full-row column norms of the current effective operator, on CUDA.
 
         Bounded column blocks avoid sparse-sparse products and never allocate
         the full sensing matrix. Workspace is O(block*(n + mid + p)).
+
+        The block width is a trade-off against the factors being re-read (see
+        _norm_block_budget).  It is re-clamped against LIVE free memory, and a
+        CUDA OOM falls back once to the conservative configured floor: this box is
+        shared, so the room can disappear between the first query and the
+        allocation, and that must not turn a norm pass into a hard failure.
         """
         if self._n_shards != 1:
             return self._sharded_col_norms()
         torch = self.torch
         n, p = self.shape
-        budget = _norm_workspace_bytes()
-        block = max(1, budget // max(8 * (n + self.ns.shape[0] + p) * 2, 1))
+        per_col = max(8 * (n + self.ns.shape[0] + p) * 2, 1)
+        floor = _norm_workspace_bytes()
+        budget = self._norm_block_budget()
         norms = torch.empty_like(self.scale)
-        for start in range(0, p, block):
+        start = 0
+        block = max(1, budget // per_col)
+        while start < p:
             count = min(block, p - start)
             # Follow the factor dtype: an fp64 basis against fp32 factors is
             # the same mixed-dtype failure the resident path hit (found by
             # re-running this gate with float32 fixtures).
-            basis = torch.zeros((p, count), dtype=self._value_dtype, device=self.device)
-            idx = torch.arange(count, device=self.device)
-            basis[start + idx, idx] = 1
-            cols = self._mm(self.prime, self._mm(self.ns, basis / (self.input_scale * self.scale)[:, None]))
-            norms[start:start + count] = torch.linalg.vector_norm(cols, dim=0)
+            try:
+                basis = torch.zeros((p, count), dtype=self._value_dtype,
+                                    device=self.device)
+                idx = torch.arange(count, device=self.device)
+                basis[start + idx, idx] = 1
+                cols = self._mm(self.prime, self._mm(
+                    self.ns, basis / (self.input_scale * self.scale)[:, None]))
+                norms[start:start + count] = torch.linalg.vector_norm(cols, dim=0)
+            except RuntimeError as _e:
+                if "out of memory" not in str(_e).lower() or count <= 1:
+                    raise
+                # Someone else took the memory: drop to the configured floor
+                # (never below one column) and retry this block.
+                del basis
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+                block = max(1, floor // per_col)
+                if block >= count:
+                    block = max(1, count // 2)
+                continue
+            del basis, cols
+            start += count
         return norms
 
     def _sharded_col_norms(self):
@@ -1878,7 +2647,7 @@ class GpuTwoLevelOperator:
         """
         torch = self.torch
         n, p = self.shape
-        budget = _norm_workspace_bytes()
+        budget = self._norm_block_budget()
         block = max(1, budget // max(8 * (n + self.ns.shape[0] + p) * 2, 1))
         total = torch.zeros(p, dtype=torch.float64, device=self.device)
         for start in range(0, p, block):
@@ -2009,13 +2778,25 @@ class GpuSubsetOperator:
 
 def solve_resident_subset(base, target, columns, rows=None, column_scale=None,
                           ridge_alpha=0.0, atol=1e-8, btol=1e-8, maxiter=5000,
-                          raise_on_nonconvergence=True):
+                          raise_on_nonconvergence=True, accept_measured_floor=False):
     """Return physical CUDA subset coefficients; reject unconverged elimination fits.
 
     raise_on_nonconvergence keeps elimination fits fail-closed (RFE), while the
     relaxed-LASSO debias sets it False so an unconverged CGLS returns its last
     iterate -- exactly the CPU LSQR path's non-aborting behavior -- and the caller's
     residual check decides whether to keep the refit.
+
+    accept_measured_floor separates the two reasons a solve can end uncertified.
+    Measured on the production MgC operator (454656x69487, float32, required GPU
+    mode) the FIRST RFE round's subset solve reaches a criterion floor ABOVE the
+    certifiable cap after 5000 iterations and ends stall_above_floor, which made the
+    whole RFE fit raise "Resident subset solve did not converge" -- for a solve whose
+    only job is to RANK the features.  With this flag the coefficients are returned
+    when the info carries floor EVIDENCE (precision_floor / stall_above_floor, i.e.
+    the criterion was measured to stop improving at the working precision), the
+    decision is recorded in info["floor_accepted"] / info["floor_note"], and a solve
+    with NO floor evidence (iteration_limit, invalid_search_direction, ...) still
+    raises: an exhausted budget says nothing about what the arithmetic can reach.
 
     target is the full row-space vector; column_scale is in active-column order.
     """
@@ -2036,18 +2817,29 @@ def solve_resident_subset(base, target, columns, rows=None, column_scale=None,
         coef, info = _iterative_lstsq_tensor(view, y, atol, btol, maxiter)
     info = dict(info, n_samples=view.shape[0], n_features=view.shape[1],
                 fit_scope="full" if rows is None else "fold", ridge_alpha=float(ridge_alpha))
-    if not info["converged"] and raise_on_nonconvergence:
+    _floor_reasons = ("precision_floor", "stall_above_floor")
+    _at_floor = bool(not info["converged"] and info.get("stop_reason") in _floor_reasons)
+    if _at_floor:
+        info["floor_accepted"] = bool(accept_measured_floor)
+        info["floor_note"] = (
+            "coefficients returned at the MEASURED precision floor (%s, best "
+            "criterion %s at iteration %s); this is a precision limit, not an "
+            "exhausted budget -- acceptable for a ranking solve, not a certified "
+            "solution" % (info.get("stop_reason"), info.get("stall_floor"),
+                          info.get("stall_iteration")))
+    if not info["converged"] and raise_on_nonconvergence and not (
+            accept_measured_floor and _at_floor):
         raise RuntimeError("Resident subset solve did not converge: " + repr(info))
     return coef / view.column_scale, info
 
 
-def iterative_ridge(A, y, alpha, atol=1e-8, btol=1e-8, maxiter=5000, rows=None):
+def iterative_ridge(A, y, alpha, atol=1e-8, btol=1e-8, maxiter=5000, rows=None, x0=None):
     """Solve ridge on a CUDA-resident operator, returning NumPy coefficients."""
-    x, info = _iterative_ridge_tensor(A, y, alpha, atol, btol, maxiter, rows)
+    x, info = _iterative_ridge_tensor(A, y, alpha, atol, btol, maxiter, rows, x0=x0)
     return x.detach().cpu().numpy(), info
 
 
-def _iterative_ridge_tensor(A, y, alpha, atol=1e-8, btol=1e-8, maxiter=5000, rows=None, penalty_scale=None):
+def _iterative_ridge_tensor(A, y, alpha, atol=1e-8, btol=1e-8, maxiter=5000, rows=None, penalty_scale=None, x0=None):
     """Augmented CGLS with CUDA coefficient output."""
     torch = A.torch
     dev = A.device
@@ -2079,6 +2871,12 @@ def _iterative_ridge_tensor(A, y, alpha, atol=1e-8, btol=1e-8, maxiter=5000, row
             # PHEASY_GPU_RIDGE_RESIDENT=1 on the c6.5/c3=4.5 fit (twice), and it is
             # the same omission as GpuSubsetOperator._value_dtype.
             self._value_dtype = _vd
+            # With penalty_scale, sa is a vector (one penalty per coefficient) and
+            # the augmented operator's condition bound is set by the SMALLEST
+            # effective penalty, so reduce it to that scalar here.  Exposing it on
+            # the operator lets _iterative_lstsq_tensor learn the penalty without
+            # a new argument.
+            self.penalty_alpha = float(torch.as_tensor(sa * sa).min().item())
         def norm_estimate(self, iters=10):
             if getattr(self, "_norma", None) is None:
                 self._norma = _operator_norm_estimate(self, iters)
@@ -2087,7 +2885,9 @@ def _iterative_ridge_tensor(A, y, alpha, atol=1e-8, btol=1e-8, maxiter=5000, row
             return torch.cat((A.matvec(x) * mask, sa * x))
         def rmatvec(self, z):
             return A.rmatvec(z[:A.shape[0]] * mask) + sa * z[A.shape[0]:]
-    return _iterative_lstsq_tensor(Augmented(), torch.cat((y * mask, y.new_zeros(A.shape[1]))), atol, btol, maxiter)
+    return _iterative_lstsq_tensor(Augmented(),
+                                   torch.cat((y * mask, y.new_zeros(A.shape[1]))),
+                                   atol, btol, maxiter, x0)
 
 
 def _operator_norm_estimate(A, iters=10):
@@ -2114,8 +2914,87 @@ def iterative_lstsq(A, y, atol=1e-8, btol=1e-8, maxiter=5000):
     return x.detach().cpu().numpy(), info
 
 
-def _iterative_lstsq_tensor(A, y, atol=1e-8, btol=1e-8, maxiter=5000):
-    """CGLS core returning CUDA coefficients and the same convergence diagnostics."""
+_CGLS_FLOOR_MAX = 1e-3
+# Plain least squares carries no penalty, so sigma_min is unbounded from below
+# and there is no condition number to build a floor from.  Fall back to the same
+# one-decade-above-eps rule _lsmr_tol uses, so the CGLS and LSMR paths agree on
+# what the stored data precision can actually reach.
+_CGLS_UNPENALIZED_COND = 10.0
+# Relative improvement the primary criterion must show between two honest
+# verifications to count as progress; below it the solve is stagnating.
+# These margins must sit ABOVE the reproducibility of the measurement itself.
+# On the c7 operator (float32 factors, RTX 3090) three recomputations of
+# ||A^T (y - A x)|| for the SAME x gave 2.715779e-06 / 2.767306e-06 /
+# 2.832976e-06, i.e. a +-2% spread from the sparse-kernel accumulation order.
+# A 1% margin therefore made the verdict depend on kernel scheduling: the
+# certificate was raised by 1% and the re-derivation then missed it by 1.25%.
+_CGLS_STALL_MARGIN = 0.05
+# Headroom over the measured floor when it is promoted to the certificate.
+_CGLS_FLOOR_MARGIN = 0.10
+# Earliest iteration at which the UNCONDITIONAL honest probe may run, relative to
+# the iteration budget (see the probe_window note in _iterative_lstsq_tensor).
+# Same reasoning as _FISTA_STALL_WINDOW_MAX: a criterion that is still creeping
+# down must not be declared floored by a window that is short compared with the
+# budget.
+_CGLS_PROBE_WINDOW_MAX = 8000
+
+# Column-norm workspace: how much of the device free memory one transient block
+# may take, and its cap (see GpuTwoLevelOperator._norm_block_budget).
+_NORM_BLOCK_FREE_FRACTION = 0.25
+_NORM_BLOCK_MAX_BYTES = 8 * 1024 ** 3
+
+
+def _cgls_relative_floor(torch, dtype, norma, alpha=None):
+    """Smallest relative normal residual this working precision can certify.
+
+    CG attains a relative normal residual no better than eps*cond(A) in the
+    arithmetic it runs in, and for the ridge-augmented operator
+
+        cond(A_aug)^2 = (s_max^2 + alpha) / (s_min^2 + alpha) <= ||A||^2/alpha + 1
+
+    because sigma_min(A_aug)^2 = sigma_min(A)^2 + alpha >= alpha.  Requesting
+    less than this floor asks for something the arithmetic cannot express, and
+    on the resident path that is not a harmless stall: measured on the c7
+    operator (25515x3678, float32 factors, single RTX3090) the shipped 1e-8 sat
+    four to five orders below the floor, the recurrence lost the gradient after
+    ~1000 iterations, and the true residual grew to 1e17 before maxiter.
+
+    Capped at _CGLS_FLOOR_MAX: past that the system is not solvable in this
+    precision at all and a tolerance that large certifies nothing.
+    """
+    eps = float(torch.finfo(dtype).eps)
+    if alpha is not None and float(alpha) > 0:
+        cond = max(1.0, float(norma) / float(np.sqrt(float(alpha))))
+    else:
+        cond = _CGLS_UNPENALIZED_COND
+    return min(eps * cond, _CGLS_FLOOR_MAX)
+
+
+def _iterative_lstsq_tensor(A, y, atol=1e-8, btol=1e-8, maxiter=5000, x0=None):
+    """CGLS core returning CUDA coefficients and the same convergence diagnostics.
+
+    Two things separate this from a textbook CGLS, and both are forced by the
+    float32 production runs:
+
+    * the requested atol/btol are raised to the floor the working precision can
+      reach (see _cgls_relative_floor), so a tolerance the arithmetic cannot
+      express stops the iteration early instead of driving it past the point
+      where the recurrence still means anything;
+    * the cheap stopping test runs on the RECURRENCE residual, which in float32
+      drifts below the true y - A x.  Measured on the c7 operator: the
+      recurrence was optimistic by 8x at alpha=1e-2, 48x at 1e-4 and 370x at
+      1e-6.  Every verdict it produces is therefore re-checked against a
+      recomputed residual, and when the two disagree the recurrence is replaced
+      by the honest one and the iteration continues.  That disagreement used to
+      be terminal -- stop_reason=true_residual_check_failed, 17 times in one
+      shipped c7 CV sweep -- and the coefficients it discarded were correct.
+
+    A ridge caller wraps its operator in an augmented one that names the
+    penalty it applied in A.penalty_alpha; plain least squares carries none,
+    and then only the bare precision bounds the achievable tolerance.  Reading
+    it off the operator rather than taking a new argument keeps this signature
+    stable for the callers and test doubles that already patch it.
+    """
     torch = getattr(A, "torch", None)
     device = getattr(A, "device", None)
     if torch is None or device is None or torch.device(device).type != "cuda":
@@ -2134,8 +3013,26 @@ def _iterative_lstsq_tensor(A, y, atol=1e-8, btol=1e-8, maxiter=5000):
     if (not np.isfinite(atol) or not np.isfinite(btol) or atol < 0 or btol < 0
             or not np.isfinite(maxiter) or maxiter <= 0 or int(maxiter) != maxiter):
         raise ValueError("atol/btol must be finite nonnegative and maxiter a finite positive integer")
-    x = torch.zeros(A.shape[1], dtype=y.dtype, device=device)
-    r = y.clone()
+    warm = None
+    if x0 is not None:
+        # A warm start is an optimization, never a contract: the alpha path hands
+        # over the previous (larger) alpha's solution, and a stale or non-finite
+        # one must not poison the solve -- it is validated here and dropped when
+        # unusable rather than trusted.
+        candidate = torch.as_tensor(np.asarray(x0, dtype=np.float64).ravel(),
+                                    dtype=y.dtype, device=device)
+        if candidate.numel() == A.shape[1] and bool(torch.isfinite(candidate).all().item()):
+            warm = candidate
+        else:
+            import warnings
+            warnings.warn("ignoring unusable CGLS warm start: expected %d "
+                          "finite values, got %d"
+                          % (A.shape[1], candidate.numel()),
+                          RuntimeWarning, stacklevel=2)
+    x = warm.clone() if warm is not None else torch.zeros(A.shape[1], dtype=y.dtype, device=device)
+    # Every recurrence below is rebuilt from this residual, so a warm x must
+    # produce it exactly as the loop would on its own.
+    r = (y - A.matvec(x)) if warm is not None else y.clone()
     s = A.rmatvec(r)
     p = s.clone()
     gamma = torch.dot(s, s)
@@ -2143,16 +3040,185 @@ def _iterative_lstsq_tensor(A, y, atol=1e-8, btol=1e-8, maxiter=5000):
     normal_norm = torch.linalg.vector_norm(s)
     residual_norm = torch.linalg.vector_norm(r)
     norma = A.norm_estimate() if hasattr(A, "norm_estimate") else _operator_norm_estimate(A)
+    tol_floor = _cgls_relative_floor(torch, y.dtype, norma,
+                                     getattr(A, "penalty_alpha", None))
+    atol_eff = max(float(atol), tol_floor)
+    btol_eff = max(float(btol), tol_floor)
+    # How often to re-derive the residual honestly once the cheap test has been
+    # caught lying.  Bounded so a pathological system cannot make the extra
+    # matvec/rmatvec dominate the iteration.
+    verify_every = max(1, min(int(os.environ.get("PHEASY_CGLS_VERIFY_EVERY", "50")),
+                              int(maxiter)))
     def meets_tolerance():
+        # Tried and REVERTED: fetching ||x|| lazily (it is only used by the btol
+        # branch) so that the first branch could be answered from scalars already
+        # in hand.  Measured no gain -- on a converging CGLS the first branch fails
+        # on nearly every iteration, so normx is still computed -- and it invited a
+        # dtype trap (np.isfinite returns a numpy bool, which made torch dispatch
+        # bitwise_and on float tensors: "bitwise_and_cuda is not implemented for
+        # Float").  The per-iteration syncs are therefore still there; batching them
+        # is the only way to remove them, and GPU.md records an earlier batching
+        # attempt that measured 15.7-16.8% SLOWER on this box.
         normx = torch.linalg.vector_norm(x)
         finite = torch.isfinite(normal_norm) & torch.isfinite(residual_norm) & torch.isfinite(rhs_norm) & torch.isfinite(normx)
-        return bool((finite & bool(np.isfinite(norma)) & ((normal_norm <= atol * norma * residual_norm)
-                    | (residual_norm <= btol * rhs_norm + atol * norma * normx))).item())
+        # residual_norm <= rhs_norm is not part of SciPy's LSQR test, but the true
+        # CGLS residual is monotone and x=0 already achieves ||b||, so it holds at
+        # any genuine minimum.  It is what stops an exploded iterate from
+        # certifying itself through the ||x||-scaled branch below: a c7 float32
+        # run was measured reporting converged=True with normr/||b||=1.2e17 and
+        # ||x||=inf, i.e. the gate would have accepted coefficients that were
+        # 1e17 times wrong.
+        return bool((finite & bool(np.isfinite(norma)) & (residual_norm <= rhs_norm)
+                    & ((normal_norm <= atol_eff * norma * residual_norm)
+                       | (residual_norm <= btol_eff * rhs_norm + atol_eff * norma * normx))).item())
     converged = meets_tolerance()
     n_iter = 0
-    residual_norm = torch.linalg.vector_norm(r)
     stop_reason = "iteration_limit"
+    honest_only = False        # the recurrence test has been caught lying
+    next_verify = 0
+    best_true = None           # smallest honest residual reached so far
+    # Best honest iterate by the PRIMARY criterion (normar <= atol*norma*normr),
+    # which is the one a float32 solve stalls on, plus the stall bookkeeping that
+    # turns "stopped improving" into a measured floor.
+    best_iterate = None        # (criterion value, x, normr, normar)
+    stalls = 0
+    stall_limit = max(1, int(os.environ.get("PHEASY_CGLS_STALL_POINTS", "5")))
+    measured_floor = None
+    # A solve whose CHEAP test never fires never enters the honest block below,
+    # so its stall detector never runs and an arithmetic floor is reported as a
+    # bare "iteration_limit" with no number attached.  That is the production MgC
+    # OLS case (454656x69487, float32): 20000 iterations reached a criterion of
+    # 1.33e-03 against a 1.19e-06 analytic floor -- three orders below what the
+    # arithmetic can express -- so the fit was refused with no way to see why or
+    # what to ask for instead.  An unconditional periodic honest probe therefore
+    # runs from probe_start onwards, records the best criterion and the iterate
+    # that reached it, and reports both.  It CERTIFIES early when that floor is
+    # inside _CGLS_FLOOR_MAX, but it never ends the run on a floor above the cap:
+    # the recurrence is still creeping down there (measured 5.31e-03 at 10000
+    # iterations -> 1.33e-03 at 20000), so stopping would deliver a worse iterate
+    # than the remaining budget can still reach.
+    probe_window = min(_CGLS_PROBE_WINDOW_MAX, max(int(maxiter) // 2, verify_every))
+    probe_start = int(os.environ.get("PHEASY_CGLS_PROBE_START", probe_window))
+    next_probe = probe_start
+    probe_count = 0
+    stall_floor = None         # best criterion an honest probe reached
+    stall_iteration = None
+
+    def _record_honest(r_norm, n_norm):
+        """Update the best-criterion bookkeeping from one honest measurement.
+
+        Returns (rel, improved) where rel = ||A^T r|| / (||A|| * ||r||) is the
+        quantity the primary criterion tests and the one a float32 solve stalls
+        on.  Shared by the honest re-verification and the periodic probe so both
+        decide "improving" by the same margin (see _CGLS_STALL_MARGIN).
+        """
+        nonlocal best_true, best_iterate, stalls
+        if bool((r_norm <= rhs_norm).item()):
+            best_true = (r_norm if best_true is None
+                         else torch.minimum(best_true, r_norm))
+        _denom = float((norma * r_norm).item())
+        rel = (float(n_norm.item()) / _denom) if _denom > 0 else float("inf")
+        improved = (best_iterate is None
+                    or rel < best_iterate[0] * (1.0 - _CGLS_STALL_MARGIN))
+        if improved:
+            best_iterate = (rel, x.clone(), r_norm, n_norm)
+            stalls = 0
+        else:
+            stalls += 1
+        return rel, improved
     for it in range(int(maxiter)):
+        if not honest_only and not converged and it >= next_probe:
+            # Periodic honest probe: the cheap recurrence test has not fired, so
+            # nothing else in this loop measures the TRUE residual.  This is what
+            # turns an arithmetic floor into a reported number instead of a bare
+            # iteration_limit (see the probe_window note above).
+            probe_r = y - A.matvec(x)
+            probe_rn = torch.linalg.vector_norm(probe_r)
+            probe_nn = torch.linalg.vector_norm(A.rmatvec(probe_r))
+            probe_count += 1
+            rel, _improved = _record_honest(probe_rn, probe_nn)
+            if stall_floor is None or rel < stall_floor:
+                stall_floor = rel
+                stall_iteration = it
+            next_probe = it + verify_every
+            if stalls >= stall_limit and stall_floor is not None:
+                if stall_floor <= _CGLS_FLOOR_MAX:
+                    # Certifiable: promote the measured floor exactly as the
+                    # honest path does and stop here instead of at the cap.
+                    measured_floor = stall_floor
+                    _, x, residual_norm, normal_norm = best_iterate
+                    _accepted = min(measured_floor * (1.0 + _CGLS_FLOOR_MARGIN),
+                                    _CGLS_FLOOR_MAX)
+                    atol_eff = max(atol_eff, _accepted)
+                    btol_eff = max(btol_eff, _accepted)
+                    converged = True
+                    stop_reason = "precision_floor"
+                    break
+                # Above the cap: keep spending the budget (the recurrence is still
+                # creeping down) but remember the number for the verdict below,
+                # and re-arm the window so the probe does not re-fire every step.
+                stalls = 0
+        if (converged or honest_only) and it >= next_verify:
+            true_r = y - A.matvec(x)
+            residual_norm = torch.linalg.vector_norm(true_r)
+            normal_norm = torch.linalg.vector_norm(A.rmatvec(true_r))
+            if meets_tolerance():
+                converged = True
+                stop_reason = "converged_on_true_residual" if honest_only else "converged"
+                break
+            if best_true is not None and bool((residual_norm > 10.0 * rhs_norm).item()):
+                # The recurrence has come apart: report the breakdown instead of
+                # grinding to maxiter and returning the wreckage.
+                converged = False
+                stop_reason = "residual_growth"
+                break
+            # How close this iterate came to the primary criterion.  Stagnation of
+            # THIS quantity is what defines the floor in this precision; the
+            # analytic eps*cond estimate above is only where the search starts.
+            # _record_honest also maintains best_true (the residual-growth guard
+            # above reads it) so both paths decide "improving" identically.
+            _record_honest(residual_norm, normal_norm)
+            if stalls >= stall_limit:
+                # The iteration has stopped improving, so what it reached is what
+                # this working precision can express.  Deliver the BEST iterate
+                # (the current one is usually worse) and certify against the
+                # MEASURED floor instead of grinding to maxiter and reporting
+                # iteration_limit with an uncertified vector.  Refuse when even
+                # the measured floor is past _CGLS_FLOOR_MAX: at that point the
+                # system is not solvable in this precision and a certificate would
+                # mean nothing.
+                measured_floor = best_iterate[0]
+                _, x, residual_norm, normal_norm = best_iterate
+                if measured_floor <= _CGLS_FLOOR_MAX:
+                    # The certificate is re-derived from x after the loop, and
+                    # that re-derivation only reproduces to ~2% (see
+                    # _CGLS_STALL_MARGIN), so certifying AT the measured value
+                    # leaves the verdict inside the measurement noise: measured
+                    # on c7, atol_effective 7.825285e-06 against a re-derived
+                    # normar 3.242940e-06 missed the test by 1.25%.  The floor is
+                    # therefore brought with _CGLS_FLOOR_MARGIN headroom -- still
+                    # two orders below the 1e-3 cap, so it certifies far less
+                    # than the cap allows.
+                    accepted = min(measured_floor * (1.0 + _CGLS_FLOOR_MARGIN),
+                                   _CGLS_FLOOR_MAX)
+                    atol_eff = max(atol_eff, accepted)
+                    btol_eff = max(btol_eff, accepted)
+                    converged = True
+                else:
+                    converged = False
+                stop_reason = "precision_floor"
+                break
+            # Restart the recurrence from the honest residual and keep going.
+            # Returning here is what discarded correct float32 coefficients: the
+            # recurrence had drifted, so the true certificate could not match it.
+            r = true_r
+            s = A.rmatvec(r)
+            normal_norm = torch.linalg.vector_norm(s)
+            p = s.clone()
+            gamma = torch.dot(s, s)
+            converged = False
+            honest_only = True
+            next_verify = it + verify_every
         if converged:
             break
         q = A.matvec(p)
@@ -2168,9 +3234,10 @@ def _iterative_lstsq_tensor(A, y, atol=1e-8, btol=1e-8, maxiter=5000):
         residual_norm = torch.linalg.vector_norm(r)
         normal_norm = torch.linalg.vector_norm(s_new)
         n_iter = it + 1
-        converged = meets_tolerance()
-        if converged:
-            break
+        if not honest_only:
+            # Do NOT stop here: the verdict is only a recurrence estimate and has
+            # to survive the certificate check at the top of the next iteration.
+            converged = meets_tolerance()
         if bool((~torch.isfinite(gamma_new) | (gamma <= 0)).item()):
             stop_reason = "invalid_gradient_recurrence"
             break
@@ -2178,15 +3245,59 @@ def _iterative_lstsq_tensor(A, y, atol=1e-8, btol=1e-8, maxiter=5000):
         s = s_new
         gamma = gamma_new
     # Certify the delivered coefficients, not only the recursively updated residual.
-    recurrence_converged = converged
+    recurrence_converged = bool(converged)
     true_r = y - A.matvec(x)
     residual_norm = torch.linalg.vector_norm(true_r)
     normal_norm = torch.linalg.vector_norm(A.rmatvec(true_r))
-    converged = meets_tolerance()
-    if converged:
-        stop_reason = "converged" if recurrence_converged else "converged_on_true_residual"
-    elif recurrence_converged:
+    certified = meets_tolerance()
+    _denom_end = float((norma * residual_norm).item())
+    _rel_end = ((float(normal_norm.item()) / _denom_end) if _denom_end > 0
+                else float("inf"))
+    # Deliver the best iterate the honest measurements saw when it beats the
+    # last one.  Once the criterion has stalled the loop's final iterate is
+    # usually the worse of the two, and the certificate is recomputed from
+    # whatever vector is actually returned, so this can only help.  The stall
+    # valve above has always done this for the honest path.
+    if not certified and best_iterate is not None:
+        _denom_now = float((norma * residual_norm).item())
+        _rel_now = ((float(normal_norm.item()) / _denom_now) if _denom_now > 0
+                    else float("inf"))
+        if best_iterate[0] < _rel_now * (1.0 - _CGLS_STALL_MARGIN):
+            x = best_iterate[1]
+            true_r = y - A.matvec(x)
+            residual_norm = torch.linalg.vector_norm(true_r)
+            normal_norm = torch.linalg.vector_norm(A.rmatvec(true_r))
+            certified = meets_tolerance()
+            _denom_end = float((norma * residual_norm).item())
+            _rel_end = ((float(normal_norm.item()) / _denom_end) if _denom_end > 0
+                        else float("inf"))
+    if certified:
+        # "precision_floor" is a verdict of its own: the iteration stagnated at
+        # the measured floor and atol_eff was raised to it, so re-testing must
+        # not relabel it as a stalling recurrence check.
+        if stop_reason not in ("converged", "converged_on_true_residual",
+                               "precision_floor"):
+            stop_reason = "converged_on_true_residual"
+    elif stop_reason == "precision_floor":
+        # Keep the verdict and its reason: a measured-floor certificate that the
+        # re-derivation cannot reproduce is still a measured floor, not a broken
+        # recurrence, and conflating them is what made this path look identical
+        # to the failure it replaced.
+        pass
+    elif recurrence_converged or stop_reason in ("converged", "converged_on_true_residual"):
         stop_reason = "true_residual_check_failed"
+    elif (stop_reason == "iteration_limit" and stall_floor is not None
+          and _rel_end >= stall_floor * (1.0 - _CGLS_STALL_MARGIN)):
+        # The honest probes stopped improving ABOVE the cap, and the DELIVERED
+        # iterate is no better than what they reached: this precision cannot
+        # certify the system.  That is a different verdict from "ran out of
+        # iterations while still improving", and reporting it as iteration_limit
+        # hid the number that makes it actionable (raise the tolerance to it).
+        # The comparison uses the delivered criterion, not the stall counter: the
+        # probe re-arms its window after a stall, so a LATER improvement means the
+        # stall was spurious and the budget really did run out mid-progress.
+        stop_reason = "stall_above_floor"
+    converged = certified
     info = {"solver": "GPU CGLS", "itn": n_iter, "n_iter": n_iter,
             "residual_certificate": "recomputed_y_minus_Ax",
             "stop_reason": stop_reason,
@@ -2196,20 +3307,140 @@ def _iterative_lstsq_tensor(A, y, atol=1e-8, btol=1e-8, maxiter=5000):
             "normr": float(residual_norm.item()), "normar": float(normal_norm.item()),
             "converged": bool(converged), "device": str(device),
             "backend": "gpu_resident_iterative", "atol": float(atol),
-            "btol": float(btol), "maxiter": int(maxiter)}
+            "btol": float(btol), "maxiter": int(maxiter),
+            # Requested vs applied, so a manifest never hides a loosened test:
+            # the applied values are what the certificate above actually used.
+            "atol_effective": float(atol_eff), "btol_effective": float(btol_eff),
+            "tolerance_floor": float(tol_floor),
+            "tolerance_floor_dtype": str(y.dtype).replace("torch.", ""),
+            # Analytic floor versus what the iteration actually reached: the
+            # second is what a "precision_floor" verdict certified against.
+            "tolerance_floor_measured": (None if measured_floor is None
+                                         else float(measured_floor)),
+            "honest_residual_check": ("recurrence_replaced" if honest_only
+                                      else "recurrence_agreed"),
+            # What the unconditional honest probe saw, whether or not it could be
+            # certified: this is the number a caller needs to choose a reachable
+            # tolerance instead of guessing (see probe_window).
+            "probe_start": int(probe_start), "probe_count": int(probe_count),
+            "stall_floor": (None if stall_floor is None else float(stall_floor)),
+            "stall_iteration": (None if stall_iteration is None
+                                else int(stall_iteration)),
+            "criterion_value": ((float(normal_norm.item())
+                                 / float((norma * residual_norm).item()))
+                                if float((norma * residual_norm).item()) > 0
+                                else float("inf")),
+            "best_criterion": (None if best_iterate is None
+                               else float(best_iterate[0]))}
     if not converged:
         import warnings
-        warnings.warn("GPU CGLS did not converge: reason=%s, iterations=%d, normr=%g, normar=%g" %
-                      (info["stop_reason"], n_iter, info["normr"], info["normar"]), RuntimeWarning, stacklevel=2)
+        _hint = ""
+        if stall_floor is not None:
+            # Say what the number MEANS, in the same spirit as the FISTA valve's
+            # "Re-run with --tol >= X": a caller reading only the warning should not
+            # have to guess whether the budget or the arithmetic was the limit.  The
+            # caveat is not decoration -- the criterion is relative, so a raised
+            # tolerance certifies the iterate the probes reached, which was measured
+            # 20x worse in residual than the run that reached the floor itself.
+            _hint = (", best_criterion=%.3e at iteration %s (analytic floor %.3e,"
+                     " certifiable cap %.3e): this is a PRECISION limit, not a"
+                     " budget limit, and requesting atol >= %.3e would certify the"
+                     " iterate the probe reached -- not a better one"
+                     % (stall_floor, stall_iteration, tol_floor, _CGLS_FLOOR_MAX,
+                        stall_floor * (1.0 + _CGLS_FLOOR_MARGIN)))
+        warnings.warn("GPU CGLS did not converge: reason=%s, iterations=%d, normr=%g, normar=%g%s" %
+                      (info["stop_reason"], n_iter, info["normr"], info["normar"], _hint),
+                      RuntimeWarning, stacklevel=2)
     return x, info
 
 
-def _fista_twolevel(A, y, alpha, x0, max_iter, tol, lipschitz, rows=None, penalty_weights=None, n_samples=None):
+# ---- FISTA measured-floor valve (mirrors the CGLS stall valve above) --------
+# A relative KKT certificate (max violation / |A^T y|_max) computed in float32
+# stalls well above the requested tolerance on large, ill-conditioned problems:
+# measured on the Mg8C120 c7/c4 LASSO fit, 20000 iterations reached 2.566e-4 and
+# 60000 iterations reached 2.523e-4 against a requested 1e-4 -- tripling the
+# budget moved the certificate by 1.7 %, so the run could not be certified and
+# the entire budget was spent for nothing (3364 s and 2759 s of GPU time, both
+# rejected).  LSMR has its own floor (_lsmr_tol) and the debias CGLS has
+# _CGLS_STALL_MARGIN; FISTA had neither, so it always ground to max_iter.
+_FISTA_STALL_MARGIN = 0.05      # < 5 % certificate improvement = no progress
+_FISTA_FLOOR_MARGIN = 0.10      # headroom once the floor becomes the certificate
+_FISTA_FLOOR_MAX = 1e-2         # past this the system is unsolvable in this precision
+# How long "no progress" must last before the run stops paying for more.  FISTA's
+# tail is sublinear, NOT flat: on the c2=7 A/c3=4 A Mg8C120 operator the relative
+# KKT certificate runs 9.90e-04 at iteration 80 -> 2.98e-04 at 7160 -> 2.52e-04 at
+# 60000, i.e. it keeps creeping down by ~16 % per 1000 iterations for tens of
+# thousands of iterations.  A short window therefore declares a "floor" that is
+# not one: with the first 60-iteration window this valve stopped at iteration 80
+# and delivered ||x||=460.4 / nnz 37285 against the converged run's 608.4 / 25847.
+# The window is what makes the verdict meaningful, so it scales with the budget:
+# min(_FISTA_STALL_WINDOW_MAX, max(_FISTA_STALL_WINDOW_MIN, max_iter // 2)) --
+# never before 8000 iterations unless the whole budget is smaller than that.
+_FISTA_STALL_WINDOW_MAX = 8000  # iterations without progress that may end a run
+_FISTA_STALL_WINDOW_MIN = 200
+_FISTA_KKT_EVERY = 20           # iterations between certificate checks
+# The objective-monotonicity test behind the step-size backtracking used a
+# 1e-9 *relative* slack.  In torch.float32 the objective carries its own
+# evaluation noise (~1e-7 relative), so noise-level increases counted as real
+# increases and doubled L on every check until it overflowed: measured on the
+# Mg8C120 c2=7 A LASSO, lipschitz=Infinity after 292 inflations, after which
+# 1/L == 0 froze the iterate for the rest of a 60000-iteration budget that was
+# then rejected.  Compare against the dtype's own resolution instead.
+_FISTA_F_REFINE = 8.0           # objective-slack multiplier, in units of eps(dtype)
+_FISTA_MAX_INFLATIONS = 40      # beyond this L is chasing rounding noise, not curvature
+
+
+def _fista_floor_cfg(auto_floor=None, max_iter=None):
+    """(use_valve, stall_points, floor_max, floor_margin) for the FISTA valve.
+
+    PHEASY_FISTA_AUTO_FLOOR=0 restores the pre-valve behaviour (grind to
+    max_iter, then report non-convergence).  PHEASY_FISTA_STALL_POINTS is how
+    many consecutive KKT checks (one every _FISTA_KKT_EVERY iterations) without
+    a >= 5 % improvement declare the practical floor; left unset it is derived
+    from the budget as min(8000, max(200, max_iter // 2)) / 20, because a short
+    window on a sublinear tail certifies a "floor" that is still descending (see
+    the constants above).  PHEASY_FISTA_FLOOR_MAX is where stopping early wins
+    over certifying a tolerance this precision cannot express.
+
+    auto_floor=False is for the callers where hitting the cap is BY DESIGN (CV
+    folds, the alpha path walk): there the cheap approximate solve is the point
+    and the hit-cap diagnostic is information, not waste.
+    """
+    def _num(name, default):
+        try:
+            return float(os.environ.get(name, default))
+        except (TypeError, ValueError):
+            return float(default)
+
+    env_on = os.environ.get("PHEASY_FISTA_AUTO_FLOOR", "1").strip().lower() in (
+        "1", "true", "yes", "on")
+    use = env_on if auto_floor is None else (bool(auto_floor) and env_on)
+    raw_points = os.environ.get("PHEASY_FISTA_STALL_POINTS")
+    if raw_points:
+        points = max(1, int(_num("PHEASY_FISTA_STALL_POINTS", 0)))
+    elif max_iter is None:
+        points = 3
+    else:
+        budget = max(1, int(max_iter))
+        window = min(_FISTA_STALL_WINDOW_MAX,
+                     max(_FISTA_STALL_WINDOW_MIN, budget // 2))
+        points = max(1, -(-window // _FISTA_KKT_EVERY))
+    return (use,
+            points,
+            _num("PHEASY_FISTA_FLOOR_MAX", _FISTA_FLOOR_MAX),
+            _num("PHEASY_FISTA_FLOOR_MARGIN", _FISTA_FLOOR_MARGIN))
+
+
+def _fista_twolevel(A, y, alpha, x0, max_iter, tol, lipschitz, rows=None, penalty_weights=None, n_samples=None,
+                    auto_floor=None):
     """Device FISTA, adaptive restart and exact L1 KKT certificate.
 
     No NumPy or vector host transfers in the iteration loop. Scalar syncs are
     limited to backtracking acceptance and a KKT check every 20 iterations.
     Masked residuals give the exact training objective without fold CSR copies.
+
+    auto_floor: run the measured-floor valve (see _fista_floor_cfg).  None =
+    follow PHEASY_FISTA_AUTO_FLOOR (default on), False = never valve (CV/path).
     """
     torch = A.torch
     n = A.shape[0] if rows is None else rows.numel()
@@ -2248,6 +3479,21 @@ def _fista_twolevel(A, y, alpha, x0, max_iter, tol, lipschitz, rows=None, penalt
     n_iter = 0
     prev_f = None
     n_inflate = 0
+    # --- measured-floor valve state (see _fista_floor_cfg) ------------------
+    _valve, _stall_limit, _floor_max, _floor_margin = _fista_floor_cfg(
+        auto_floor, max_iter)
+    try:
+        _max_inflate = int(float(os.environ.get("PHEASY_FISTA_MAX_INFLATIONS",
+                                                _FISTA_MAX_INFLATIONS)))
+    except (TypeError, ValueError):
+        _max_inflate = _FISTA_MAX_INFLATIONS
+    tol_requested = float(tol)
+    tol_eff = float(tol)
+    stop_reason = "iteration_limit"
+    best_kkt = None
+    best_x = None
+    stalls = 0
+    measured_floor = None
     for it in range(int(max_iter)):
         n_iter = it + 1
         residual = (A.matvec(z) - y) * mask
@@ -2271,11 +3517,13 @@ def _fista_twolevel(A, y, alpha, x0, max_iter, tol, lipschitz, rows=None, penalt
             rx = (A.matvec(x) - y) * mask
             f_new = float((0.5 * torch.dot(rx, rx)
                            + (penalty_vec * x.abs()).sum()).item())
-            if prev_f is not None and f_new > prev_f + 1e-9 * (abs(prev_f) + 1e-300):
+            f_slack = _FISTA_F_REFINE * float(torch.finfo(y.dtype).eps)
+            if prev_f is not None and f_new > prev_f + f_slack * (abs(prev_f) + 1e-300):
                 # Step too large: inflate L, restart the momentum from the
                 # current iterate.  (One measured inflation over 800 iterations
                 # on the reference problems, so this costs nothing when L is
-                # already adequate.)
+                # already adequate.)  The slack is dtype-scaled because a
+                # float32 objective cannot resolve differences below ~1e-7.
                 L = L * 2.0
                 z = x.clone()
                 momentum = torch.ones((), dtype=y.dtype, device=y.device)
@@ -2283,18 +3531,105 @@ def _fista_twolevel(A, y, alpha, x0, max_iter, tol, lipschitz, rows=None, penalt
                 n_inflate += 1
             else:
                 prev_f = f_new
-            if bool((certificate <= tol).item()):
+            cert = float(certificate.item())
+            if cert <= tol_eff:
                 converged = True
+                stop_reason = ("converged" if tol_eff <= tol_requested
+                               else "converged_on_raised_tol")
+                break
+            if not _valve:
+                continue
+            # Solver-health guard, BEFORE the floor valve: a frozen iterate
+            # (1/L == 0 after runaway inflations) also leaves the certificate
+            # flat, and certifying that as a measured floor would label a
+            # step-size failure as a precision limit.
+            if not bool(torch.isfinite(L).item()) or n_inflate >= _max_inflate:
+                import warnings
+                warnings.warn(
+                    "FISTA step-size estimate diverged: lipschitz=%g (finite=%s) "
+                    "after %d inflations in %s (budget %d).  Backtracking doubled L "
+                    "every time the objective rose, i.e. it is chasing rounding "
+                    "noise rather than curvature, and at this L the step 1/L can no "
+                    "longer move the iterate.  Stopping at iteration %d of "
+                    "max_iter=%d WITHOUT certifying -- a frozen iterate is not a "
+                    "precision floor.  Re-estimate L (raise "
+                    "PHEASY_LIPSCHITZ_POWER_P, lower "
+                    "PHEASY_FISTA_LIPSCHITZ_SAFETY) or check the operator."
+                    % (float(L), bool(np.isfinite(float(L))), n_inflate,
+                       str(y.dtype), int(_max_inflate), n_iter, int(max_iter)),
+                    RuntimeWarning, stacklevel=2)
+                stop_reason = "step_size_diverged"
+                break
+            # Certificate stopped improving: measure the floor instead of
+            # assuming the requested tolerance is reachable.  Same idiom as the
+            # CGLS stall valve -- keep the BEST iterate, because the one the loop
+            # happens to stop on is usually worse.
+            if best_kkt is None or cert < best_kkt * (1.0 - _FISTA_STALL_MARGIN):
+                best_kkt = cert
+                best_x = x.clone()
+                stalls = 0
+            else:
+                stalls += 1
+            if stalls >= _stall_limit:
+                measured_floor = best_kkt
+                if measured_floor <= _floor_max:
+                    accepted = min(measured_floor * (1.0 + _floor_margin), _floor_max)
+                    if accepted > tol_eff:
+                        import warnings
+                        warnings.warn(
+                            "FISTA cannot reach tol=%g in %s: the relative KKT "
+                            "certificate improved by less than %g%% in every "
+                            "%d-iteration check for the last %d iterations "
+                            "(best %g at iteration %d).  The request is below what "
+                            "this precision can express, so the run certifies the "
+                            "BEST iterate at tol_effective=%g instead of spending "
+                            "the remaining %d of max_iter=%d iterations on a "
+                            "stopping test it cannot satisfy.  Request --tol >= %g, "
+                            "or shorten the window with PHEASY_FISTA_STALL_POINTS, "
+                            "to make the request honest."
+                            % (tol_requested, str(y.dtype),
+                               100.0 * _FISTA_STALL_MARGIN, _FISTA_KKT_EVERY,
+                               int(_stall_limit) * _FISTA_KKT_EVERY, measured_floor,
+                               n_iter, accepted, int(max_iter) - n_iter,
+                               int(max_iter), accepted), RuntimeWarning, stacklevel=2)
+                        tol_eff = accepted
+                    x = best_x
+                    stop_reason = "converged_measured_floor"
+                    break
+                import warnings
+                warnings.warn(
+                    "FISTA stalled at relative KKT=%g, past "
+                    "PHEASY_FISTA_FLOOR_MAX=%g: this precision cannot certify any "
+                    "meaningful tolerance here, so the run stops at iteration %d "
+                    "instead of grinding to max_iter=%d.  Re-run with --tol >= %g or "
+                    "fix the conditioning (the certificate is not a tolerance "
+                    "problem)." % (measured_floor, _floor_max, n_iter,
+                                   int(max_iter), measured_floor * 1.05),
+                    RuntimeWarning, stacklevel=2)
+                x = best_x
+                stop_reason = "stall_above_floor"
                 break
     certificate = kkt(x)
     value = float(certificate.item())
-    converged = bool(np.isfinite(value) and value <= tol)
+    if stop_reason == "converged_measured_floor":
+        # Certify against the measured floor (the re-derived certificate is the
+        # same deterministic quantity, with _FISTA_FLOOR_MARGIN headroom for the
+        # +-2 % kernel-accumulation spread the CGLS valve documents).
+        converged = bool(np.isfinite(value) and value <= tol_eff)
+        if not converged:
+            stop_reason = "stall_above_floor"
+    else:
+        converged = bool(np.isfinite(value) and value <= tol)
     info = dict(n_iter=n_iter, converged=converged, kkt_relative=value,
-                lipschitz=float(L), lipschitz_inflations=n_inflate)
+                lipschitz=float(L), lipschitz_inflations=n_inflate,
+                stop_reason=stop_reason, tol_requested=tol_requested,
+                tol_effective=tol_eff, measured_floor=measured_floor,
+                stall_points=int(_stall_limit))
     if not converged:
         import warnings
-        warnings.warn("Resident FISTA did not converge: iterations=%d, relative KKT=%g, tol=%g" %
-                      (n_iter, value, tol), RuntimeWarning, stacklevel=2)
+        warnings.warn("Resident FISTA did not converge: iterations=%d, relative KKT=%g, tol=%g"
+                      " (stop_reason=%s)" %
+                      (n_iter, value, tol, stop_reason), RuntimeWarning, stacklevel=2)
     return x, info
 
 
@@ -2443,6 +3778,8 @@ class GpuTwoLevelLassoCV(GpuLassoCV):
         # the factors per card.  The canonical copy is released as soon as the
         # last card has uploaded (the device copies are independent).
         host_factors = _canonical_twolevel_host(A)
+        _mem_trace("resident host factors ready (lazy adjoint=%s)"
+                   % type(host_factors[2]).__name__)
         replicas = []
         try:
             try:
@@ -2475,6 +3812,7 @@ class GpuTwoLevelLassoCV(GpuLassoCV):
                 owned.append(op)
         finally:
             host_factors = None
+        _mem_trace("resident factors uploaded")
         print("[gpu_resident] factors ready on %d device(s) primary=%s shards=%d "
               "dtype=%s estimated_peak_bytes=%d elapsed=%.2fs" %
               (len(devices), op.device, op._n_shards, op._value_dtype,
@@ -2493,7 +3831,27 @@ class GpuTwoLevelLassoCV(GpuLassoCV):
         penalty_weights = None
         pilot_info = None
         if self.adaptive:
-            pilot, pilot_info = iterative_lstsq(op, yt, atol=min(self.tol, 1e-8), btol=min(self.tol, 1e-8), maxiter=self.max_iter)
+            # The pilot only sets the adaptive weights (|c_j| + eps)^-gamma, so
+            # it needs the coefficient MAGNITUDES, not a tight solution -- and it
+            # has its own accuracy budget rather than the FISTA tolerance.  Asking
+            # it for 1e-8 on a float32 operator is a request the arithmetic cannot
+            # meet: measured on c7 (25515x3678, float32 factors, one RTX 3090) the
+            # pilot ran 666 iterations into an exploded iterate and returned
+            # ||c|| = 4.0e19, so every weight came out ~1e-19 (|c|+eps)^-1 and the
+            # "adaptive" LASSO had a numerically ZERO penalty -- it degenerated
+            # into truncated OLS with 3678 nonzeros.  At 1e-5 the pilot converges
+            # in 126 iterations (0.3s vs 32.7s) and its weights differ from the
+            # 20000-iteration solution by 0.6% peak; at 1e-4 the peak weight
+            # difference is already 62%, because the smallest coefficients -- the
+            # ones that set the top of the weight range -- are where the relative
+            # error concentrates.  1e-5 is the coarsest setting inside a 1% weight
+            # budget on that operator.
+            pilot_tol = float(os.environ.get("PHEASY_ALASSO_PILOT_TOL", "1e-5"))
+            pilot, pilot_info = iterative_lstsq(
+                op, yt, atol=pilot_tol, btol=pilot_tol, maxiter=self.max_iter)
+            # Keep the pilot certificate: if it did not converge the weights are
+            # still usable, but nothing else in the fit would say so.
+            self.pilot_info_ = dict(pilot_info) if isinstance(pilot_info, dict) else pilot_info
             pilot = torch.as_tensor(pilot, dtype=op._value_dtype, device=op.device)
             penalty_weights_t = torch.pow(pilot.abs() + self.eps, -self.gamma)
             if not bool(torch.isfinite(penalty_weights_t).all().item()):
@@ -2503,10 +3861,18 @@ class GpuTwoLevelLassoCV(GpuLassoCV):
             self.penalty_weights_ = _to_numpy(penalty_weights_t, np.float64)
             print("[gpu_resident] adaptive pilot=GPU CGLS gamma=%.6g weight_range=[%.6e, %.6e]" % (self.gamma, float(penalty_weights_t.min().item()), float(penalty_weights_t.max().item())), flush=True)
             if self.alpha_auto:
-                weighted_kkt = torch.max(torch.abs(op.rmatvec(yt)) / torch.clamp(penalty_weights_t, min=torch.finfo(yt.dtype).tiny)) / A.shape[0]
+                _g_w = torch.abs(op.rmatvec(yt))
+                weighted_kkt = torch.max(_g_w / torch.clamp(penalty_weights_t, min=torch.finfo(yt.dtype).tiny)) / A.shape[0]
+                # [FIX P46] the ALASSO rule (P37) anchors the bottom at the MIN of
+                # the weighted and unweighted thresholds; the unweighted one comes
+                # from the same rmatvec, so it is free here.
+                unweighted_kkt = float(torch.max(_g_w).item()) / A.shape[0]
                 amax = float(weighted_kkt.item())
                 if amax > 0 and np.isfinite(amax):
-                    self.alphas = np.logspace(np.log10(amax) - self.decades, np.log10(amax), max(self.nalpha, len(self.alphas)))
+                    self.alphas = _lasso_grid(amax, min(amax, unweighted_kkt),
+                                              self.decades,
+                                              max(self.nalpha, len(self.alphas)),
+                                              A.shape[0], A.shape[1])
         elif self.alpha_auto:
             # Non-adaptive LASSO: derive the KKT-threshold grid on the resident
             # operator instead of relying on the CLI's CPU derive_alpha_grid. op
@@ -2516,7 +3882,12 @@ class GpuTwoLevelLassoCV(GpuLassoCV):
             g = op.rmatvec(yt)
             amax = float(torch.max(torch.abs(g)).item()) / A.shape[0]
             if amax > 0 and np.isfinite(amax):
-                self.alphas = np.logspace(np.log10(amax) - self.decades, np.log10(amax), max(self.nalpha, len(self.alphas)))
+                # [FIX P46] same span floor as derive_alpha_grid: this resident
+                # grid is the one the shipped GPU runner actually uses, and a bare
+                # 4 decades pinned Mg8C120 alpha* 1.2x above its own bottom.
+                self.alphas = _lasso_grid(amax, amax, self.decades,
+                                          max(self.nalpha, len(self.alphas)),
+                                          A.shape[0], A.shape[1])
         cv_tol = float(os.environ.get("PHEASY_CV_TOL", str(max(self.tol, 1e-3))))
         # CV only needs the MSE *ranking* across alphas, not a tight solution per
         # alpha. The mid-grid alphas (the sparse->dense transition) converge
@@ -2553,9 +3924,12 @@ class GpuTwoLevelLassoCV(GpuLassoCV):
                 x = None
                 infos = []
                 for i in range(len(self.alphas) - 1, -1, -1):
+                    # CV folds are a capped, ranking-only approximation by design:
+                    # hitting the cap is information (see _cv_hit_cap), not waste.
                     x, info = _fista_twolevel(worker, target, float(self.alphas[i]), x,
                                              cv_cap, cv_tol, estimate, trt,
-                                             penalty_weights=penalty_weights, n_samples=int(trt.numel()))
+                                             penalty_weights=penalty_weights, n_samples=int(trt.numel()),
+                                             auto_floor=False)
                     err = worker.matvec(x)[vat] - target[vat]
                     values[i] = err.square().mean()
                     infos.append(dict(info, alpha=float(self.alphas[i])))
@@ -2608,8 +3982,11 @@ class GpuTwoLevelLassoCV(GpuLassoCV):
         # Preserve independent full-data descending warm-start path.
         x = None
         for i in range(len(self.alphas) - 1, best_i - 1, -1):
+            # The alpha-path walk is warm-started and capped on purpose (each
+            # alpha only needs to be roughly right to rank the grid).
             x, path_info = _fista_twolevel(op, yt, float(self.alphas[i]), x, cv_cap, cv_tol, L,
-                                         penalty_weights=penalty_weights, n_samples=A.shape[0])
+                                         penalty_weights=penalty_weights, n_samples=A.shape[0],
+                                         auto_floor=False)
             print("[gpu_resident] full-path alpha=%.6e n_iter=%d kkt=%.3e converged=%s elapsed=%.2fs" %
                   (self.alphas[i], path_info["n_iter"], path_info["kkt_relative"],
                    path_info["converged"], time.monotonic() - started), flush=True)

@@ -78,9 +78,17 @@ class OptimizerLargeRegressions(unittest.TestCase):
                 before = model.results["pre_debias_coef"]
                 assert_allclose(dense @ before, captured["prediction"], atol=1e-10)
                 self.assertFalse(np.shares_memory(before, model.results["coef"]))
-                with patch.dict(os.environ, {"PHEASY_LASSO_DEBIAS": "0"}):
+                # [FIX P46] PHEASY_LASSO_DEBIAS=0 is honoured, EXCEPT when alpha*
+                # sits at the grid bottom: then no sparsity is supported and the
+                # relaxed refit is forced (see _alpha_edge_relaxed_enabled).  This
+                # test is about the debias switch itself, so pin alpha* away from
+                # the edge fallback and assert the historical behaviour.
+                with patch.dict(os.environ, {"PHEASY_LASSO_DEBIAS": "0",
+                                             "PHEASY_LASSO_EDGE_RELAXED": "0"}):
                     model.fit(A, y)
                 self.assertNotIn("pre_debias_coef", model.results)
+                self.assertFalse(model.results.get("alpha_at_grid_edge", False) and
+                                 "debias_forced_reason" in model.results)
 
     def test_debias_rejects_worse_refit_and_skips_empty_support(self):
         A = aslinearoperator(np.eye(4))
@@ -267,7 +275,12 @@ class OptimizerLargeRegressions(unittest.TestCase):
         dense = q * np.geomspace(1, 1e6, 40)
         A = opt.TwoLevelSM(sp.csr_matrix(dense), sp.eye(40, format="csr"))
         y = dense @ (1 / np.geomspace(1, 1e6, 40))
-        model = opt.PheasyRFE_OLS_TSQR(min_features=40, cv=3, verbose=False)
+        # min_features must be BELOW n_features or the RFE has no elimination
+        # round, and under [PATCH rfe-final-tsqr] the degenerate case solves the
+        # full support with the exact Gram refit instead of the iterative subset
+        # solver -- the pattern this test exists to pin.  With 40 features, 12
+        # forces real ranking solves through _solve_subset(column_scale=...).
+        model = opt.PheasyRFE_OLS_TSQR(min_features=12, cv=3, verbose=False)
         with patch.dict(os.environ, {"PHEASY_RFE_JACOBI": "1",
                                      "PHEASY_LSQR_MAXITER": "80"}), \
                 patch.object(opt, "_iterative_solver_info", wraps=opt._iterative_solver_info) as info:

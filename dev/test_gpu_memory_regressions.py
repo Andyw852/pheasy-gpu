@@ -115,7 +115,14 @@ class GpuMemoryRegressions(unittest.TestCase):
 
     def test_skewed_blocks_fail_before_upload(self):
         matrix = sp.csr_matrix(([1.0] * 9, ([0] * 9, list(range(9)))), shape=(12, 24))
-        actual = gb._cuda_spmv_block_budget(matrix[:6], matrix[:, :12].T.tocsr(), 8)
+        # The pre-flight is per SHARD, at the boundaries the operator actually
+        # splits at -- nnz-balanced since the c3=5.0 skew fix (_row/col_shard_edges),
+        # not the uniform linspace the original version of this test hard-coded.
+        rs = gb._row_shard_edges(matrix, 2)
+        cs = gb._col_shard_edges(matrix, 2)
+        actual = gb._cuda_spmv_block_budget(
+            matrix[int(rs[0]):int(rs[1])],
+            matrix[:, int(cs[0]):int(cs[1])].T.tocsr(), 8)
         with patch.object(gb, "_device_free_bytes", return_value=actual - 1):
             with self.assertRaisesRegex(MemoryError, "actual CSR row/transpose blocks"):
                 gb.GpuSparseMV(matrix, n_gpu=2, device_ids=[0, 1])

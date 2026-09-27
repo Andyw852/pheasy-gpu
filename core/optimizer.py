@@ -1,13 +1,20 @@
 """Classes and functions for force constant regression.
 
-Implements the five force-constant fitting methods exposed by pheasy:
-OLS, RFE, RFE-OLS-TSQR (RFE_TSQR), LASSO and ALASSO (adaptive LASSO), plus
-the legacy RIDGE method. The public entry point is the Optimizer class.
+Implements the force-constant fitting methods exposed by pheasy:
+OLS, RFE / RFE-OLS (recursive feature elimination with an OLS base
+estimator; "RFE" and "RFE-OLS" are aliases), RFE-OLS-TSQR (RFE_TSQR),
+LASSO, ALASSO (adaptive LASSO), ARDR (automatic relevance determination
+regression) and the legacy RIDGE method.  The public entry point is the
+Optimizer class.
 
 References:
   H. Zou, "The Adaptive Lasso and Its Oracle Properties", JASA 101 (2006).
   F. Eriksson et al., Adv. Theory Simul. 2 (2019) (hiphive).
   J. Demmel et al., SIAM J. Sci. Comput. 34 (2012) A206 (TSQR).
+  E. Fransson, F. Eriksson, P. Erhart, npj Comput. Mater. 6, 135 (2020)
+    (OLS / LASSO / RFE-OLS / ARDR comparison for force-constant models;
+    ARDR = scikit-learn ARDRegression, threshold_lambda = 1e4).
+  D. J. C. MacKay, "Bayesian interpolation", Neural Comput. 4 (1992) 415.
 """
 import contextlib
 import os
@@ -54,11 +61,42 @@ def _array_precision(A):
     a float32 matrix -- exactly the case where the floor is needed.  Read the
     array in hand instead: the two-level operator exposes SM_prime, anything else
     exposes dtype.
+
+    The factors are read through the _twolevel_base chain FIRST, because the
+    wrappers that carry a row slice or a column scaling are declared float64
+    whatever they multiply: _scale_columns -> _scale_operator builds a
+    _CustomLinearOperator(..., dtype=np.float64) that keeps its two-level
+    provenance only in _twolevel_base, and _row_slice of it (every CV fold)
+    inherits that.  Testing A.dtype before the factors therefore reported
+    float64 for a float32 operator, _lsmr_tol saw 1e-8 as reachable and left it
+    alone -- the exact failure the floor was written to prevent.  Measured on
+    the c7 resident-ridge operator: atol 1.192e-06 for the bare TwoLevelSM but
+    1e-08 once --std wrapped it in _scale_operator, i.e. the resident CGLS was
+    asked for a tolerance five orders below what float32 can represent.
     """
-    for obj in (getattr(A, "SM_prime", None), A):
-        dt = getattr(obj, "dtype", None)
-        if dt is None:
-            continue
+    # Explicit provenance wins over inference: the wrappers below record what
+    # they multiply in _data_dtype, because a wrapper that declares
+    # dtype=float64 around float32 factors (see _scale_operator, _row_slice_op)
+    # is otherwise indistinguishable from a genuine float64 operator.
+    hint = getattr(A, "_data_dtype", None)
+    if hint is not None:
+        try:
+            return np.dtype(hint).type
+        except TypeError:
+            pass
+    seen = set()
+    node = A
+    while node is not None and id(node) not in seen:
+        seen.add(id(node))
+        dt = getattr(getattr(node, "SM_prime", None), "dtype", None)
+        if dt is not None:
+            try:
+                return np.dtype(dt).type
+            except TypeError:
+                pass
+        node = getattr(node, "_twolevel_base", None)
+    dt = getattr(A, "dtype", None)
+    if dt is not None:
         try:
             return np.dtype(dt).type
         except TypeError:
@@ -326,6 +364,83 @@ def _col_norms(A):
     return norms
 
 
+# ---------------------------------------------------------------------------
+# [FIX P46] LASSO auto-grid: span floor + per-decade density.
+#
+# The grid TOP is principled and system independent: alpha_max = max_j|X_j^T y|/n
+# is the exact KKT threshold (verified to 1e-9 against the definition on
+# synthetic sparse/half/dense problems).  The grid BOTTOM used to be a bare
+# --alpha_decades = 4, and that truncates cross-validation whenever the data is
+# high-SNR, because the CV curve then keeps falling below everything the grid
+# reaches and alpha* is pinned to the bottom edge -- i.e. the penalty is chosen
+# by the GRID, not by the data.
+#
+# Measured on Mg8C120 (454656 x 69487, c2=7/c3=4, 296 configs):
+#     4-decade grid  -> alpha*=3.846e-08 (1.2x above the bottom), re 7.52%,
+#                       grouped holdout relL2 7.54%   (the shipped v4 fit)
+#     6-decade grid  -> alpha*=2.305e-10 (still the bottom),  re 1.34%,
+#                       grouped holdout relL2 1.65%; the same command with the
+#                       same data: 4dec 2.43% vs 6dec 1.32% on 237/59 configs
+#     OLS            ->                                     re 1.39%,
+#                       grouped holdout relL2 1.23%
+# The synthetic study (tmp/alpha_grid_snr.py) shows the regime boundary: with a
+# genuinely sparse truth (20 of 300 coefficients) the CV minimum is INTERIOR at
+# 4 decades, so the floor below is a no-op there; with a dense truth and low
+# noise (the Mg8C120 regime) alpha* pins at the bottom for 4, 6, 8 AND 10
+# decades and the LASSO solution equals OLS to the last digit -- which is what
+# the relaxed/L1-free refit in Optimizer.fit is for.
+#
+# ALASSO already floors its OVERDETERMINED grid at 6 decades ([FIX P37]); LASSO
+# did not, so the two paths disagreed on the same data.  Keep the floor to
+# overdetermined problems: an underdetermined system genuinely needs
+# regularization, its CV optimum is interior, and a long low-alpha tail only
+# makes the solver crawl.
+_LASSO_GRID_MIN_DECADES = 6.0
+
+
+def lasso_grid_floor_enabled():
+    """PHEASY_LASSO_GRID_FLOOR=0 restores the historical bare --alpha_decades."""
+    return os.environ.get("PHEASY_LASSO_GRID_FLOOR", "1").lower() in ("1", "true", "yes")
+
+
+def lasso_grid_min_decades(n_samples, n_features, decades):
+    """Effective decades below alpha_max for an auto-derived LASSO grid."""
+    dec = float(decades)
+    if not lasso_grid_floor_enabled():
+        return dec
+    if int(n_samples) <= int(n_features):
+        return dec
+    floor = float(os.environ.get("PHEASY_LASSO_GRID_MIN_DECADES",
+                                 str(_LASSO_GRID_MIN_DECADES)))
+    if not np.isfinite(floor) or floor <= dec:
+        return dec
+    return floor
+
+
+def lasso_alpha_grid(lo, hi, nalpha):
+    """Log grid lo..hi whose DENSITY does not drop when the span widens.
+
+    Widening the span must not coarsen the step (a 6-decade span at a fixed 20
+    points is 2x coarser per step than 4 decades, which is how the v4 fit ended
+    up with alpha* between two grid points).  Density follows
+    PHEASY_ALPHA_PER_DECADE (default (nalpha-1)/4, i.e. the historical 4-decade
+    grid's density) and the count is capped by PHEASY_ALPHA_NMAX.
+    """
+    lo = float(lo)
+    hi = float(hi)
+    if not (np.isfinite(lo) and np.isfinite(hi)) or lo <= 0 or hi <= lo:
+        raise ValueError("invalid alpha grid bounds [%r, %r]" % (lo, hi))
+    span = float(np.log10(hi / lo))
+    per_dec = float(os.environ.get(
+        "PHEASY_ALPHA_PER_DECADE", str(max((int(nalpha) - 1) / 4.0, 1.0))))
+    n = 1 + int(np.ceil(span * per_dec))
+    n = max(n, int(nalpha))
+    nmax = int(os.environ.get("PHEASY_ALPHA_NMAX", "200"))
+    if nmax > 0 and n > nmax:
+        n = nmax
+    return np.logspace(np.log10(lo), np.log10(hi), n)
+
+
 def derive_alpha_grid(A, y, nalpha=100, decades=4.0, standardize=False,
                      mu_shift=0.0):
     """Derive a LASSO/ALASSO alpha grid from the data.
@@ -370,8 +485,17 @@ def derive_alpha_grid(A, y, nalpha=100, decades=4.0, standardize=False,
     a_max *= 10.0 ** float(mu_shift)
     if not np.isfinite(a_max) or a_max <= 0:
         raise ValueError("alpha_max = %r, invalid" % a_max)
-    a_min = a_max * 10.0 ** (-float(decades))
-    return np.logspace(np.log10(a_min), np.log10(a_max), nalpha)
+    # [FIX P46] span floor + span-independent density (see the block above).
+    _dec = lasso_grid_min_decades(n, p, decades)
+    if _dec > float(decades):
+        print("[alpha_auto] alpha grid widened from %.1f to %.1f decades below the "
+              "KKT threshold (overdetermined %d x %d; PHEASY_LASSO_GRID_FLOOR=0 "
+              "restores the old span). A 4-decade grid pins alpha* to its own "
+              "bottom on high-SNR data: Mg8C120 re 7.52%% at 4 decades vs 1.34%% "
+              "at 6 with the identical command."
+              % (float(decades), _dec, n, p), flush=True)
+    a_min = a_max * 10.0 ** (-_dec)
+    return lasso_alpha_grid(a_min, a_max, nalpha)
 
 
 def _make_cv_splits(n_samples, cv, random_state=None, group_size=None):
@@ -454,8 +578,11 @@ def _solve_sparse_lsqr(A, y, info=None):
     ~280 GB). This is the same Krylov approach used by symfc / phonopy.
     """
     from scipy.sparse.linalg import lsqr as _sp_lsqr
-    atol = float(_lsmr_tol("PHEASY_LSQR_ATOL", 1e-8))
-    btol = float(_lsmr_tol("PHEASY_LSQR_BTOL", 1e-8))
+    # Pass the matrix: the floor is a property of the STORED data, so a sparse
+    # float32 sensing matrix cannot support the 1e-8 default and every solve on
+    # it would burn its whole iter_lim with istop=7 instead of converging.
+    atol = float(_lsmr_tol("PHEASY_LSQR_ATOL", 1e-8, A))
+    btol = float(_lsmr_tol("PHEASY_LSQR_BTOL", 1e-8, A))
     iter_lim = int(os.environ.get("PHEASY_LSQR_MAXITER", "5000"))
     y64 = np.asarray(y, dtype=np.float64).ravel()
     res = _sp_lsqr(A, y64, atol=atol, btol=btol, iter_lim=iter_lim)
@@ -578,7 +705,20 @@ def _lasso_backend(A):
         # (measured: 2 min into the fit, after a 3.6 GB SM_prime read).
         from . import gpu_backend as _gbp
         try:
-            peak, budget, _free, _frac = _gbp.resident_twolevel_estimate(A)
+            # [FIX R3] The resident operator tries a FULL per-card replica first
+            # and downgrades to ONE sharded operator ("CV folds run sequentially")
+            # when a replica does not fit, so the pre-flight must describe the
+            # sharded footprint too.  Without n_shards a large third-order fit is
+            # judged against the single-card number and sent to CPU even when the
+            # sharded operator fits: measured at c3=5.0, 88029528920 bytes was
+            # compared against 23643429273, while the sharded 22540422422 bytes
+            # would have fit that same budget.
+            try:
+                _n_shards = max(1, len(_gbp._resident_cv_devices()))
+            except Exception:
+                _n_shards = 1
+            peak, budget, _free, _frac = _gbp.resident_twolevel_estimate(
+                A, n_shards=_n_shards)
         except Exception:   # never let the pre-flight itself become the bug
             peak = budget = None
         if peak is not None and budget is not None and peak > budget:
@@ -811,7 +951,12 @@ def _make_masked_op(A, row_idx, col_idx):
             u_full = u
         return np.asarray(A.T @ u_full).ravel()[col_idx]
 
-    return LinearOperator((n_rows, n_cols), matvec=mv, rmatvec=rmv, dtype=dt)
+    result = LinearOperator((n_rows, n_cols), matvec=mv, rmatvec=rmv, dtype=dt)
+    # The masked view multiplies exactly the same stored factors, so it carries
+    # the same reachable precision -- otherwise _lsmr_tol reads the ambient
+    # dtype of this wrapper and the RFE subset solves lose the floor.
+    result._data_dtype = np.dtype(_array_precision(A))
+    return result
 
 
 def _soft_threshold(x, thr):
@@ -864,18 +1009,57 @@ def _top_eigval(G):
         return float(spla.eigvalsh(G)[-1])
 
 
-def _gram_smprime(SM_prime, block_rows=2000):
+def _gram_smprime(SM_prime, block_rows=None):
     """P = SM_prime^T SM_prime via blocked densification + BLAS gemm.
 
     [FIX P34] SM_prime (n x mid) may be huge and sparse; densifying it all at
     once costs n*mid*8 bytes. Processing row blocks keeps peak memory at
     block_rows*mid*8 and accumulates the mid x mid Gram with BLAS.
+
+    block_rows trades memory for P traffic: each block rewrites the whole
+    mid x mid P (2 * mid^2 * 8 bytes).  At mid=90108 that is 130 GB per block,
+    so the default 2000 gives 154 blocks = ~20 TB of traffic (measured 740 s
+    per block on the MgC 2+3 build, i.e. ~32 h).  PHEASY_GRAM_SMPRIME_BLOCK_ROWS
+    raises it (20000 -> 15 blocks, ~3 h of traffic, at the cost of a
+    block_rows x mid float64 buffer).
     """
+    import time as _t
+    if block_rows is None:
+        block_rows = int(os.environ.get("PHEASY_GRAM_SMPRIME_BLOCK_ROWS", "2000"))
     n, mid = SM_prime.shape
     P = np.zeros((mid, mid), dtype=np.float64)
-    for i0 in range(0, n, block_rows):
+    _nblk = (n + block_rows - 1) // block_rows
+    _t0 = _t.time()
+    _tlast = _t0
+    _used_syrk = False
+    try:
+        from scipy.linalg import blas as _blas
+    except Exception:
+        _blas = None
+    for _b, i0 in enumerate(range(0, n, block_rows)):
         B = np.asarray(SM_prime[i0:i0 + block_rows].toarray(), dtype=np.float64)
-        P += B.T @ B
+        if _blas is not None and hasattr(_blas, "dsyrk"):
+            # P += B^T B in place.  The naive form materializes a second
+            # mid x mid array (65 GB at mid=90108) on top of P, i.e. ~130 GB
+            # peak, which segfaulted the 2+3 build; dsyrk accumulates into P.
+            P = _blas.dsyrk(1.0, B, beta=1.0, c=P, trans=1, lower=0, overwrite_c=1)
+            _used_syrk = True
+        else:
+            P += B.T @ B
+        _now = _t.time()
+        if _b % 20 == 0 or _now - _tlast > 60.0 or _b == _nblk - 1:
+            print("[gram] P = SM_prime^T SM_prime: block %d/%d (%.1f%%) "
+                  "%.0fs elapsed, %.0fs since last report"
+                  % (_b + 1, _nblk, 100.0 * (_b + 1) / _nblk, _now - _t0,
+                     _now - _tlast), flush=True)
+            _tlast = _now
+    if _used_syrk:
+        # SYRK fills ONE triangle only (upper with lower=0); the other stays
+        # zero, so P was silently triangular and G = NS^T P NS indefinite.
+        # alpha*G + diag(lambda) then failed Cholesky and fell back to the
+        # ~100x slower pinvh (and the ARD trajectory was wrong).  Mirror the
+        # strict upper triangle into the lower to make P symmetric.
+        P += np.triu(P, 1).T
     return P
 
 
@@ -906,7 +1090,20 @@ def _compute_gram(A, y):
     P = None
     if hasattr(A, "SM_prime"):  # TwoLevelSM
         P = _gram_smprime(A.SM_prime)
-        G = np.asarray(A.NS.T @ (P @ A.NS), dtype=np.float64)
+        # [FIX P40] G = NS^T P NS computed in column blocks so the mid x p
+        # intermediate (P @ NS) is never fully materialized.  At c3=3.8 that
+        # intermediate is 78930 x 60238 x 8 = 38 GB; materializing it on top of
+        # P (49.8 GB) and G (29 GB) peaked at ~117 GB and was OOM-killed on the
+        # shared box.  Blocking caps the peak at P + mid x blk + G.
+        _NS = A.NS
+        _p = _NS.shape[1]
+        _blk = int(os.environ.get("PHEASY_GRAM_PROJECT_BLOCK", "1024"))
+        _blk = max(1, min(_blk, _p))
+        G = np.zeros((_p, _p), dtype=np.float64)
+        for _j0 in range(0, _p, _blk):
+            _j1 = min(_j0 + _blk, _p)
+            _Tblk = np.asarray(P @ _NS[:, _j0:_j1], dtype=np.float64)
+            G[:, _j0:_j1] = np.asarray(_NS.T @ _Tblk, dtype=np.float64)
     elif sp.issparse(A):
         G = np.asarray((A.T @ A).toarray(), dtype=np.float64)
     elif _is_linear_operator(A):
@@ -927,9 +1124,106 @@ def _compute_gram(A, y):
     return G, b, P
 
 
+def _compute_gram_blockwise(A, y, blk=None):
+    """G = A^T A and b = A^T y built column-block-wise, without forming P.
+
+    For a TwoLevelSM, _compute_gram first builds P = SM_prime^T SM_prime
+    (mid x mid) and then G = NS^T P NS.  When mid is large, P dominates the
+    peak memory (and can exceed G itself), even though the null-space
+    projection makes G much smaller.  This loop touches only n x blk and
+    p x blk temporaries:
+
+        SM_blk    = A @ I_blk        (n x blk)
+        G[:, blk] = A^T @ SM_blk     (p x blk)
+
+    so the peak is G + n*blk.  Cost is one TwoLevelSM matvec pair per block;
+    PHEASY_GRAM_BLOCK (default 64) trades memory for Python/matvec overhead.
+    """
+    n, m = A.shape
+    y64 = np.asarray(y, dtype=np.float64).ravel()
+    b = np.asarray(A.T @ y64, dtype=np.float64).ravel()
+    blk = int(os.environ.get("PHEASY_GRAM_BLOCK", "64")) if blk is None else int(blk)
+    blk = max(1, blk)
+    G = np.zeros((m, m), dtype=np.float64)
+    for j0 in range(0, m, blk):
+        j1 = min(j0 + blk, m)
+        I_blk = np.zeros((m, j1 - j0), dtype=np.float64)
+        I_blk[j0:j1, :] = np.eye(j1 - j0, dtype=np.float64)
+        A_blk = np.asarray(A @ I_blk, dtype=np.float64)     # n x blk
+        G[:, j0:j1] = np.asarray(A.T @ A_blk, dtype=np.float64)
+    return G, b
+
+
+def _build_gram_matrix(A, y64, budget_gb=None, force_block=False):
+    """Build (G = X^T X, b = X^T y) by the cheapest route that fits the budget.
+
+    For two-level input the factorized P = SM_prime^T SM_prime route needs far
+    fewer matvecs, but P is mid x mid and dominates when the null space
+    projects many columns away.  When P exceeds budget_gb (or force_block is
+    set) this falls back to _compute_gram_blockwise, whose peak is G + n*blk.
+    Column-scaled operator wrappers are handled by scaling G and b.
+
+    Returns (G, b, how) with how in {"P", "block", "dense", "sparse"}.
+    """
+    base = getattr(A, "_twolevel_base", None)
+    scale = getattr(A, "_twolevel_scale", None)
+    if budget_gb is None:
+        budget_gb = float(os.environ.get(
+            "PHEASY_ARDR_GRAM_MAX_GB", os.environ.get("PHEASY_GRAM_MAX_GB", "4")))
+    _no_p_env = os.environ.get("PHEASY_ARDR_GRAM_NO_P")
+    _force = force_block or (_no_p_env is not None
+                             and _no_p_env.lower() in ("1", "true", "yes", "on"))
+    p_base = base if base is not None else A
+    can_p = hasattr(p_base, "SM_prime") and not _force
+    if can_p and not _gram_budget_ok(p_base, max_gb=budget_gb):
+        print("[gram] P = SM_prime^T SM_prime (mid^2) exceeds "
+              "PHEASY_ARDR_GRAM_MAX_GB=%.1f; using the P-free block Gram"
+              % budget_gb, flush=True)
+        can_p = False
+    if can_p and os.environ.get("PHEASY_ARDR_GRAM_COST_HEURISTIC", "0").lower() in (
+            "1", "true", "yes", "on"):
+        # Opt-in cost heuristic.  In theory the P route needs n*mid^2 flops and
+        # the block route ~2*nnz*p, but measured on the MgC operators the block
+        # route is SLOWER (its sparse multi-column products run at a few
+        # GFLOPS: p=7918/mid=8361 block Gram took 489 s vs ~195 s for P), so P
+        # stays the default when it fits memory.
+        _mid = getattr(p_base, "SM_prime", None)
+        try:
+            _npt = float(A.shape[0]); _ppt = float(A.shape[1])
+            if (_mid is not None
+                    and _npt * float(_mid.shape[1]) ** 2 > 4.0 * float(_mid.nnz) * _ppt):
+                print("[gram] block Gram is >4x cheaper than P "
+                      "(n*mid^2=%.3g vs 2*nnz*p=%.3g); using the P-free block Gram"
+                      % (_npt * float(_mid.shape[1]) ** 2,
+                         2.0 * float(_mid.nnz) * _ppt), flush=True)
+                can_p = False
+        except Exception:
+            pass
+    if can_p:
+        G, b, _P = _compute_gram(p_base, y64)
+        if scale is not None:
+            d = 1.0 / np.asarray(scale, dtype=np.float64).ravel()
+            G = G * d[:, None] * d[None, :]
+            b = b * d
+        return G, b, "P"
+    p = int(A.shape[1])
+    if p * p * 8.0 / 1e9 > budget_gb:
+        raise NotImplementedError(
+            "the design Gram G = p x p (p=%d, %.2f GB) exceeds "
+            "PHEASY_ARDR_GRAM_MAX_GB=%.1f; raise the budget only if the machine "
+            "can genuinely hold it." % (p, p * p * 8.0 / 1e9, budget_gb))
+    if isinstance(A, np.ndarray) or sp.issparse(A):
+        # A concrete matrix: one BLAS gemm beats the block loop.
+        G, b, _P = _compute_gram(A, y64)
+        return G, b, "dense" if isinstance(A, np.ndarray) else "sparse"
+    G, b = _compute_gram_blockwise(A, y64)
+    return G, b, "block"
+
+
 def _fista_lasso(A, y, alpha, x0=None, max_iter=3000, tol=1e-7,
                  lipschitz=None, penalty_weights=None, _info=None,
-                 gram=None, n_samples=None, warn_nonconvergence=True):
+                 gram=None, n_samples=None, warn_nonconvergence=True,
+                 auto_floor=None):
     """Solve min 0.5||A x - y||^2 + alpha * sum_j w_j |x_j| via FISTA.
 
     [FIX P26] Matvec-only LASSO so LASSO / ALASSO can run on a TwoLevelSM /
@@ -1001,6 +1295,28 @@ def _fista_lasso(A, y, alpha, x0=None, max_iter=3000, tol=1e-7,
 
     converged = False
     kkt = float("inf")
+    # --- measured-floor valve (same idiom as _fista_twolevel / the CGLS one) --
+    # This is the path the LASSO takes whenever the resident factors do not fit
+    # the device (PHEASY_GPU_RESIDENT_FALLBACK): the matvecs are still the
+    # sharded GPU ones, so the certificate is limited by the same float32
+    # operator, and a tolerance below that floor can never fire.
+    try:
+        from .gpu_backend import (_fista_floor_cfg as _floor_cfg,
+                                  _FISTA_STALL_MARGIN as _stall_margin,
+                                  _FISTA_KKT_EVERY as _kkt_every)
+    except Exception:                                   # pragma: no cover
+        _floor_cfg = lambda auto_floor=None, max_iter=None: (False, 3, 1e-2, 0.10)  # noqa: E731
+        _stall_margin = 0.05
+        _kkt_every = 20
+    _valve, _stall_limit, _floor_max, _floor_margin = _floor_cfg(auto_floor,
+                                                                max_iter)
+    tol_requested = float(tol)
+    tol_eff = float(tol)
+    stop_reason = "iteration_limit"
+    best_kkt = None
+    best_x = None
+    stalls = 0
+    measured_floor = None
     z = x.copy()          # momentum point y_0 = x_0
     t = 1.0
     x_prev = x.copy()
@@ -1030,23 +1346,106 @@ def _fista_lasso(A, y, alpha, x0=None, max_iter=3000, tol=1e-7,
 
         if it % 20 == 19:
             dx = float(np.linalg.norm(x - x_prev))
-            if dx <= tol * max(1.0, float(np.linalg.norm(x))):
+            small_step = dx <= tol_eff * max(1.0, float(np.linalg.norm(x)))
+            if small_step or _valve:
                 kkt = kkt_relative(x)
-                if np.isfinite(kkt) and kkt <= tol:
+                if np.isfinite(kkt) and kkt <= tol_eff:
                     converged = True
+                    stop_reason = ("converged" if tol_eff <= tol_requested
+                                   else "converged_on_raised_tol")
                     break
+                if _valve and not (np.isfinite(step) and step > 0.0):
+                    # Solver-health guard, BEFORE the floor valve: a zero step
+                    # (nonfinite or overflowed Lipschitz estimate) freezes the
+                    # iterate, which leaves the certificate just as flat as a
+                    # precision floor does.  Never certify that.
+                    warnings.warn(
+                        "FISTA step size is %g (lipschitz estimate %r): a zero or "
+                        "nonfinite step cannot move the iterate, so the flat "
+                        "certificate at iteration %d is a step-size failure, not a "
+                        "precision floor.  Stopping WITHOUT certifying; re-estimate "
+                        "the Lipschitz constant (PHEASY_FISTA_LIPSCHITZ_SAFETY / "
+                        "PHEASY_LIPSCHITZ_POWER_P) or check the operator."
+                        % (step, lipschitz, n_iter), RuntimeWarning, stacklevel=2)
+                    stop_reason = "step_size_diverged"
+                    break
+                if _valve:
+                    # Certificate stopped improving: measure the floor instead
+                    # of assuming the requested tolerance is reachable.
+                    if best_kkt is None or kkt < best_kkt * (1.0 - _stall_margin):
+                        best_kkt = kkt
+                        best_x = x.copy()
+                        stalls = 0
+                    else:
+                        stalls += 1
+                    if stalls >= _stall_limit:
+                        measured_floor = best_kkt
+                        if measured_floor <= _floor_max:
+                            accepted = min(measured_floor * (1.0 + _floor_margin),
+                                           _floor_max)
+                            if accepted > tol_eff:
+                                warnings.warn(
+                                    "FISTA cannot reach tol=%g (operator dtype %s): "
+                                    "the relative KKT certificate improved by less "
+                                    "than %g%% in every %d-iteration check for the "
+                                    "last %d iterations (best %g at iteration %d).  "
+                                    "The request is below what this precision can "
+                                    "express, so the run certifies the BEST iterate "
+                                    "at tol_effective=%g instead of spending the "
+                                    "remaining %d of max_iter=%d iterations on a "
+                                    "stopping test it cannot satisfy.  Request "
+                                    "--tol >= %g, or shorten the window with "
+                                    "PHEASY_FISTA_STALL_POINTS, to make the request "
+                                    "honest."
+                                    % (tol_requested, _array_precision(A),
+                                       100.0 * _stall_margin, _kkt_every,
+                                       int(_stall_limit) * _kkt_every, measured_floor,
+                                       n_iter, accepted, int(max_iter) - n_iter,
+                                       int(max_iter), accepted),
+                                    RuntimeWarning, stacklevel=2)
+                                tol_eff = accepted
+                            x = best_x
+                            kkt = measured_floor
+                            stop_reason = "converged_measured_floor"
+                            break
+                        warnings.warn(
+                            "FISTA stalled at relative KKT=%g, past "
+                            "PHEASY_FISTA_FLOOR_MAX=%g: this precision cannot certify "
+                            "any meaningful tolerance here, so the run stops at "
+                            "iteration %d instead of grinding to max_iter=%d.  Re-run "
+                            "with --tol >= %g or fix the conditioning."
+                            % (measured_floor, _floor_max, n_iter, int(max_iter),
+                               measured_floor * 1.05), RuntimeWarning, stacklevel=2)
+                        x = best_x
+                        kkt = measured_floor
+                        stop_reason = "stall_above_floor"
+                        break
             x_prev = x.copy()
-    if not converged:
+    if stop_reason not in ("converged", "converged_on_raised_tol"):
         kkt = kkt_relative(x)
-        converged = bool(np.isfinite(kkt) and kkt <= tol)
+        if stop_reason == "converged_measured_floor":
+            converged = bool(np.isfinite(kkt) and kkt <= tol_eff)
+            if not converged:
+                stop_reason = "stall_above_floor"
+        else:
+            converged = bool(np.isfinite(kkt) and kkt <= tol)
     if _info is not None:
-        _info.update(n_iter=n_iter, converged=converged, kkt_relative=kkt)
+        _info.update(n_iter=n_iter, converged=converged, kkt_relative=kkt,
+                     stop_reason=stop_reason, tol_requested=tol_requested,
+                     tol_effective=tol_eff, measured_floor=measured_floor,
+                     stall_points=int(_stall_limit))
     if not converged and warn_nonconvergence:
         # CV folds pass warn_nonconvergence=False and report ONE aggregated line
         # instead: a ranking-only solve that stops at the cap is not the same
         # problem as an uncertified final refit, and 36 identical tracebacks
         # buried the real diagnostics.
-        import warnings
+        # NOTE: deliberately no function-local "import warnings" here.  A local
+        # import binds the name for the WHOLE function, so every warnings.warn
+        # ABOVE this line (the FISTA floor / measured-floor warnings) raised
+        # UnboundLocalError: cannot access local variable "warnings" -- measured
+        # by dev.test_optimizer_large_regressions' FISTA floor case, and the
+        # same bug fires on any CPU-FISTA LASSO/ALASSO run that stalls.  This
+        # function uses the module-level import at the top of the file.
         warnings.warn("FISTA did not converge: iterations=%d, relative KKT=%g, tol=%g"
                       % (n_iter, kkt, tol), RuntimeWarning, stacklevel=2)
     return x
@@ -1065,6 +1464,23 @@ def _scale_operator(A, w):
         return (np.asarray(A.T @ u, dtype=np.float64).ravel()) * inv_w
 
     result = LinearOperator(A.shape, matvec=mv, rmatvec=rmv, dtype=np.float64)
+    result._data_dtype = np.dtype(_array_precision(A))
+    # MOVE any resident operator the wrapped operator owns to this wrapper.
+    # It is the same factors, and leaving it behind made the wrapper -- the
+    # operator the RIDGE CV folds are sliced from -- upload them again, once for
+    # the wrapper and once per fold.  _resident_ridge_op() re-applies the column
+    # scaling (input_scale) whenever it hands the op out, so a moved op stays
+    # consistent; the source simply rebuilds if anything asks it again.
+    _cached_op = getattr(A, "_gpu_ridge_op", None)
+    if _cached_op is not None:
+        try:
+            del A._gpu_ridge_op
+        except Exception:
+            pass
+        try:
+            result._gpu_ridge_op = _cached_op
+        except Exception:
+            pass
     if _resident_twolevel_input(A):
         # Preserve known column-scaling provenance, not arbitrary operators.
         result._twolevel_base = getattr(A, "_twolevel_base", A)
@@ -1093,15 +1509,199 @@ def _row_slice_op(A, rows):
         np.add.at(u_full, rows, u)  # repeated selected rows contribute additively
         return np.asarray(A.T @ u_full, dtype=dt).ravel()
 
-    return LinearOperator((len(rows), n), matvec=mv, rmatvec=rmv, dtype=dt)
+    result = LinearOperator((len(rows), n), matvec=mv, rmatvec=rmv, dtype=dt)
+    result._data_dtype = np.dtype(_array_precision(A))
+    return result
 
+
+class _ResidentRowView(object):
+    """A[rows, :] as a VIEW on an already-uploaded resident operator.
+
+    The CV folds used to build their own GpuTwoLevelOperator from the sliced
+    host factors: one factor upload plus one host csr_tocsc transpose each
+    (both inside GpuTwoLevelOperator.__init__).  On the MgC production operator
+    that is ~3 x (137 s upload + transpose) per RIDGE fit, which outweighs every
+    GPU kernel in the fit and is why the folds looked "host bound" after the
+    column norms moved to the GPU.  The factors the parent already has on the
+    device cover exactly the same matrix, so a fold is a row SELECTION over
+    them -- GpuSubsetOperator, the same view the resident RFE subsets use.
+
+    matvec/rmatvec return numpy on purpose: the host CV prediction path calls
+    np.asarray() on their result, and a CUDA tensor there fails.
+    """
+
+    def __init__(self, parent, resident, rows):
+        self._parent = parent
+        self._resident = resident
+        self._rows = np.asarray(rows, dtype=np.intp)
+        self._cols = np.arange(int(parent.shape[1]), dtype=np.intp)
+        self.shape = (int(self._rows.size), int(parent.shape[1]))
+        self.dtype = np.dtype(np.float64)
+        self._view = None
+
+    @property
+    def _gpu_ridge_parent(self):
+        # the host parent rides along so the tolerance floor still reads the
+        # FACTOR dtype (float32) instead of this view's float64 shell.
+        return (self._resident, self._cols, self._rows, self._parent)
+
+    @property
+    def _data_dtype(self):
+        # [FIX P50c 2026-09-25] This view multiplies the PARENT's stored
+        # factors, so it must report THEIR precision.  Without this it was a
+        # float64 shell wrapped around a float32 operator, and the tolerance
+        # floor (_array_precision -> the FISTA tol_effective / _lsmr_tol) read
+        # float64: a request of 1e-7 looked reachable and the run kept
+        # iterating past what float32 can express.  Same provenance idiom as
+        # _row_slice_op / _scale_operator, which record _data_dtype for exactly
+        # this reason (see _array_precision's docstring).
+        return np.dtype(_array_precision(self._parent))
+
+    def _subset(self):
+
+        if self._view is None:
+            from . import gpu_backend as _gb
+            self._view = _gb.GpuSubsetOperator(self._resident, self._cols,
+                                               self._rows)
+        return self._view
+
+    def _to_device(self, v):
+        r = self._resident
+        return r.torch.as_tensor(np.asarray(v, dtype=np.float64).ravel(),
+                                 dtype=r._value_dtype, device=r.device)
+
+    def matvec(self, v):
+        out = self._subset().matvec(self._to_device(v))
+        return np.asarray(out.detach().cpu().numpy(), dtype=np.float64).ravel()
+
+    def rmatvec(self, u):
+        out = self._subset().rmatvec(self._to_device(u))
+        return np.asarray(out.detach().cpu().numpy(), dtype=np.float64).ravel()
+
+    def __matmul__(self, x):
+        """Operator product: the view must behave like every other operator here.
+
+        [FIX P50 2026-09-17] _is_linear_operator duck-types on matvec, so this
+        view IS an operator as far as the dispatchers are concerned -- but FISTA
+        and the masked/scaled wrappers multiply through the @ operator, not
+        through matvec.  A view that exposed only matvec/rmatvec would therefore
+        pass dispatch and fail one line later (A @ z / A.T @ u).  2-D operands
+        take the column path so the Gram builder can still multiply blocks.
+        """
+        arr = np.asarray(x, dtype=np.float64)
+        if arr.ndim == 1:
+            return self.matvec(arr)
+        if arr.ndim == 2:
+            return np.column_stack([self.matvec(arr[:, j])
+                                    for j in range(arr.shape[1])])
+        raise ValueError("operator product expects a 1-D or 2-D operand, got %d-D"
+                         % arr.ndim)
+
+    dot = __matmul__
+
+    def row_slice(self, rows):
+        # rows index THIS view; the resident op indexes the parent.
+        return _ResidentRowView(self._parent, self._resident,
+                                self._rows[np.asarray(rows, dtype=np.intp)])
+
+    def transpose(self):
+        return _ResidentRowAdjoint(self)
+
+    @property
+    def T(self):
+        """Transpose of the view, as an operator with matvec/rmatvec swapped.
+
+        [FIX P50 2026-09-17] This view is NOT a scipy LinearOperator -- matvec
+        and rmatvec are plain methods that return numpy -- so "A.T" used to be
+        an AttributeError.  That stayed invisible while the only consumer was
+        _ridge_solve, which recognises the view through _gpu_ridge_parent, but
+        _row_slice hands the view to EVERY caller that slices rows of an
+        operator carrying a cached _gpu_ridge_op, and FISTA is one of them:
+        _lasso_backend returns "iterative" (FISTA) whenever the resident
+        two-level LASSO is not active (e.g. PHEASY_GPU_LASSO_RESIDENT=false
+        with PHEASY_GPU_SM=1), and _fista_lasso needs the transpose for the KKT
+        scale (A.T @ y), the gradient (A.T @ (Az - y)) and the Lipschitz power
+        iteration (A.T @ u).  Measured on the Mg2C60 2x2x2 fit (2026-09-17):
+        after a RIDGE CV had cached the resident op, the LASSO fit died with
+        AttributeError: a _ResidentRowView has no attribute "T".
+
+        The adjoint is a dedicated class built from the swapped BOUND methods.
+        It must never be a closure over self.T (or over a name later rebound to
+        the transpose): that is the recursion b6b7f92 had to fix in
+        _solve_subset.  Only ONE definition of __matmul__ / T may exist in this
+        class body -- a second one silently shadows the first.
+        """
+        return _ResidentRowAdjoint(self)
+
+
+class _ResidentRowAdjoint(object):
+    """Adjoint of a _ResidentRowView: V.T @ u evaluates V.rmatvec(u).
+
+    Kept as its own class (rather than a scipy LinearOperator over bound
+    methods) so .T round-trips: (V.T).T is V and (V.T).transpose() is V.
+
+    [FIX P50b 2026-09-25] The operator protocol has to be COMPLETE on both
+    sides.  A later duplicate __matmul__ on _ResidentRowView had been reduced
+    to `self.matvec(other)`, dropping the 2-D column path, and this class only
+    forwarded 1-D operands.  Both are reachable from the Gram builder:
+    _compute_gram does `A @ I_blk` and `A.T @ A_blk` with 2-D blocks, and the
+    FISTA Gram path wraps that call in try/except, so a cached-resident view
+    silently fell back to the slow matvec loop ("Gram build failed") instead of
+    building G.  Measured on the MgC resident view: `view @ I_blk` raised
+    "matmul: Input operand 1 has a mismatch in its core dimension 0".
+
+    _data_dtype keeps the provenance idiom of _row_slice_op/_scale_operator:
+    the adjoint multiplies the SAME stored factors, so it must not look like a
+    fresh float64 operator to the tolerance floor (_array_precision).
+    """
+
+    def __init__(self, view):
+        self._view = view
+        self.shape = (int(view.shape[1]), int(view.shape[0]))
+        self.dtype = getattr(view, "dtype", np.dtype(np.float64))
+
+    @property
+    def _data_dtype(self):
+        return np.dtype(_array_precision(self._view))
+
+    def __matmul__(self, other):
+        arr = np.asarray(other, dtype=np.float64)
+        if arr.ndim == 1:
+            return self._view.rmatvec(arr)
+        if arr.ndim == 2:
+            return np.column_stack([self._view.rmatvec(arr[:, j])
+                                    for j in range(arr.shape[1])])
+        raise ValueError("operator product expects a 1-D or 2-D operand, got %d-D"
+                         % arr.ndim)
+
+    dot = __matmul__
+
+    def matvec(self, other):
+        return self._view.rmatvec(other)
+
+    def rmatvec(self, other):
+        return self._view.matvec(other)
+
+    def transpose(self):
+        return self._view
+
+    @property
+    def T(self):
+        return self._view
 
 def _row_slice(A, rows):
     """A[rows, :] for dense / sparse / LinearOperator.
 
     [FIX P30] TwoLevelSM gets a true row-slice (slices SM_prime) so CV-fold
     matvecs cost O(nnz(SM_prime[rows])) instead of the full O(nnz(SM_prime)).
+
+    When the operator already owns an uploaded resident op, slice as a VIEW over
+    it instead (see _ResidentRowView): re-slicing the host factors and uploading
+    them again per fold was the dominant cost of a resident RIDGE CV.
     """
+    resident = getattr(A, "_gpu_ridge_op", None)
+    if resident is not None:
+        return _ResidentRowView(A, resident, rows)
     if hasattr(A, "_twolevel_base"):
         return _scale_operator(A._twolevel_base.row_slice(rows), A._twolevel_scale)
     if hasattr(A, "row_slice"):     # TwoLevelSM
@@ -1109,6 +1709,40 @@ def _row_slice(A, rows):
     if _is_linear_operator(A):
         return _row_slice_op(A, rows)
     return A[rows]
+
+
+def _resident_ridge_op(A):
+    """The resident operator for A: cached, or freshly uploaded (base + scaling).
+
+    Single place that knows how a column-scaled two-level operator maps onto
+    GpuTwoLevelOperator: hand it the FACTOR carrier (a _CustomLinearOperator
+    wrapper has no SM_prime) and express the scaling as input_scale, which the
+    matvec divides by.  Passing the wrapper raised inside the constructor and the
+    surrounding except swallowed it, so every --std fold silently ran on CPU.
+    input_scale is (re)applied on every call so a moved/cached op stays correct.
+    """
+    from . import gpu_backend as _gb
+    op = getattr(A, "_gpu_ridge_op", None)
+    if op is None:
+        base = getattr(A, "_twolevel_base", A)
+        # Hand over the canonical host factors (one tocsr copy plus one full
+        # transpose, built once and kept while host RAM allows): from RAW
+        # factors __init__ pays one O(nnz) column-slice transpose PER SHARD for
+        # the adjoint.  Measured on the MgC operator (2 shards): 456.9 s of a
+        # 1298.8 s full-scale RIDGE fit, i.e. 35% of the fit in host transposes.
+        op = _gb.GpuTwoLevelOperator(
+            base, device_ids=_gb.resident_device_ids(),
+            host_factors=_gb.twolevel_host_factors(base))
+        try:
+            A._gpu_ridge_op = op
+        except Exception:
+            pass          # read-only operator: fall back to rebuild
+    _w = getattr(A, "_twolevel_scale", None)
+    if _w is not None:
+        op.input_scale = op.torch.as_tensor(
+            np.asarray(_w, dtype=np.float64),
+            dtype=op._value_dtype, device=op.device)
+    return op
 
 
 def _ridge_solve(A, y, alpha, x0=None):
@@ -1119,6 +1753,35 @@ def _ridge_solve(A, y, alpha, x0=None):
     solutions and LSMR converges in a fraction of the cold-start iterations.
     """
     y64 = np.asarray(y, dtype=np.float64).ravel()
+    _parent_view = getattr(A, "_gpu_ridge_parent", None)
+    if _parent_view is not None:
+        # Fold solve THROUGH the parent's already-uploaded factors: see
+        # _ResidentRowView.  No per-fold upload, no per-fold host transpose.
+        _resident, _cols, _rows, _host = _parent_view
+        try:
+            from . import gpu_backend as _gb
+            _view = _gb.GpuSubsetOperator(_resident, _cols, _rows)
+            _yt = _resident.torch.as_tensor(
+                y64, dtype=_view._value_dtype, device=_view.device)
+            _coef, _info = _gb._iterative_ridge_tensor(
+                _view, _yt, float(alpha),
+                atol=float(_lsmr_tol("PHEASY_LSQR_ATOL", 1e-8, _host)),
+                btol=float(_lsmr_tol("PHEASY_LSQR_BTOL", 1e-8, _host)),
+                maxiter=int(os.environ.get("PHEASY_LSQR_MAXITER", "5000")),
+                x0=x0)
+            _info = _iterative_solver_info(_info, "GPU CGLS-RIDGE")
+            _info["alpha"] = float(alpha)
+            try:
+                A._gpu_solver_info = _info
+                A._ridge_solver_info = _info
+            except Exception:
+                pass
+            return np.asarray(_coef.detach().cpu().numpy(),
+                              dtype=np.float64).ravel()
+        except Exception as _e:
+            if _gpu_required():
+                raise RuntimeError("GPU ridge fold solve failed with fallback "
+                                   "disabled: %s" % _e) from _e
     if _is_linear_operator(A):
         # Narrow opt-in: keep TwoLevel factors resident and solve the augmented
         # ridge system with GPU CGLS. Any setup/kernel failure deliberately
@@ -1143,20 +1806,33 @@ def _ridge_solve(A, y, alpha, x0=None):
                     # sharded layout is the one the matvec/rmatvec/col-norm gates
                     # cover; omitting it silently pinned resident RIDGE to one card
                     # while PHEASY_GPU_SM used three.
-                    gpu_op = getattr(A, "_gpu_ridge_op", None)
-                    if gpu_op is None:
-                        gpu_op = _gb.GpuTwoLevelOperator(
-                            A, device_ids=_gb.resident_device_ids())
-                        try:
-                            A._gpu_ridge_op = gpu_op
-                        except Exception:
-                            pass          # read-only operator: fall back to rebuild
+                    # Hand GpuTwoLevelOperator the FACTOR carrier, not the wrapper.
+                    # A column-scaled operator (--std -> _scale_columns ->
+                    # _scale_operator) exposes only _twolevel_base and _twolevel_scale,
+                    # so passing the wrapper raised inside the constructor, the
+                    # enclosing except swallowed it and EVERY --std CV fold ran the
+                    # CPU LSMR branch in silence -- the opposite of the fail-closed
+                    # contract.  The wrapper's effective operator is exactly the base
+                    # with that column scaling, which GpuTwoLevelOperator expresses as
+                    # input_scale (matvec divides by scale*input_scale).
+                    gpu_op = _resident_ridge_op(A)
+                    # x0 is the previous alpha's solution.  The resident branch
+                    # used to drop it while the CV folds and the L-curve walk kept
+                    # computing and passing one, so the warm start the CPU branch
+                    # documents was silently absent on the GPU path.
                     coef, info = _gb.iterative_ridge(
                         gpu_op, y64, alpha,
                         atol=float(_lsmr_tol("PHEASY_LSQR_ATOL", 1e-8, A)),
                         btol=float(_lsmr_tol("PHEASY_LSQR_BTOL", 1e-8, A)),
-                        maxiter=int(os.environ.get("PHEASY_LSQR_MAXITER", "5000")))
-                    A._gpu_solver_info = _iterative_solver_info(info, "GPU CGLS-RIDGE")
+                        maxiter=int(os.environ.get("PHEASY_LSQR_MAXITER", "5000")),
+                        x0=x0)
+                    info = _iterative_solver_info(info, "GPU CGLS-RIDGE")
+                    # alpha rides along so a reader can tell which solve of this
+                    # operator a certificate belongs to (the L-curve walk leaves
+                    # one per alpha on the same object).
+                    info["alpha"] = float(alpha)
+                    A._gpu_solver_info = info
+                    A._ridge_solver_info = info
                     return np.asarray(coef, dtype=np.float64)
             except Exception as exc:
                 if _gpu_required():
@@ -1180,13 +1856,25 @@ def _ridge_solve(A, y, alpha, x0=None):
             y_aug = np.concatenate([y64, np.zeros(n)])
         else:
             op, y_aug = A, y64
-        atol = float(_lsmr_tol("PHEASY_LSQR_ATOL", 1e-8))
-        btol = float(_lsmr_tol("PHEASY_LSQR_BTOL", 1e-8))
+        # The floor is a property of the DATA, not of the arithmetic: this branch
+        # runs in float64 but on whatever factors the operator holds, and for a
+        # float32 two-level operator the achievable relative normal residual is
+        # bounded by eps32, not eps64.  Without A the floor never applied here and
+        # the 1e-8 default was simply unreachable, which is what turns into
+        # istop=7 at the iteration cap.
+        atol = float(_lsmr_tol("PHEASY_LSQR_ATOL", 1e-8, A))
+        btol = float(_lsmr_tol("PHEASY_LSQR_BTOL", 1e-8, A))
         maxiter = int(os.environ.get("PHEASY_LSQR_MAXITER", "5000"))
         import time as _tr
         _t_r = _tr.time()
         res = _lsmr(op, y_aug, atol=atol, btol=btol, maxiter=maxiter, x0=x0)
-        _iterative_solver_info(res, "LSMR")
+        # Certify the CPU branch too.  The return value used to be discarded, so a
+        # RIDGE fit that reached its iteration cap on CPU reported
+        # fit_accepted=True while the identical solve on GPU raised.  The alpha is
+        # recorded with it so a caller can tell which solve a certificate belongs
+        # to (the L-curve walk leaves several on the same operator object).
+        A._ridge_solver_info = dict(_iterative_solver_info(res, "LSMR"),
+                                    alpha=float(alpha), backend="cpu_lsmr_ridge")
         # scipy returns (x, istop, itn, normr, normar, norma, conda, normx).
         # istop is the whole diagnosis: 1/2 = a stopping test was met, 7 = the
         # iteration cap was hit (i.e. alpha never entered the solve and the cost
@@ -1233,10 +1921,16 @@ def _solve_subset(A, y, row_idx, col_idx, ridge_alpha=0.0, qr=False,
                 raise ValueError("column_scale must be finite and nonnegative")
             scale = np.where(scale < 1e-30, 1.0, scale)
             op = _scale_operator(op, scale)
-        atol = float(os.environ.get("PHEASY_LSQR_ATOL", str(
-            lsmr_atol if lsmr_atol is not None else 1e-8)))
-        btol = float(os.environ.get("PHEASY_LSQR_BTOL", str(
-            lsmr_btol if lsmr_btol is not None else 1e-8)))
+        # Route through _lsmr_tol WITH the operator: reading the environment
+        # here directly was the one remaining path where the request never met
+        # the precision floor, so a float32-factored TwoLevelSM got a 1e-8 it
+        # cannot reach and every full-support RFE subset solve ran to istop=7.
+        # op is still the un-augmented operator at this point, which is the one
+        # whose stored precision bounds the solve.
+        atol = float(_lsmr_tol("PHEASY_LSQR_ATOL",
+                               (lsmr_atol if lsmr_atol is not None else 1e-8), op))
+        btol = float(_lsmr_tol("PHEASY_LSQR_BTOL",
+                               (lsmr_btol if lsmr_btol is not None else 1e-8), op))
         maxiter = int(os.environ.get("PHEASY_LSQR_MAXITER", str(
             lsmr_maxiter if lsmr_maxiter is not None else 5000)))
         if ridge_alpha > 0:
@@ -1452,7 +2146,89 @@ class TwoLevelSM(LinearOperator):
         t = _sp_mv(self.SM_primeT, u)
         return _sp_mv(self.NST, np.ascontiguousarray(t, dtype=self._dt))
 
-    def col_norms(self, block_rows=None):
+    def _matmat(self, X):
+        """SM @ X for a dense k-column block.
+
+        Without this, scipy's LinearOperator falls back to k separate _matvec
+        calls, which is what made the P-free Gram build on the MgC operators
+        take minutes (each call rebuilds t = NS @ v).  One sparse product per
+        factor with a multi-column RHS is the efficient form.
+        """
+        X = np.ascontiguousarray(X, dtype=self._dt)
+        t = np.asarray(self.NS @ X, dtype=self._dt)
+        return np.asarray(self.SM_prime @ t, dtype=self._dt)
+
+    def _rmatmat(self, U):
+        """SM.T @ U for a dense k-column block."""
+        U = np.ascontiguousarray(U, dtype=self._dt)
+        t = np.asarray(self.SM_primeT @ U, dtype=self._dt)
+        return np.asarray(self.NST @ t, dtype=self._dt)
+
+    def _col_norms_on_gpu(self, gpu_op=None):
+        """Exact column norms from the resident CUDA operator, or None.
+
+        The CPU loop below is one bounded sparse-sparse product per row block.
+        On the MgC operator (36864x69487) it dominated the whole fit: profiled
+        at 125.5 s of RIDGE's 154.4 s and 197.9 s of OLS's 219.9 s (81% and
+        90%), while the actual iterations cost 4.9 s and 16.2 s.  The resident
+        operator already implements the same computation as blocked basis
+        matvecs (GpuTwoLevelOperator.col_norms), so use it.
+
+        The operator built here is CACHED as self._gpu_ridge_op, which is the
+        same slot the resident solvers look in -- so the factor upload is paid
+        once and the solve that follows reuses it.  Passing gpu_op (the OLS
+        Jacobi path already holds one) avoids even that.
+        """
+        if getattr(self, "_twolevel_scale", None) is not None:
+            return None          # scaled wrapper: keep the CPU semantics
+        try:
+            from . import gpu_backend as _gb
+        except Exception:
+            return None
+        try:
+            # Probing the mode must never become the failure: under required GPU
+            # mode without CUDA, enabled() raises, and letting that escape here
+            # replaced the solver's own (correct, tested) error surface with a
+            # bare "GPU mode is required but CUDA is unavailable".
+            if not (_gb.enabled() and _gb.available()):
+                return None
+        except Exception:
+            return None
+        op = gpu_op if gpu_op is not None else getattr(self, "_gpu_ridge_op", None)
+        if op is None:
+            try:
+                # Same canonical host factors as _resident_ridge_op: this call is
+                # usually the FIRST resident construction in a fit, so it is the
+                # one that pays the host passes (see twolevel_host_factors).
+                op = _gb.GpuTwoLevelOperator(
+                    self, device_ids=_gb.resident_device_ids(),
+                    host_factors=_gb.twolevel_host_factors(self))
+            except Exception as _e:
+                # [FIX colnorms-A] The GPU path here only accelerates a
+                # preprocessing step; the solve itself still runs on the GPU.
+                # Aborting the whole fit because this optional resident operator
+                # does not fit (it is budgeted as a per-CARD replica while the
+                # sharded two-level factors already occupy that card) made every
+                # large third-order fit die under required GPU mode.  Use the
+                # bounded CPU loop this method exists to accelerate instead.
+                print("[optimizer] GPU column norms unavailable (%s); using the "
+                      "bounded CPU column-norm loop instead" % _e, flush=True)
+                return None
+            try:
+                self._gpu_ridge_op = op
+            except Exception:
+                pass
+        try:
+            norms = op.col_norms()
+            return np.asarray(norms.detach().cpu().numpy(), dtype=np.float64).ravel()
+        except Exception as _e:
+            # [FIX colnorms-B] Same rationale as [FIX colnorms-A]: an
+            # accelerator that cannot be allocated must not abort the fit.
+            print("[optimizer] GPU column norms unavailable (%s); using the "
+                  "bounded CPU column-norm loop instead" % _e, flush=True)
+            return None
+
+    def col_norms(self, block_rows=None, gpu_op=None):
         """Exact column norms from bounded row blocks of SM_prime @ NS.
 
         The generic LinearOperator implementation needs one full SpMV per
@@ -1461,7 +2237,21 @@ class TwoLevelSM(LinearOperator):
         The default 64 MiB block budget allows 24 bytes per possible output
         entry (float64 values, sparse indices, and the squaring temporary),
         plus the sliced input block. NS is shared when already float64.
+
+        The resident CUDA operator is used when it is available (see
+        _col_norms_on_gpu); the CPU loop below stays as the fallback and as the
+        definition of the result.
         """
+        cached = getattr(self, "_col_norms_cache", None)
+        if cached is not None and gpu_op is None:
+            return cached.copy()
+        norms = self._col_norms_on_gpu(gpu_op)
+        if norms is not None and norms.shape == (self.shape[1],):
+            try:
+                self._col_norms_cache = norms
+            except Exception:
+                pass
+            return norms.copy()
         n_rows, n_cols = self.shape
         squares = np.zeros(n_cols, dtype=np.float64)
         if not n_rows or not n_cols:
@@ -1670,7 +2460,23 @@ def _lasso_n_jobs(A):
 
 
 def _predict_rows(A, coef, rows):
-    """A[rows] @ coef for dense / sparse / LinearOperator (one matvec)."""
+    """A[rows] @ coef for dense / sparse / LinearOperator.
+
+    Slicing FIRST is not a detail: the grouped CV calls this once per
+    (alpha, fold), and a full-row matvec on a two-level operator costs
+    O(nnz(SM_prime)) however small the validation fold is.  On the MgC
+    operator (454656 rows) the uncounted CV path dominated the host time that
+    the wall/CPU/GPU audit attributed to RIDGE.  row_slice exists on TwoLevelSM
+    (and on the resident views, which slice SM_prime / mask rows on device), so
+    use it when present and keep the full matvec as the fallback.
+    """
+    rows = np.asarray(rows, dtype=np.intp)
+    slicer = getattr(A, "row_slice", None)
+    if callable(slicer):
+        try:
+            return np.asarray(slicer(rows) @ coef, dtype=np.float64).ravel()
+        except Exception:
+            pass          # keep the exact old behaviour as the fallback
     return np.asarray(A @ coef, dtype=np.float64).ravel()[rows]
 
 
@@ -1828,7 +2634,8 @@ class _LassoCVIterative:
                                         penalty_weights=self.penalty_weights,
                                         gram=gram_folds[k],
                                         n_samples=len(tr), _info=info,
-                                        warn_nonconvergence=False)
+                                        warn_nonconvergence=False,
+                                        auto_floor=False)
                     pred = np.asarray(A_va_list[k] @ coef, dtype=np.float64).ravel()
                 else:
                     if A_folds is not None:
@@ -1843,7 +2650,8 @@ class _LassoCVIterative:
                                         max_iter=cv_max_iter, tol=cv_tol,
                                         lipschitz=self._lipschitz,
                                         penalty_weights=self.penalty_weights,
-                                        _info=info, warn_nonconvergence=False)
+                                        _info=info, warn_nonconvergence=False,
+                                        auto_floor=False)
                     pred = _predict_rows(A, coef, va)
                 err = pred - y64[va]
                 return (float(np.mean(err * err)), coef, int(info.get("n_iter", 0)),
@@ -1875,13 +2683,15 @@ class _LassoCVIterative:
                                       lipschitz=lip_full,
                                       penalty_weights=self.penalty_weights,
                                       gram=gram_full, _info=_cv_info,
-                                      warn_nonconvergence=False)
+                                      warn_nonconvergence=False,
+                                      auto_floor=False)
             else:
                 x_full = _fista_lasso(A, y64, alpha, x0=x_full,
                                       max_iter=cv_max_iter, tol=cv_tol,
                                       lipschitz=self._lipschitz,
                                       penalty_weights=self.penalty_weights,
-                                      _info=_cv_info, warn_nonconvergence=False)
+                                      _info=_cv_info, warn_nonconvergence=False,
+                                      auto_floor=False)
             # The full-data warm-start solve also reports n_iter; it feeds the
             # "max iterations" message but must NOT set the hit-cap flag: that
             # flag is the CONVERGENCE diagnosis for the CV solves themselves.
@@ -2108,6 +2918,24 @@ class _LassoCVModel:
         self._alpha_at_min = getattr(model, "_alpha_at_min", False)
         self._alpha_at_min_flat = getattr(model, "_alpha_at_min_flat", False)
         self._alpha_at_min_hitcap = getattr(model, "_alpha_at_min_hitcap", False)
+        # This backend iterated too, and it used to be the only LASSO path that
+        # published no certificate at all: the FISTA backends (resident, GPU
+        # Gram, CPU iterative) all report converged/kkt_relative and the
+        # acceptance gate vetoes on it, while a coordinate descent that stopped
+        # at max_iter still read as fit_accepted=True.  sklearn's own signal is
+        # n_iter_ == max_iter plus a ConvergenceWarning -- a warning is not a
+        # gate.  sklearn optimizes over the alpha path and reports n_iter_ for
+        # the SELECTED alpha, which is the solve whose coefficients are kept.
+        _hit_cap = bool(self.n_iter_ >= int(self.max_iter))
+        self.regularized_solver_info_ = {
+            "solver": "sklearn LassoCV (coordinate descent)",
+            "backend": "cpu_dense_coordinate_descent",
+            "converged": not _hit_cap,
+            "stop_reason": "iteration_limit" if _hit_cap else "converged",
+            "n_iter": self.n_iter_,
+            "maxiter": int(self.max_iter),
+            "tol": float(self.tol),
+        }
         return self
 
     def predict(self, A):
@@ -2373,6 +3201,25 @@ class _AdaptiveLassoCV(_LassoCVModel):
         self._alpha_at_min = getattr(model, "_alpha_at_min", False)
         self._alpha_at_min_flat = getattr(model, "_alpha_at_min_flat", False)
         self._alpha_at_min_hitcap = getattr(model, "_alpha_at_min_hitcap", False)
+        # Same certificate as the plain dense LASSO, and for the same reason: the
+        # adaptive branch runs its OWN LassoCV on the weighted matrix and used to
+        # publish nothing at all -- measured on c7 it reported
+        # regularized_solver_info={} and execution_backend=None, so the whole
+        # adaptive solve was invisible to the acceptance gate while the resident
+        # FISTA equivalent vetoed on convergence.
+        _hit_cap = bool(self.n_iter_ >= int(self.max_iter))
+        self.regularized_solver_info_ = {
+            "solver": "sklearn LassoCV on the weighted matrix (coordinate descent)",
+            "backend": "cpu_dense_coordinate_descent",
+            "converged": not _hit_cap,
+            "stop_reason": "iteration_limit" if _hit_cap else "converged",
+            "n_iter": self.n_iter_,
+            "maxiter": int(self.max_iter),
+            "tol": float(self.tol),
+            "weight_dispersion": float(np.std(np.log(np.maximum(self._weights,
+                                                             1e-300)))),
+            "beta0_floor_fraction": float(getattr(self, "_beta0_floor", float("nan"))),
+        }
         return self
 
     def predict(self, A):
@@ -2380,6 +3227,523 @@ class _AdaptiveLassoCV(_LassoCVModel):
         if self.fit_intercept:
             pred = pred + self.intercept_
         return pred
+
+
+def _ardr_evidence_gram(G, b, yty, n_samples, y_var, threshold_lambda=1e4,
+                        max_iter=300, tol=1e-3, alpha_1=1e-6, alpha_2=1e-6,
+                        lambda_1=1e-6, lambda_2=1e-6, gpu=None, verbose=False,
+                        checkpoint=None):
+    """ARD evidence maximization driven by the Gram matrix alone.
+
+    sklearn.linear_model.ARDRegression's update touches only G = X^T X,
+    b = X^T y and yty = y^T y: _update_sigma inverts
+    lambda_keep * I + alpha * X_keep^T X_keep, update_coeff multiplies that
+    inverse by X_keep^T y, and sse = ||y - X coef||^2 is the identical Gram
+    quadratic form.  This function reproduces that loop exactly, so the
+    n_samples x n_features design matrix never has to be materialized -- which
+    is what lets ARDR run on a large sensing matrix whose rows do not fit.
+
+    Only the linear-algebra backend differs from sklearn: scipy.linalg.pinvh
+    on the CPU (the same routine sklearn calls) and torch Cholesky when a GPU
+    backend is supplied.  The hard limit that remains is the p x p Gram itself:
+    O(p^2) memory and O(p^3) per evidence iteration.
+
+    Returns (coef, alpha, lambda_, n_iter, stop_reason, sse).
+    """
+    import numpy as np
+    p = int(G.shape[0])
+    n = int(n_samples)
+    yty = float(yty)
+    y_var = float(y_var)
+    tiny = float(np.finfo(np.float64).tiny)
+    eps = float(np.finfo(np.float64).eps)
+    thr = float(threshold_lambda)
+    # Gram-form sse suffers catastrophic cancellation when the fit is
+    # near-perfect (many features, few samples): yty and 2 b.c - c^T G c cancel
+    # to below machine precision, sse clamps to tiny, and alpha = n/sse explodes
+    # (observed on the 2+3 c3=3.5 N=40 fit).  Floor it at a relative residual of
+    # 1e-6, which is below any physical force noise and only guards the update.
+    _sse_floor = max(tiny, 1e-12 * float(yty))
+    if p == 0:
+        return (np.zeros(0, dtype=np.float64), 1.0, np.zeros(0, dtype=np.float64),
+                0, "pruned_empty", 0.0)
+
+    def _reason(converged, exhausted, keep_any):
+        if converged:
+            return "converged"
+        if not keep_any:
+            return "pruned_empty"
+        if exhausted:
+            return "iteration_limit"
+        return "pruned_empty"
+
+    if gpu is not None:
+        import torch
+        dev = gpu.device()
+        Gt = gpu._to_torch(np.asarray(G, dtype=np.float64), torch.float64)
+        bt = gpu._to_torch(np.asarray(b, dtype=np.float64), torch.float64)
+        lam = torch.ones(p, dtype=torch.float64, device=dev)
+        keep = torch.ones(p, dtype=torch.bool, device=dev)
+        coef = torch.zeros(p, dtype=torch.float64, device=dev)
+        alpha_ = 1.0 / (y_var + eps)
+        coef_old = None
+        converged = False
+        exhausted = False
+        n_iter = 0
+        for it in range(int(max_iter)):
+            idx = torch.nonzero(keep, as_tuple=False).reshape(-1)
+            if idx.numel() == 0:
+                n_iter = it
+                break
+            Gk = Gt.index_select(0, idx).index_select(1, idx)
+            A = alpha_ * Gk
+            A.diagonal().add_(lam.index_select(0, idx))
+            try:
+                Ainv = torch.cholesky_inverse(torch.linalg.cholesky(A))
+            except Exception:
+                Ainv = torch.linalg.pinv(A)
+            lam_k = lam.index_select(0, idx)
+            bk = bt.index_select(0, idx)
+            ck = alpha_ * (Ainv @ bk)
+            sse = max(yty - 2.0 * float(ck @ bk) + float(ck @ (Gk @ ck)), _sse_floor)
+            gamma = 1.0 - lam_k * Ainv.diagonal()
+            lam = lam.index_copy(0, idx, (gamma + 2.0 * lambda_1) / (ck * ck + 2.0 * lambda_2))
+            alpha_ = (n - float(gamma.sum()) + 2.0 * alpha_1) / (sse + 2.0 * alpha_2)
+            coef = coef * keep
+            coef = coef.index_copy(0, idx, ck)
+            keep = lam < thr
+            coef = coef * keep
+            n_iter = it + 1
+            if verbose:
+                print("[ARDR]   iter %d: active=%d sse=%.6e alpha=%.4e"
+                      % (it, int(idx.numel()), sse, alpha_), flush=True)
+            if it > 0 and float((coef_old - coef).abs().sum()) < float(tol):
+                converged = True
+                break
+            coef_old = coef.clone()
+            if not bool(keep.any()):
+                break
+        else:
+            exhausted = True
+        if bool(keep.any()):
+            idx = torch.nonzero(keep, as_tuple=False).reshape(-1)
+            Gk = Gt.index_select(0, idx).index_select(1, idx)
+            A = alpha_ * Gk
+            A.diagonal().add_(lam.index_select(0, idx))
+            try:
+                Ainv = torch.cholesky_inverse(torch.linalg.cholesky(A))
+            except Exception:
+                Ainv = torch.linalg.pinv(A)
+            bk = bt.index_select(0, idx)
+            ck = alpha_ * (Ainv @ bk)
+            coef = torch.zeros(p, dtype=torch.float64, device=dev).index_copy(0, idx, ck)
+            sse = max(yty - 2.0 * float(ck @ bk) + float(ck @ (Gk @ ck)), _sse_floor)
+        else:
+            coef = torch.zeros(p, dtype=torch.float64, device=dev)
+            sse = yty
+        return (gpu._to_numpy(coef, np.float64), float(alpha_),
+                gpu._to_numpy(lam, np.float64), int(n_iter),
+                _reason(converged, exhausted, bool(keep.any())), float(sse))
+
+    _force_pinvh = os.environ.get("PHEASY_ARDR_PINVH", "0").lower() in ("1", "true", "yes", "on")
+
+    def _sigma_diag_and_solve(A, bk):
+        """(diag(A^-1), A^-1 bk) for symmetric PD A.
+
+        alpha*G + diag(lambda) is PD (lambda > 0), so Cholesky is exact and is
+        ~100x faster than pinvh's eigendecomposition (measured p=5000: 0.4s vs
+        41.6s; p=20000: 16s vs ~44 min).  diag(A^-1) via LAPACK dpotri is then
+        ~4x faster than solve_triangular(L, I) (p=20000: 30s vs 120s) and uses
+        half the workspace.  sklearn uses pinvh, so PHEASY_ARDR_PINVH=1 restores
+        that path for exact parity checks.
+        """
+        if not _force_pinvh:
+            try:
+                c, lower = spla.cho_factor(A, check_finite=False)
+                sigma_bk = spla.cho_solve((c, lower), bk, check_finite=False)
+                Ainv, info = spla.lapack.dpotri(c, lower=lower, overwrite_c=1)
+                if info == 0:
+                    return np.diag(Ainv), sigma_bk
+            except (spla.LinAlgError, ValueError):
+                pass
+        sigma = spla.pinvh(A, check_finite=False)
+        return np.diag(sigma), sigma @ bk
+
+    alpha_ = 1.0 / (y_var + eps)
+    lam = np.ones(p, dtype=np.float64)
+    keep = np.ones(p, dtype=bool)
+    coef = np.zeros(p, dtype=np.float64)
+    coef_old = None
+    converged = False
+    exhausted = False
+    n_iter = 0
+    start_it = 0
+    if checkpoint and os.path.exists(checkpoint):
+        # Resume a long run across process restarts.  Only the O(p) state is
+        # saved (coef, lambda, alpha), never the p x p Gram.
+        _z = np.load(checkpoint, allow_pickle=True)
+        coef = np.asarray(_z["coef"], dtype=np.float64)
+        lam = np.asarray(_z["lam"], dtype=np.float64)
+        alpha_ = float(_z["alpha_"])
+        if "coef_old" in _z.files:
+            coef_old = np.asarray(_z["coef_old"], dtype=np.float64)
+        start_it = int(_z["it"]) + 1
+        keep = lam < thr
+        print("[ARDR] resumed from %s at iteration %d (active=%d)"
+              % (checkpoint, start_it, int(keep.sum())), flush=True)
+    for it in range(start_it, int(max_iter)):
+        idx = np.flatnonzero(keep)
+        if idx.size == 0:
+            n_iter = it
+            break
+        Gk = np.asarray(G[np.ix_(idx, idx)], dtype=np.float64)
+        A = Gk
+        A *= alpha_
+        A[np.diag_indices_from(A)] += lam[idx]
+        lam_k = lam[idx]
+        bk = np.asarray(b[idx], dtype=np.float64)
+        diag_sigma, sigma_bk = _sigma_diag_and_solve(A, bk)
+        ck = alpha_ * sigma_bk
+        # sse = yty - 2 ck.bk + ck.(Gk @ ck) == yty - ck.bk - alpha * lam.sigma^2
+        # (Gk @ ck = bk - diag(lam) @ sigma_bk), avoids keeping the original Gk alive
+        # after the in-place scale, halving the p x p peak for the full-active phase.
+        sse = max(yty - float(ck @ bk) - alpha_ * float(lam_k @ (sigma_bk ** 2)), _sse_floor)
+        gamma = 1.0 - lam_k * diag_sigma
+        lam[idx] = (gamma + 2.0 * lambda_1) / (ck * ck + 2.0 * lambda_2)
+        alpha_ = (n - float(gamma.sum()) + 2.0 * alpha_1) / (sse + 2.0 * alpha_2)
+        coef[:] = 0.0
+        coef[idx] = ck
+        keep = lam < thr
+        coef[~keep] = 0.0
+        n_iter = it + 1
+        if verbose:
+            print("[ARDR]   iter %d: active=%d sse=%.6e alpha=%.4e"
+                  % (it, int(idx.size), sse, alpha_), flush=True)
+        if it > 0 and float(np.sum(np.abs(coef_old - coef))) < float(tol):
+            converged = True
+            break
+        coef_old = coef.copy()
+        if not keep.any():
+            break
+        if checkpoint:
+            np.savez(checkpoint, coef=coef, lam=lam, alpha_=alpha_,
+                     coef_old=coef_old, it=it)
+    else:
+        exhausted = True
+    if keep.any():
+        idx = np.flatnonzero(keep)
+        Gk = np.asarray(G[np.ix_(idx, idx)], dtype=np.float64)
+        A = Gk
+        A *= alpha_
+        A[np.diag_indices_from(A)] += lam[idx]
+        bk = np.asarray(b[idx], dtype=np.float64)
+        diag_sigma, sigma_bk = _sigma_diag_and_solve(A, bk)
+        ck = alpha_ * sigma_bk
+        coef[:] = 0.0
+        coef[idx] = ck
+        sse = max(yty - float(ck @ bk) - alpha_ * float(lam[idx] @ (sigma_bk ** 2)), _sse_floor)
+    else:
+        coef[:] = 0.0
+        sse = yty
+    return (coef, float(alpha_), lam, int(n_iter),
+            _reason(converged, exhausted, bool(keep.any())), float(sse))
+
+
+class _ARDRModel:
+    """Automatic Relevance Determination Regression (ARDR).
+
+    Bayesian linear regression with one precision hyperparameter per
+    coefficient.  Evidence maximization drives the precision of irrelevant
+    coefficients above 'threshold_lambda'; those coefficients are then pruned
+    to exactly zero, so the model selects features without an explicit
+    elimination schedule (MacKay, Neural Comput. 4 (1992) 415; Tipping 2001).
+
+    This is a grouped-CV wrapper around scikit-learn's ARDRegression.
+    Fransson, Eriksson & Erhart, npj Comput. Mater. 6, 135 (2020) compared
+    ARDR against OLS / LASSO / RFE-OLS for force-constant models using exactly
+    the scikit-learn implementation with pruning threshold lambda_t = 1e4
+    (scikit-learn's default threshold_lambda); that is the default here.
+
+    Two fit paths share the same evidence loop:
+
+    * dense / sparse input (default) -- sklearn ARDRegression, which needs the
+      full X;
+    * matrix-free Gram mode (automatic for a TwoLevelSM / LinearOperator, or
+      PHEASY_ARDR_GRAM=1) -- the update runs directly on G = X^T X, b = X^T y
+      and y^T y, so the n_samples x n_features design matrix is never built.
+      The O(p^2) Gram and the O(p^3) per-iteration solve remain: that is ARD's
+      hard wall, the unfavourable scaling reported in the reference paper.
+      PHEASY_ARDR_GPU=1 moves that solve to torch Cholesky on the device.
+    """
+
+    def __init__(self, threshold_lambda=1e4, thresholds=None, cv=5,
+                 max_iter=300, tol=1e-3, fit_intercept=False, rand_seed=None,
+                 group_size=None, alpha_1=1e-6, alpha_2=1e-6,
+                 lambda_1=1e-6, lambda_2=1e-6, n_jobs=None):
+        if thresholds is None:
+            self.thresholds = np.asarray([float(threshold_lambda)], dtype=np.float64)
+        else:
+            self.thresholds = np.asarray(list(thresholds), dtype=np.float64)
+            if self.thresholds.size == 0:
+                raise ValueError("ARDR thresholds must be non-empty")
+        self.cv = int(cv)
+        self.max_iter = int(max_iter)
+        self.tol = float(tol)
+        self.fit_intercept = bool(fit_intercept)
+        self.rand_seed = rand_seed
+        self.group_size = group_size
+        self.alpha_1 = float(alpha_1)
+        self.alpha_2 = float(alpha_2)
+        self.lambda_1 = float(lambda_1)
+        self.lambda_2 = float(lambda_2)
+        self.n_jobs = n_jobs
+        # CV of the full-data fit is always evaluated for the report; when more
+        # than one threshold is supplied the CV also SELECTS the threshold.
+        self.threshold_ = float(self.thresholds[0])
+        self.mse_path_ = None
+        self.best_rmse_cv_ = float("nan")
+
+    def _new_model(self, threshold):
+        import inspect
+        from sklearn.linear_model import ARDRegression
+        kwargs = dict(
+            tol=self.tol,
+            alpha_1=self.alpha_1, alpha_2=self.alpha_2,
+            lambda_1=self.lambda_1, lambda_2=self.lambda_2,
+            threshold_lambda=float(threshold),
+            fit_intercept=self.fit_intercept, copy_X=True)
+        # scikit-learn >= 1.3 names the iteration cap 'max_iter'; older
+        # releases (the pyproject floor is 1.1) name it 'n_iter'.
+        if "max_iter" in inspect.signature(ARDRegression.__init__).parameters:
+            kwargs["max_iter"] = self.max_iter
+        else:
+            kwargs["n_iter"] = self.max_iter
+        return ARDRegression(**kwargs)
+
+    def fit(self, A, y, sample_weight=None):
+        if sample_weight is not None:
+            raise NotImplementedError("ARDR does not support sample weights")
+        y64 = np.asarray(y, dtype=np.float64).ravel()
+        # Matrix-free Gram mode: the ARD update only needs X^T X, X^T y and
+        # y^T y, so a TwoLevelSM / LinearOperator can be fitted without ever
+        # materializing the n_samples x n_features design matrix.
+        _gram_env = os.environ.get("PHEASY_ARDR_GRAM")
+        if _gram_env is None:
+            gram_mode = _is_linear_operator(A)
+        else:
+            gram_mode = _gram_env.lower() in ("1", "true", "yes", "on")
+        if _is_linear_operator(A) and not gram_mode:
+            raise NotImplementedError(
+                "ARDR received a matrix-free LinearOperator/TwoLevelSM with "
+                "PHEASY_ARDR_GRAM=0. Enable the Gram path (the default) or pass "
+                "the dense/sparse sensing matrix.")
+        if gram_mode:
+            return self._fit_gram(A, y64)
+        A64 = _to_dense_f64(A)
+        n_samples, n_features = A64.shape
+
+        # Memory gate: ARDRegression owns a dense copy of X, the
+        # n_features x n_features posterior covariance and its Cholesky
+        # factors.  Fail loudly (and name the knob) instead of dying in the
+        # allocator or thrashing swap.
+        per_feat = 8.0 * n_samples * n_features + 24.0 * n_features ** 2
+        budget = float(os.environ.get("PHEASY_ARDR_MAX_GB", "16")) * 1e9
+        max_features = int(os.environ.get("PHEASY_ARDR_MAX_FEATURES", "0") or 0)
+        if max_features > 0 and n_features > max_features:
+            raise NotImplementedError(
+                "ARDR: n_features=%d exceeds PHEASY_ARDR_MAX_FEATURES=%d. ARD "
+                "regression is O(n_features^3) in time and O(n_features^2) in "
+                "memory; raise the cap explicitly if the machine can take it."
+                % (n_features, max_features))
+        if per_feat > budget:
+            raise NotImplementedError(
+                "ARDR estimated workspace %.2f GB exceeds PHEASY_ARDR_MAX_GB=%.1f "
+                "(n_samples=%d, n_features=%d). ARD regression does not scale to "
+                "this design matrix; use RIDGE/LASSO/ALASSO or an explicit cutoff."
+                % (per_feat / 1e9, budget / 1e9, n_samples, n_features))
+
+        splits = _make_cv_splits(n_samples, self.cv, self.rand_seed, self.group_size)
+        thresholds = self.thresholds
+        mse_path = np.full((thresholds.size, len(splits)), np.nan, dtype=np.float64)
+        with warnings.catch_warnings():
+            # ARDRegression emits a ConvergenceWarning when it hits the
+            # iteration cap; that is recorded as converged=False below instead
+            # of surfacing as a warning per fold.
+            warnings.simplefilter("ignore")
+            for j, thr in enumerate(thresholds):
+                for k, (tr, va) in enumerate(splits):
+                    model = self._new_model(thr)
+                    model.fit(A64[tr], y64[tr])
+                    pred = np.asarray(A64[va] @ model.coef_).ravel()
+                    if self.fit_intercept:
+                        pred = pred + model.intercept_
+                    mse_path[j, k] = float(np.mean((pred - y64[va]) ** 2))
+            best_idx = int(np.argmin(mse_path.mean(axis=1)))
+            self.threshold_ = float(thresholds[best_idx])
+            model = self._new_model(self.threshold_)
+            model.fit(A64, y64)
+
+        self.model_ = model
+        self.coef_ = np.asarray(model.coef_, dtype=np.float64)
+        self.intercept_ = float(model.intercept_)
+        self.alpha_ = float(model.alpha_)
+        self.lambda_ = np.asarray(model.lambda_, dtype=np.float64)
+        self.sigma_ = np.asarray(model.sigma_, dtype=np.float64)
+        self.n_iter_ = int(model.n_iter_)
+        self.n_features_in_ = int(n_features)
+        self.mse_path_ = mse_path
+        self.best_index_ = best_idx
+        self.best_rmse_cv_ = float(np.sqrt(mse_path[best_idx].mean()))
+        self.cv_evaluated = True
+        hit_cap = self.n_iter_ >= self.max_iter
+        self.regularized_solver_info_ = {
+            "solver": "sklearn ARDRegression (evidence maximization)",
+            "backend": "cpu_dense_ardr",
+            "converged": not hit_cap,
+            "stop_reason": "iteration_limit" if hit_cap else "converged",
+            "n_iter": self.n_iter_,
+            "maxiter": int(self.max_iter),
+            "tol": float(self.tol),
+            "threshold_lambda": self.threshold_,
+        }
+        return self
+
+    def _fit_gram(self, A, y64):
+        """Matrix-free ARD fit driven by the sensing matrix's Gram.
+
+        Runs the exact sklearn ARD evidence loop on G = X^T X, b = X^T y and
+        yty = y^T y, so no n_samples x n_features matrix is ever allocated.
+        The remaining cost is the p x p Gram (O(p^2) memory) and the O(p^3)
+        per-iteration solve; a GPU backend moves that solve to torch Cholesky.
+        """
+        if self.thresholds.size != 1:
+            warnings.warn(
+                "ARDR Gram mode fits one pruning threshold (the paper's "
+                "lambda_t = 1e4); ignoring PHEASY_ARDR_THRESHOLDS and using "
+                "%.4g." % float(self.thresholds[0]), RuntimeWarning, stacklevel=3)
+        thr = float(self.thresholds[0])
+        base = getattr(A, "_twolevel_base", None)
+        scale = getattr(A, "_twolevel_scale", None)
+        _gram_gb = float(os.environ.get(
+            "PHEASY_ARDR_GRAM_MAX_GB", os.environ.get("PHEASY_GRAM_MAX_GB", "4")))
+        print("[ARDR] building the design Gram (matrix-free; "
+              "PHEASY_ARDR_GRAM_MAX_GB=%.1f)..." % _gram_gb, flush=True)
+        import time as _t
+        _t_gram0 = _t.time()
+        G, b, _gram_how = _build_gram_matrix(A, y64, budget_gb=_gram_gb)
+        G = np.asarray(G, dtype=np.float64)
+        print("[ARDR] design Gram ready: %dx%d (%.2f GB) in %.1fs"
+              % (G.shape[0], G.shape[1], G.nbytes / 1e9, _t.time() - _t_gram0),
+              flush=True)
+        n_samples = int(y64.shape[0])
+        yty = float(y64 @ y64)
+        y_var = float(np.var(y64))
+
+        _gpu_env = os.environ.get("PHEASY_ARDR_GPU")
+        if _gpu_env is not None:
+            want_gpu = _gpu_env.lower() in ("1", "true", "yes", "on")
+        else:
+            want_gpu = _gpu() is not None
+        gb = _gpu() if want_gpu else None
+        if want_gpu and gb is None and _gpu_required():
+            raise RuntimeError(
+                "ARDR was asked for the GPU backend (or GPU is required) but "
+                "CUDA is unavailable")
+        p = int(G.shape[0])
+        if gb is not None:
+            print("[ARDR] matrix-free Gram fit on GPU: G=%dx%d (%.2f GB)"
+                  % (p, p, G.nbytes / 1e9), flush=True)
+        else:
+            print("[ARDR] matrix-free Gram fit on CPU: G=%dx%d (%.2f GB); each "
+                  "evidence iteration solves a p x p system (O(p^3))"
+                  % (p, p, G.nbytes / 1e9), flush=True)
+
+        # sklearn's 300-iteration default is tuned for modest p.  On a large
+        # p the evidence path can still be pruning a handful of coefficients
+        # per step when the cap is reached, so Gram mode defaults higher
+        # (PHEASY_ARDR_GRAM_MAX_ITER); the dense path is unchanged.
+        _gram_max_iter = int(os.environ.get(
+            "PHEASY_ARDR_GRAM_MAX_ITER", str(max(self.max_iter, 1000))))
+        _gram_tol = float(os.environ.get("PHEASY_ARDR_GRAM_TOL", str(self.tol)))
+        coef, alpha_, lam, n_iter, stop_reason, sse = _ardr_evidence_gram(
+            G, b, yty, n_samples, y_var, threshold_lambda=thr,
+            max_iter=_gram_max_iter, tol=_gram_tol, alpha_1=self.alpha_1,
+            alpha_2=self.alpha_2, lambda_1=self.lambda_1, lambda_2=self.lambda_2,
+            gpu=gb,
+            verbose=os.environ.get("PHEASY_ARDR_VERBOSE", "1").lower()
+            in ("1", "true", "yes", "on"))
+
+        self.model_ = None
+        self.coef_ = np.asarray(coef, dtype=np.float64)
+        self.intercept_ = 0.0
+        self.alpha_ = float(alpha_)
+        self.lambda_ = np.asarray(lam, dtype=np.float64)
+        self.sigma_ = np.zeros((0, 0), dtype=np.float64)
+        self.n_iter_ = int(n_iter)
+        self.n_features_in_ = p
+        self.threshold_ = thr
+        self.mse_path_ = np.array(
+            [[max(sse, 0.0) / max(n_samples, 1)]], dtype=np.float64)
+        self.best_index_ = 0
+        self.best_rmse_cv_ = float(np.sqrt(self.mse_path_[0, 0]))
+        # Gram mode has no hold-out folds: a per-fold Gram costs folds x p^2,
+        # and the reference paper uses one fixed threshold. The reported score
+        # is therefore the in-sample RMSE and cv_evaluated says so.
+        self.cv_evaluated = False
+        self.backend_ = "gpu_gram_ardr" if gb is not None else "cpu_gram_ardr"
+        self.regularized_solver_info_ = {
+            "solver": "ARD evidence maximization on the Gram (matrix-free)",
+            "backend": self.backend_,
+            "converged": stop_reason in ("converged", "pruned_empty"),
+            "stop_reason": stop_reason,
+            "n_iter": self.n_iter_,
+            "maxiter": int(_gram_max_iter),
+            "tol": float(self.tol),
+            "threshold_lambda": thr,
+            "cv_skipped": "gram_mode",
+            "gram_construction": _gram_how,
+            "n_features": p,
+            "n_samples": n_samples,
+        }
+        return self
+
+    def predict(self, A):
+        pred = np.asarray(A @ self.coef_).ravel()
+        if self.fit_intercept:
+            pred = pred + self.intercept_
+        return pred
+
+
+class _RVMModel:
+    """Result holder for the fast marginal-likelihood RVM fit."""
+
+    def __init__(self, coef, active, alpha, beta, n_iter, n_features, rss,
+                 n_samples, converged):
+        self.coef_ = np.asarray(coef, dtype=np.float64)
+        self.intercept_ = 0.0
+        self.n_features_in_ = int(n_features)
+        self.n_iter_ = int(n_iter)
+        self.active_ = np.asarray(active, dtype=np.int64)
+        self.alpha_ = np.asarray(alpha, dtype=np.float64)
+        self.beta_ = float(beta)
+        self.cv_evaluated = False
+        self.mse_path_ = np.array(
+            [[max(float(rss), 0.0) / max(int(n_samples), 1)]], dtype=np.float64)
+        self.best_index_ = 0
+        self.best_rmse_cv_ = float(np.sqrt(self.mse_path_[0, 0]))
+        self.regularized_solver_info_ = {
+            "solver": "fast marginal-likelihood RVM (Tipping & Faul 2003)",
+            "backend": "cpu_gram_rvm",
+            "converged": bool(converged),
+            "stop_reason": "evidence_maximum" if converged else "step_limit",
+            "n_iter": int(n_iter),
+            "n_active": int(self.active_.size),
+            "beta": float(beta),
+            "cv_skipped": "gram_mode",
+        }
+
+    def predict(self, A):
+        return np.asarray(A @ self.coef_).ravel()
 
 
 def _scale_columns(A, w):
@@ -2401,6 +3765,141 @@ def _scale_columns(A, w):
     A64 = _to_dense_f64(A)
     # A[:, j] * (1/w[j]) == A[:, j] / w[j]
     return A64 * inv_w[None, :]
+
+
+def _materialize_columns(A, col_idx):
+    """[PATCH rfe-final-tsqr-v2] A[:, col_idx] as scipy sparse / ndarray, or None."""
+    if isinstance(A, TwoLevelSM):
+        NSs = A.NS[:, col_idx]
+        if not sp.issparse(NSs):
+            NSs = sp.csr_matrix(NSs)
+        return (A.SM_prime @ NSs).tocsr()
+    if sp.issparse(A):
+        return A[:, col_idx].tocsr()
+    if isinstance(A, np.ndarray):
+        return A[:, col_idx]
+    return None
+
+
+class _RowBlockProduct:
+    """[PATCH rfe-final-tsqr-v2] Streaming row blocks of SM_prime @ NS_sub.
+
+    A CSR A_sub for a 30k-feature support is ~38 GB and holding it while the
+    block QR allocates its own dense blocks OOM-killed the box.  This view
+    computes each requested row block on demand so the full product is never
+    resident.
+    """
+
+    def __init__(self, prime, ns):
+        self.prime = prime
+        self.ns = ns
+        self.shape = (int(prime.shape[0]), int(ns.shape[1]))
+
+    def __getitem__(self, sl):
+        return self.prime[sl] @ self.ns
+
+
+def _rfe_final_refit_exact(A, y, best_idx, *, block_rows=None, diag_floor=1e-12,
+                           iterative_diagnostics=None, n_samples=None):
+    """[PATCH rfe-final-tsqr-v3] Exact OLS on the selected support.
+
+    Default method "gram" accumulates the normal equations G = A^T A in float64
+    over row blocks, streaming from SM_prime @ NS, so the peak is ~G + one dense
+    block (~25 GB for 30k features).  The Q-less TSQR needs the R factors plus a
+    merged Q (~120 GB) and OOM-killed the box at this size; it is still available
+    via PHEASY_RFE_FINAL_METHOD=tsqr.  Both are unregularized OLS (no ridge bias).
+    Returns the coefficient vector or None (caller falls back to LSMR).
+    """
+    y64 = np.asarray(y, dtype=np.float64).ravel()
+    m = int(A.shape[0])
+    n = int(len(best_idx))
+    blk = int(block_rows) if block_rows else int(
+        os.environ.get("PHEASY_RFE_FINAL_BLOCK_ROWS", "20000"))
+    method = os.environ.get("PHEASY_RFE_FINAL_METHOD", "gram").lower()
+
+    # --- row-block source: sparse slice getter -------------------------------
+    if isinstance(A, TwoLevelSM):
+        try:
+            NSs = A.NS[:, best_idx]
+            if not sp.issparse(NSs):
+                NSs = sp.csr_matrix(NSs)
+        except Exception as exc:
+            print("[RFE] final exact refit: NS slice failed (%s); LSMR fallback"
+                  % type(exc).__name__, flush=True)
+            return None
+        prime = A.SM_prime
+        def _rows(i0, i1):
+            return prime[i0:i1] @ NSs
+    else:
+        try:
+            A_full = _materialize_columns(A, best_idx)
+        except Exception as exc:
+            print("[RFE] final exact refit: materialization failed (%s); LSMR fallback"
+                  % type(exc).__name__, flush=True)
+            return None
+        if A_full is None:
+            return None
+        def _rows(i0, i1):
+            return A_full[i0:i1]
+
+    if method == "tsqr":
+        print("[RFE] final exact refit: streaming TSQR (%d x %d), blocks of %d"
+              % (m, n, blk), flush=True)
+        try:
+            class _GetterBlocks(object):
+                def __init__(self, getter, shape):
+                    self._getter = getter
+                    self.shape = shape
+
+                def __getitem__(self, sl):
+                    return self._getter(sl.start, sl.stop)
+            coef, ok, _cond = _tsqr_qless(_GetterBlocks(_rows, (m, n)), y64, blk, diag_floor)
+            if (not ok) or coef is None:
+                print("[RFE] final exact refit: TSQR rank-deficient; LSMR fallback",
+                      flush=True)
+                return None
+        except Exception as exc:
+            print("[RFE] final exact refit: TSQR failed (%s); LSMR fallback"
+                  % type(exc).__name__, flush=True)
+            return None
+    else:
+        print("[RFE] final exact refit: Gram normal equations (%d x %d), blocks of %d"
+              % (m, n, blk), flush=True)
+        G = np.zeros((n, n), dtype=np.float64)
+        rhs = np.zeros(n, dtype=np.float64)
+        try:
+            for i0 in range(0, m, blk):
+                i1 = min(i0 + blk, m)
+                B = _rows(i0, i1)
+                Bd = np.asarray(B.toarray() if sp.issparse(B) else B, dtype=np.float64)
+                G += Bd.T @ Bd
+                rhs += Bd.T @ y64[i0:i1]
+                del Bd, B
+        except MemoryError:
+            print("[RFE] final exact refit: Gram accumulation OOM; LSMR fallback",
+                  flush=True)
+            return None
+        ridge = float(os.environ.get("PHEASY_RFE_FINAL_RIDGE", "0"))
+        if ridge > 0:
+            G.flat[:: n + 1] += ridge
+        try:
+            L = np.linalg.cholesky(G)
+            from scipy.linalg import solve_triangular as _stri
+            z = _stri(L, rhs, lower=True, check_finite=False)
+            coef = _stri(L.T, z, lower=False, check_finite=False)
+            _resid = float(np.linalg.norm(G @ coef - rhs))
+            print("[RFE] final exact refit: Cholesky ok (||Gx-b||=%.3e)" % _resid,
+                  flush=True)
+        except np.linalg.LinAlgError:
+            print("[RFE] final exact refit: Gram not PD; lstsq(rcond=1e-12)", flush=True)
+            coef = np.linalg.lstsq(G, rhs, rcond=1e-12)[0]
+    if iterative_diagnostics is not None:
+        iterative_diagnostics.append(dict(
+            solver="Gram-Cholesky" if method != "tsqr" else "TSQR",
+            converged=True, stop_reason="qr_exact" if method == "tsqr" else "normal_equations",
+            fit_scope="full", n_features=n,
+            n_samples=int(m if n_samples is None else n_samples)))
+    return np.asarray(coef, dtype=np.float64)
 
 
 class _RFECVBase:
@@ -2491,7 +3990,27 @@ class _RFECVBase:
         resident_operator = False
         iterative_diagnostics = []
         resident_subset_builds = 0
-        if os.environ.get("PHEASY_GPU_RFE_RESIDENT", "1" if _resident_default() else "0").lower() in ("1", "true", "yes", "on"):
+        _rfe_resident_on = os.environ.get(
+            "PHEASY_GPU_RFE_RESIDENT",
+            "1" if _resident_default() else "0").lower() in ("1", "true", "yes", "on")
+        if _rfe_resident_on and _gpu_required() and self.n_jobs != 1:
+            # The resident RFE operator is not fork-safe, so the outer loop has to
+            # be serial -- but in REQUIRED GPU mode the resident solve is the
+            # requirement and outer parallelism is only a CPU-side optimization.
+            # Refusing outright made "GPU required + RFE" a hard failure for every
+            # caller with a generic thread count: measured with the shipped
+            # fit_3090.sh, which exports PHEASY_N_JOBS=8, and the documented escape
+            # hatch was to give up the GPU entirely.  Serialize and say so; the
+            # per-subset solves stay on the GPU either way.
+            warnings.warn(
+                "Resident RFE needs a serial outer loop; PHEASY_RFE_N_JOBS/"
+                "PHEASY_N_JOBS requested n_jobs=%d. Running the RFE rounds "
+                "serially so every subset solve stays on the GPU (set "
+                "PHEASY_GPU_RFE_RESIDENT=0 to use the CPU solver with the "
+                "requested parallelism)." % int(self.n_jobs),
+                RuntimeWarning, stacklevel=3)
+            self.n_jobs = 1
+        if _rfe_resident_on:
             if isinstance(A, np.ndarray) and self.n_jobs == 1:
                 resident_backend = _gpu()
                 if resident_backend is not None:
@@ -2597,7 +4116,7 @@ class _RFECVBase:
                 resident_norms = torch.as_tensor(col_norms, dtype=_resident_value_dtype(resident_A, torch), device=resident_A.device)
             return resident_norms.index_select(0, cached_column_tensor)
 
-        def solve(col_idx, row_idx=None, download=True):
+        def solve(col_idx, row_idx=None, download=True, scope=None):
             nonlocal gpu_subset_solves, full_fit_coef, resident_subset_builds
             if resident_operator:
                 columns = resident_columns(col_idx)
@@ -2608,10 +4127,21 @@ class _RFECVBase:
                     ridge_alpha=self.ridge_alpha,
                     atol=float(os.environ.get("PHEASY_LSQR_ATOL", str(self.lsmr_atol))),
                     btol=float(os.environ.get("PHEASY_LSQR_BTOL", str(self.lsmr_btol))),
-                    maxiter=int(os.environ.get("PHEASY_LSQR_MAXITER", str(self.lsmr_maxiter))))
+                    maxiter=int(os.environ.get("PHEASY_LSQR_MAXITER", str(self.lsmr_maxiter))),
+                    # RFE's subset solves are for RANKING, not for delivering
+                    # coefficients: on the production operator the first round lands
+                    # on a measured precision floor above the certifiable cap, and
+                    # refusing there aborted the whole fit.  Accept the measured
+                    # floor (recorded per solve in info["floor_accepted"] /
+                    # "floor_note", and counted in backend_metadata_) while an
+                    # exhausted budget with no floor evidence still raises.
+                    # PHEASY_RFE_RANKING_FLOOR=0 restores the strict fail-closed path.
+                    accept_measured_floor=os.environ.get(
+                        "PHEASY_RFE_RANKING_FLOOR", "1").lower() in ("1", "true", "yes", "on"))
                 iterative_diagnostics.append(dict(info, n_features=len(col_idx),
                                                  n_samples=n_samples if row_idx is None else len(row_idx),
-                                                 fit_scope="full" if row_idx is None else "fold"))
+                                                 fit_scope=(scope if scope is not None
+                                                            else ("full" if row_idx is None else "fold"))))
                 resident_subset_builds += 1
                 gpu_subset_solves += 1
                 if row_idx is not None:
@@ -2650,7 +4180,8 @@ class _RFECVBase:
                                  diag_floor=self.diag_floor,
                                  column_scale=col_norms if use_scaling else None,
                                  diag_sink=iterative_diagnostics,
-                                 diag_scope="full" if row_idx is None else "fold")
+                                 diag_scope=(scope if scope is not None
+                                             else ("full" if row_idx is None else "fold")))
 
         def operator_prediction(cols, rows, coef):
             nonlocal resident_subset_builds
@@ -2707,7 +4238,20 @@ class _RFECVBase:
         best_cv = float("inf")
         best_bic = float("inf")
         no_improve = 0
-        while True:
+        # [PATCH rfe-final-tsqr-v2] Optional support override: skip the rounds and
+        # run only the exact final refit on a support saved by a previous run.
+        _sup_npy = os.environ.get("PHEASY_RFE_SUPPORT_NPY")
+        _support_override = None
+        if _sup_npy:
+            try:
+                _support_override = np.asarray(np.load(_sup_npy), dtype=np.int64).ravel()
+                print("[RFE] support override loaded: %d features from %s"
+                      % (_support_override.size, _sup_npy), flush=True)
+            except Exception as _exc:
+                print("[RFE] support override load failed (%s); running rounds"
+                      % type(_exc).__name__, flush=True)
+                _support_override = None
+        while _support_override is None:
             idx = np.where(active)[0]
             n_active = len(idx)
             # Keep the initial no-elimination fast path, but evaluate the
@@ -2717,7 +4261,7 @@ class _RFECVBase:
 
             defer_download = (resident_A is not None
                               and os.environ.get("PHEASY_GPU_RFE_RANKING", "0").lower() in ("1", "true", "yes", "on"))
-            coef_active = solve(idx, download=not defer_download)
+            coef_active = solve(idx, download=not defer_download, scope="ranking")
             if self.verbose:
                 nonzero_count = (int(torch.count_nonzero(full_fit_coef).item()) if coef_active is None
                                  else int(np.count_nonzero(coef_active)))
@@ -2811,7 +4355,15 @@ class _RFECVBase:
             round_num += 1
 
         # --- selection (each criterion prints its own summary, once) ---
-        if criterion in ("bic", "aic") and history_bic:
+        if _support_override is not None:
+            best_support = np.zeros(n_features, dtype=bool)
+            best_support[_support_override] = True
+            n_best = int(_support_override.size)
+            best_mean, best_se = float("nan"), 0.0
+            if self.verbose:
+                print("[RFE] support override: n_active=%d (rounds skipped)" % n_best,
+                      flush=True)
+        elif criterion in ("bic", "aic") and history_bic:
             best_round = int(np.argmin([h[1] for h in history_bic]))
             n_best = history_bic[best_round][0]
             best_support = history_bic[best_round][2]
@@ -2835,7 +4387,23 @@ class _RFECVBase:
             best_support = np.ones(n_features, dtype=bool)
         best_idx = np.where(best_support)[0]
 
-        coef_final = solve(best_idx)
+        # [PATCH rfe-final-tsqr] Deliver exact OLS coefficients on the selected
+        # support.  Every round's full-data LSMR solve is tagged "ranking" above,
+        # so only this final solve vetoes the acceptance gate; solving it exactly
+        # with TSQR makes the delivered force constants certifiable.
+        coef_final = None
+        if (_is_linear_operator(A)
+                and os.environ.get("PHEASY_RFE_FINAL_TSQR", "1").lower()
+                in ("1", "true", "yes", "on")):
+            try:
+                np.save(os.path.join(".", "rfe_support.npy"), best_idx)
+            except Exception:
+                pass
+            coef_final = _rfe_final_refit_exact(
+                A, y, best_idx, block_rows=self.block_rows, diag_floor=self.diag_floor,
+                iterative_diagnostics=iterative_diagnostics, n_samples=n_samples)
+        if coef_final is None:
+            coef_final = solve(best_idx)
         coef_full = np.zeros(n_features, dtype=np.float64)
         coef_full[best_idx] = coef_final
 
@@ -2932,8 +4500,9 @@ _LsmrOLSResult = _OLSModel
 class Optimizer(object):
     """Interatomic force constant optimizer.
 
-    Supported methods: ols, lasso, alasso, rfe, rfe-ols-tsqr (rfe_tsqr) and
-    the legacy ridge.
+    Supported methods: ols, lasso, alasso, rfe / rfe-ols (aliases: RFE with an
+    OLS base estimator), rfe-ols-tsqr (rfe_tsqr), ardr (automatic relevance
+    determination regression) and the legacy ridge.
     """
 
     def __init__(
@@ -3048,18 +4617,43 @@ class Optimizer(object):
                 if _gb.enabled() and ridge <= 0:
                     _dev_ids = _gb.resident_device_ids()
                     base = getattr(X, "_twolevel_base", X)
-                    gpu_op = _gb.GpuTwoLevelOperator(base, device_ids=_dev_ids)
+                    # Reuse the resident operator this host operator already owns.
+                    # The column-norm pass caches one, and so does resident RIDGE,
+                    # so a fit sequence (RIDGE then OLS, or the same operator
+                    # fitted twice) used to upload the factors again: 41.5 s at the
+                    # MgC slice size and ~206 s at full size for nothing.
+                    gpu_op = getattr(base, "_gpu_ridge_op", None)
+                    _owns_op = gpu_op is None
+                    if _owns_op:
+                        gpu_op = _gb.GpuTwoLevelOperator(
+                            base, device_ids=_dev_ids,
+                            host_factors=_gb.twolevel_host_factors(base))
                     _coln = None
                     try:
                         if jacobi:
-                            _coln = np.asarray(X.col_norms(), dtype=np.float64).ravel()
+                            # Hand the already-built resident operator over so the
+                            # norms are computed ON the GPU with no second factor
+                            # upload: this pass was 90% of the OLS fit (measured
+                            # 197.9 s of 219.9 s on the MgC operator).
+                            _coln = np.asarray(
+                                X.col_norms(gpu_op=gpu_op) if isinstance(X, TwoLevelSM)
+                                else X.col_norms(), dtype=np.float64).ravel()
                             if _coln.shape != (base.shape[1],) or not np.all(np.isfinite(_coln)) or np.any(_coln <= 0):
                                 raise ValueError("Jacobi column norms must be finite, positive and complete")
                             gpu_op.scale = gpu_op.torch.as_tensor(
                                 _coln, dtype=gpu_op._value_dtype, device=gpu_op.device)
                         coef, info = _gb.iterative_lstsq(gpu_op, y, atol=atol, btol=btol, maxiter=maxiter)
                     finally:
-                        gpu_op.close()
+                        if _owns_op:
+                            gpu_op.close()
+                        else:
+                            # Jacobi scaled this shared operator; put the scale
+                            # back so a later reuse (resident RIDGE, or the
+                            # column-norm pass) does not inherit it.
+                            try:
+                                gpu_op.scale = gpu_op.torch.ones_like(gpu_op.scale)
+                            except Exception:
+                                pass
                     if _coln is not None:
                         coef = np.asarray(coef, dtype=np.float64).ravel() / _coln
                     if isinstance(info, dict):
@@ -3154,6 +4748,14 @@ class Optimizer(object):
         method = self._method.upper().replace("_", "-")
         if method in ("RFE-OLS-TSQR", "RFE-TSQR"):
             method = "RFE-OLS-TSQR"
+        elif method in ("RFE-OLS", "RFE-OLS-CV"):
+            # RFE's base estimator IS OLS; "RFE-OLS" is the explicit spelling
+            # of the same method (Fransson et al. 2020 call it RFE-OLS).
+            method = "RFE"
+        elif method in ("ARD", "ARD-REGRESSION"):
+            method = "ARDR"
+        elif method in ("FAST-RVM", "FASTRVM", "RVM-FAST"):
+            method = "RVM"
         elif method == "RFECV":
             method = "RFE"
 
@@ -3167,6 +4769,7 @@ class Optimizer(object):
                 raise NotImplementedError("fit_intercept is not supported for operator penalized fits; use a supported dense path or fit_intercept=False")
             if weights is not None:
                 raise NotImplementedError("sample weights are not supported for operator penalized fits; weights must be None")
+
 
         if weights is not None and method == "LASSO" and self._debias_enabled():
             raise NotImplementedError("weighted LASSO debias is not supported; set PHEASY_LASSO_DEBIAS=0 for supported dense weighted fitting")
@@ -3186,7 +4789,7 @@ class Optimizer(object):
         # penalized methods; coefficients are un-scaled after fitting.
         col_scale = None
         A_fit = A
-        if self._standardize and method in ("LASSO", "ALASSO", "RIDGE") and not (resident_lasso and method in ("LASSO", "ALASSO")):
+        if self._standardize and method in ("LASSO", "ALASSO", "RIDGE", "ARDR", "RVM") and not (resident_lasso and method in ("LASSO", "ALASSO")):
             col_scale = _col_norms(A)
             col_scale = np.where(col_scale < 1e-30, 1.0, col_scale)
             A_fit = _scale_columns(A, col_scale)
@@ -3207,24 +4810,41 @@ class Optimizer(object):
             coef, n_iter = self._fit_ols(A, F64)
             self._model = _OLSModel(coef, n_iter=n_iter)
         elif method in ("LASSO", "ALASSO") and resident_lasso:
-            self._model = resident_gb.GpuTwoLevelLassoCV(
-                self._alpha, self._cv, self._tol, self._max_iter, self._rand_seed,
-                group_size=self._group_size, standardize=self._standardize,
-                adaptive=(method == "ALASSO"),
-                gamma=float(os.environ.get("PHEASY_ALASSO_GAMMA", "1.0")),
-                init_alpha=float(os.environ.get("PHEASY_ALASSO_RIDGE_ALPHA", "1e-3")),
-                eps=float(os.environ.get("PHEASY_ALASSO_EPS", "1e-8")),
-                nalpha=self._nalpha, decades=self._decades,
-                alpha_auto=self._alpha_auto and not self._alpha_user_supplied)
-            self._model.fit(A, F64, sample_weight=weights,
-                            retain_operator=self._debias_enabled())
-            coef = self._model.coef_
-            # Backend returns physical coefficients. Keep A_fit unscaled so
-            # the existing optional CPU debias operates in physical coordinates.
-            self._results["execution_backend"] = "gpu_twolevel_resident"
-            # postfit_backend is set after the optional debias (which now runs on the
-            # retained resident operator); do not pre-declare it here.
-            print("[optimizer] gpu_resident %s complete" % method, flush=True)
+            try:
+                self._model = resident_gb.GpuTwoLevelLassoCV(
+                    self._alpha, self._cv, self._tol, self._max_iter, self._rand_seed,
+                    group_size=self._group_size, standardize=self._standardize,
+                    adaptive=(method == "ALASSO"),
+                    gamma=float(os.environ.get("PHEASY_ALASSO_GAMMA", "1.0")),
+                    init_alpha=float(os.environ.get("PHEASY_ALASSO_RIDGE_ALPHA", "1e-3")),
+                    eps=float(os.environ.get("PHEASY_ALASSO_EPS", "1e-8")),
+                    nalpha=self._nalpha, decades=self._decades,
+                    alpha_auto=self._alpha_auto and not self._alpha_user_supplied)
+                self._model.fit(A, F64, sample_weight=weights,
+                                retain_operator=self._debias_enabled())
+                coef = self._model.coef_
+                # Backend returns physical coefficients. Keep A_fit unscaled so
+                # the existing optional CPU debias operates in physical coordinates.
+                self._results["execution_backend"] = "gpu_twolevel_resident"
+                # postfit_backend is set after the optional debias (which now runs on the
+                # retained resident operator); do not pre-declare it here.
+                print("[optimizer] gpu_resident %s complete" % method, flush=True)
+            except (getattr(resident_gb, "ResidentFootprintError", MemoryError),
+                    MemoryError) as _e:
+                # [FIX resident-fallback] The resident backend asked for a
+                # footprint it cannot get.  Do not abort the fit: fall through to
+                # the iterative two-level backend, which is exactly the path
+                # _lasso_backend already selected when its own pre-flight saw the
+                # same overflow (and which keeps the solve on the GPU).
+                print("[optimizer] resident %s backend does not fit this device "
+                      "set (%s); falling back to the iterative FISTA backend"
+                      % (method, _e), flush=True)
+                self._model = _LassoCVModel(
+                    self._alpha, self._cv, self._tol, self._max_iter, self._rand_seed,
+                    _lasso_n_jobs(A),
+                    fit_intercept=self._fit_intercept, group_size=self._group_size)
+                self._model.fit(A_fit, F64, sample_weight=weights)
+                coef = self._model.coef_
         elif method == "LASSO":
             self._model = _LassoCVModel(
                 self._alpha, self._cv, self._tol, self._max_iter, self._rand_seed,
@@ -3245,6 +4865,55 @@ class Optimizer(object):
                 alpha_auto=self._alpha_auto and not self._alpha_user_supplied)
             self._model.fit(A_fit, F64, sample_weight=weights)
             coef = self._model.coef_
+        elif method == "ARDR":
+            _thr_env = os.environ.get("PHEASY_ARDR_THRESHOLDS", "")
+            _thresholds = [float(t) for t in _thr_env.split(",") if t.strip()] or None
+            self._model = _ARDRModel(
+                threshold_lambda=float(os.environ.get("PHEASY_ARDR_THRESHOLD", "1e4")),
+                thresholds=_thresholds,
+                cv=self._cv,
+                max_iter=int(os.environ.get("PHEASY_ARDR_MAX_ITER", "300")),
+                tol=self._tol,
+                fit_intercept=self._fit_intercept,
+                rand_seed=self._rand_seed,
+                group_size=self._group_size,
+                n_jobs=None,
+            )
+            self._model.fit(A_fit, F64, sample_weight=weights)
+            coef = self._model.coef_
+        elif method == "RVM":
+            from .fast_rvm import fast_rvm as _fast_rvm
+            import time as _t
+            _rvm_budget = float(os.environ.get(
+                "PHEASY_ARDR_GRAM_MAX_GB", os.environ.get("PHEASY_GRAM_MAX_GB", "4")))
+            print("[RVM] building the design Gram (matrix-free; budget %.1f GB)..."
+                  % _rvm_budget, flush=True)
+            _t0 = _t.time()
+            G_rvm, b_rvm, _rvm_how = _build_gram_matrix(A_fit, F64, budget_gb=_rvm_budget)
+            print("[RVM] design Gram %dx%d (%.2f GB, %s) in %.1fs"
+                  % (G_rvm.shape[0], G_rvm.shape[1], G_rvm.nbytes / 1e9, _rvm_how,
+                     _t.time() - _t0), flush=True)
+            _rvm_beta_env = os.environ.get("PHEASY_RVM_BETA")
+            _rvm_beta = float(_rvm_beta_env) if _rvm_beta_env not in (None, "") else None
+            _rvm_max_steps = os.environ.get("PHEASY_RVM_MAX_STEPS")
+            _res = _fast_rvm(
+                G_rvm, b_rvm, float(F64 @ F64), F64.shape[0],
+                y_var=float(np.var(F64)), beta=_rvm_beta,
+                beta_iters=int(os.environ.get("PHEASY_RVM_BETA_ITERS", "10")),
+                tol=float(os.environ.get("PHEASY_RVM_TOL", "1e-6")),
+                max_steps=int(_rvm_max_steps) if _rvm_max_steps else None,
+                add_batch=int(os.environ.get("PHEASY_RVM_ADD_BATCH", "1")),
+                prune_threshold=float(os.environ.get("PHEASY_RVM_THRESHOLD", "1e4")),
+                verbose=os.environ.get("PHEASY_RVM_VERBOSE", "1").lower()
+                in ("1", "true", "yes", "on"))
+            _c_rvm = np.asarray(_res["coef"], dtype=np.float64)
+            _rss_rvm = (float(F64 @ F64) - 2.0 * float(_c_rvm @ b_rvm)
+                        + float(_c_rvm @ (G_rvm @ _c_rvm)))
+            self._model = _RVMModel(_c_rvm, _res["active"], _res["alpha"],
+                                    _res["beta"], _res["n_steps"], A.shape[1],
+                                    _rss_rvm, F64.shape[0], _res["converged"])
+            self._results["rvm_gram"] = _rvm_how
+            coef = self._model.coef_
         elif method == "RFE":
             self._model = PheasyRFECV(
                 step=float(os.environ.get("PHEASY_RFE_STEP", "0.05")),  # [FIX P21]
@@ -3254,8 +4923,16 @@ class Optimizer(object):
                 min_features=int(os.environ.get("PHEASY_RFE_MIN_FEATURES", "1")),
                 patience=int(os.environ.get("PHEASY_RFE_PATIENCE", "5")),
                 lsmr_maxiter=int(os.environ.get("PHEASY_LSQR_MAXITER", "5000")),
-                lsmr_atol=float(_lsmr_tol("PHEASY_LSQR_ATOL", 1e-8)),
-                lsmr_btol=float(_lsmr_tol("PHEASY_LSQR_BTOL", 1e-8)),
+                # No operator exists yet here -- RFE builds each subset later -- so
+                # the precision floor CANNOT be applied at this point.  Calling
+                # _lsmr_tol without one made _array_precision fall back to
+                # PHEASY_SM_DTYPE and bake the AMBIENT precision into this default,
+                # which then survived into _solve_subset and over-raised the
+                # tolerance of every float64 subset in a process that happened to
+                # set the smoke-test variable.  The floor is applied where the
+                # operator is in hand.
+                lsmr_atol=float(os.environ.get("PHEASY_LSQR_ATOL", 1e-8)),
+                lsmr_btol=float(os.environ.get("PHEASY_LSQR_BTOL", 1e-8)),
                 verbose=True, random_state=self._rand_seed)
             self._model.fit(A, F64, sample_weight=weights)
             coef = self._model.coef_
@@ -3285,6 +4962,22 @@ class Optimizer(object):
                 splits = _make_cv_splits(A.shape[0], self._cv, self._rand_seed,
                                          self._group_size)
                 n_jobs = _resolve_n_jobs("RIDGE")
+                # Pre-warm the resident operator for the SCALED parent before any
+                # fold is sliced.  _row_slice turns a fold into a row VIEW over this
+                # operator when it exists, which is what removes one factor upload
+                # plus one host csr_tocsc transpose per fold (measured at NCONF=6:
+                # GpuTwoLevelOperator.__init__ 5 calls -> 1).  A failure here is not
+                # fatal: the folds then slice host factors exactly as before.
+                if _resident_default() or os.environ.get(
+                        "PHEASY_GPU_RIDGE_RESIDENT", "").lower() in (
+                            "1", "true", "yes", "on"):
+                    try:
+                        from . import gpu_backend as _gb_pw
+                        if _gb_pw.enabled() and _gb_pw.available():
+                            _resident_ridge_op(A_fit)
+                    except Exception:
+                        if _gpu_required():
+                            raise
                 A_tr_list = [_row_slice(A_fit, tr) for tr, _ in splits]
                 y_tr_list = [F64[tr] for tr, _ in splits]
                 warm = [None] * len(splits)
@@ -3357,15 +5050,47 @@ class Optimizer(object):
                 # PHEASY_RIDGE_LCURVE=0 if the extra solves are not wanted; the
                 # best alpha's coefficient is reused for the final model.
                 _lc = {}
+                # Solver certificates are kept per alpha: A_fit carries only the
+                # LAST solve, and the L-curve walk ends on the smallest alpha, so
+                # reporting A_fit._gpu_solver_info described a fit that was thrown
+                # away while the delivered coefficients came from best_alpha.
+                _lc_info = {}
                 if os.environ.get("PHEASY_RIDGE_LCURVE", "1").lower() not in ("0", "false", "no", "off"):
                     _x0 = None
                     print("[RIDGE-LC] alpha | ||c|| | ||Xc-y|| | time", flush=True)
                     for _a in alphas:
                         _tl = _time.time()
                         _c = _ridge_solve(A_fit, F64, _a, x0=_x0)
+                        _c_info = getattr(A_fit, "_ridge_solver_info", None)
+                        _lc_info[float(_a)] = (dict(_c_info, alpha=float(_a)) if _c_info
+                                               else (dict(A_fit._gpu_solver_info)
+                                                     if getattr(A_fit, "_gpu_solver_info", None)
+                                                     else None))
                         _x0 = _c
                         _lc[float(_a)] = _c
-                        _res = np.asarray(A_fit @ _c, dtype=np.float64).ravel() - F64
+                        # Residual for the L-curve line.  This is a diagnostic
+                        # print, and on a two-level operator the host matvec costs
+                        # O(nnz(SM_prime)) per alpha: two orders of magnitude more
+                        # than the print is worth at full size (measured on the MgC
+                        # operator: 640 s -> 127 s for the whole RIDGE fit once the
+                        # folds went resident, with the L-curve host matvecs and
+                        # factor uploads left as the remaining host share).  Use the
+                        # resident operator when one exists; it is the same matvec.
+                        _op = getattr(A_fit, "_gpu_ridge_op", None)
+                        if _op is not None:
+                            try:
+                                _t = _op.torch.as_tensor(
+                                    np.asarray(_c, dtype=np.float64),
+                                    dtype=_op._value_dtype, device=_op.device)
+                                _pred = np.asarray(
+                                    _op.matvec(_t).detach().cpu().numpy(),
+                                    dtype=np.float64).ravel()
+                                _res = _pred - F64
+                            except Exception:
+                                _res = np.asarray(A_fit @ _c,
+                                                  dtype=np.float64).ravel() - F64
+                        else:
+                            _res = np.asarray(A_fit @ _c, dtype=np.float64).ravel() - F64
                         print("[RIDGE-LC] %.6e | %.6e | %.6e | %.1fs"
                               % (float(_a), float(np.linalg.norm(_c)),
                                  float(np.linalg.norm(_res)),
@@ -3376,9 +5101,24 @@ class Optimizer(object):
                 self._model = _OLSModel(coef, alpha=best_alpha)
                 self._results["alpha"] = best_alpha
                 self._results["mse_path"] = mse_path
-                ridge_info = getattr(A_fit, "_gpu_solver_info", None)
+                # The certificate must describe the solve whose coefficients
+                # are returned (best_alpha), never whichever alpha ran last.
+                ridge_info = _lc_info.get(float(best_alpha))
+                if ridge_info is None:
+                    # Only the last solve of this operator is still on it, so it
+                    # is usable only when it names the alpha being delivered.
+                    _last = getattr(A_fit, "_ridge_solver_info", None)
+                    if _last is None:
+                        _last = getattr(A_fit, "_gpu_solver_info", None)
+                    if (_last is not None
+                            and float(_last.get("alpha", best_alpha)) == float(best_alpha)):
+                        ridge_info = dict(_last)
                 if ridge_info is not None:
-                    self._results["execution_backend"] = "gpu_twolevel_ridge_resident"
+                    # Label from the certificate itself: this branch runs whichever
+                    # iterative solver _ridge_solve selected, so a hard-coded GPU
+                    # name would mislabel the CPU LSMR fallback.
+                    self._results["execution_backend"] = str(
+                        ridge_info.get("backend", "gpu_twolevel_ridge_resident"))
                     self._results["regularized_solver_info"] = dict(ridge_info)
                     self._results["postfit_backend"] = "cpu_metrics"
             else:
@@ -3452,7 +5192,7 @@ class Optimizer(object):
         else:
             raise ValueError(
                 "Unknown linear model for fitting force constants: {} ".format(self._method)
-                + "(expected OLS, LASSO, ALASSO, RFE, RFE-OLS-TSQR, RIDGE)")
+                + "(expected OLS, LASSO, ALASSO, RVM, ARDR, RFE, RFE-OLS, RFE-OLS-TSQR, RIDGE)")
 
         coef = np.asarray(coef, dtype=np.float64)
 
@@ -3462,7 +5202,22 @@ class Optimizer(object):
         # LASSO fit (Meinshausen 2007; used by ALAMODE/phono3py).  Default on;
         # disable with PHEASY_LASSO_DEBIAS=0.
         self._results.pop("pre_debias_coef", None)
-        if method in ("LASSO", "ALASSO") and self._debias_enabled():
+        # [FIX P46] alpha* pinned at the grid bottom => the CV curve never turned
+        # up, i.e. the data supports no sparsity.  Ship the relaxed refit and say
+        # so in the manifest instead of silently returning the shrunk support
+        # (this is how the delivered Mg8C120 v4 fit lost 6x generalization:
+        # debias was off AND the 4-decade grid pinned alpha* at its bottom).
+        _alpha_at_edge = bool(getattr(self._model, "_alpha_at_min", False))
+        self._results["alpha_at_grid_edge"] = _alpha_at_edge
+        if _alpha_at_edge:
+            self._results["sparsity_supported"] = False
+        _edge_relaxed = _alpha_at_edge and self._alpha_edge_relaxed_enabled()
+        if _edge_relaxed and not self._debias_enabled():
+            self._results["debias_forced_reason"] = (
+                "alpha* sits at the grid bottom (CV curve still falling): no "
+                "sparsity is supported, so the L1 shrinkage bias is removed by "
+                "the relaxed refit even though PHEASY_LASSO_DEBIAS=0.")
+        if method in ("LASSO", "ALASSO") and (self._debias_enabled() or _edge_relaxed):
             # Preserve physical-coordinate coefficients for paired evaluation.
             self._results["pre_debias_coef"] = (
                 coef / col_scale if col_scale is not None else coef.copy())
@@ -3489,15 +5244,41 @@ class Optimizer(object):
             self._results["alpha"] = float(self._model.alpha_)
             self._results["n_iter"] = int(self._model.n_iter_)
             info = getattr(self._model, "regularized_solver_info_", None)
+            if not info:
+                # Every LASSO/ALASSO backend is supposed to certify its own
+                # solve.  Silence must not read as a clean bill of health: name
+                # the model that published nothing so the gap is auditable
+                # instead of showing up as a missing execution_backend.
+                self._results["regularized_solver_info_missing"] = type(
+                    self._model).__name__
             if info is not None:
                 self._results["regularized_solver_info"] = dict(info)
                 backend = str(info.get("backend", ""))
                 if backend:
                     self._results["execution_backend"] = backend
-                    if self._debias_enabled():
+                    if self._debias_enabled() or _edge_relaxed:
                         db = getattr(self, "_debias_backend", "unknown")
                         self._results["debias_backend"] = db
                         self._results["postfit_backend"] = db + "_and_cpu_metrics"
+                        # A declared post-fit stage that did not take effect must
+                        # be visible: the residual guard can reject the refit, and
+                        # before this the results still named the backend as if it
+                        # had run.
+                        if getattr(self, "_debias_accepted", None) is not None:
+                            self._results["debias_accepted"] = bool(self._debias_accepted)
+                            self._results["debias_stage"] = getattr(
+                                self, "_debias_stage", None)
+                            _r = getattr(self, "_debias_residuals", None)
+                            if _r is not None:
+                                self._results["debias_residual_refit"] = _r[0]
+                                self._results["debias_residual_shrunk"] = _r[1]
+                            if not self._debias_accepted:
+                                self._results["debias_fallback_reason"] = (
+                                    "support refit rejected: residual %.6e > %.6e, "
+                                    "keeping the L1 coefficients" % (_r[0], _r[1]))
+                        _di = getattr(self, "_debias_solver_info", None)
+                        if isinstance(_di, dict):
+                            self._results["debias_solver_info"] = dict(_di)
                     else:
                         self._results["debias_backend"] = "disabled"
                         self._results["postfit_backend"] = "cpu_metrics"
@@ -3528,8 +5309,58 @@ class Optimizer(object):
                 self._results["execution_backend"] = "gpu_rfe_resident_iterative" if rfe_meta.get("subset_solver") == "gpu_resident_iterative" else ("gpu_rfe_subsets" if rfe_meta.get("subset_solver") == "gpu_dense" else "cpu_rfe")
                 self._results["postfit_backend"] = "cpu_orchestration_and_metrics"
                 self._results["backend_metadata"] = dict(rfe_meta)
+        elif method == "ARDR":
+            self._results["n_iter"] = int(getattr(self._model, "n_iter_", 0))
+            # 'alpha' is the ARD noise precision (1/sigma^2), not a penalty.
+            self._results["alpha"] = float(getattr(self._model, "alpha_", 0.0))
+            self._results["ardr_threshold"] = float(
+                getattr(self._model, "threshold_", float("nan")))
+            _mse = np.asarray(self._model.mse_path_, dtype=np.float64)
+            _best = int(getattr(self._model, "best_index_", 0))
+            self._metrics["mse_path"] = _mse[_best]
+            self._metrics["mse_path_mean"] = float(np.mean(_mse[_best]))
+            self._metrics["rmse_path"] = np.sqrt(_mse[_best])
+            self._metrics["rmse_path_mean"] = float(
+                getattr(self._model, "best_rmse_cv_",
+                        np.sqrt(self._metrics["mse_path_mean"])))
+            self._metrics["n_features"] = self._model.n_features_in_
+            self._metrics["n_featrues"] = self._metrics["n_features"]
+            self._results["cv_evaluated"] = bool(
+                getattr(self._model, "cv_evaluated", True))
+            _ardr_info = getattr(self._model, "regularized_solver_info_", None)
+            if _ardr_info:
+                self._results["regularized_solver_info"] = dict(_ardr_info)
+                self._results["execution_backend"] = str(
+                    _ardr_info.get("backend", "cpu_dense_ardr"))
+                self._results["postfit_backend"] = "cpu_metrics"
+        elif method == "RVM":
+            self._results["n_iter"] = int(getattr(self._model, "n_iter_", 0))
+            self._results["alpha"] = float(getattr(self._model, "beta_", 0.0))
+            self._results["rvm_beta"] = float(getattr(self._model, "beta_", float("nan")))
+            self._results["rvm_active"] = int(len(getattr(self._model, "active_", [])))
+            _mse = np.asarray(self._model.mse_path_, dtype=np.float64)
+            self._metrics["mse_path"] = _mse[0]
+            self._metrics["mse_path_mean"] = float(np.mean(_mse[0]))
+            self._metrics["rmse_path"] = np.sqrt(_mse[0])
+            self._metrics["rmse_path_mean"] = float(getattr(
+                self._model, "best_rmse_cv_", np.sqrt(self._metrics["mse_path_mean"])))
+            self._metrics["n_features"] = self._model.n_features_in_
+            self._metrics["n_featrues"] = self._metrics["n_features"]
+            self._results["cv_evaluated"] = False
+            _rvm_info = getattr(self._model, "regularized_solver_info_", None)
+            if _rvm_info:
+                self._results["regularized_solver_info"] = dict(_rvm_info)
+                self._results["execution_backend"] = str(
+                    _rvm_info.get("backend", "cpu_gram_rvm"))
+                self._results["postfit_backend"] = "cpu_metrics"
         elif method == "RIDGE":
-            ridge_info = getattr(A_fit, "_gpu_solver_info", None)
+            # _ridge_solver_info is written by BOTH iterative branches of
+            # _ridge_solve (resident CGLS and CPU LSMR); _gpu_solver_info is the
+            # older GPU-only name, kept as a fallback for operators solved before
+            # this change.
+            ridge_info = getattr(A_fit, "_ridge_solver_info", None)
+            if ridge_info is None:
+                ridge_info = getattr(A_fit, "_gpu_solver_info", None)
             if ridge_info is None:
                 ridge_info = getattr(self._model, "regularized_solver_info_", None)
             if ridge_info is not None:
@@ -3641,6 +5472,20 @@ class Optimizer(object):
     def _debias_enabled():
         return os.environ.get("PHEASY_LASSO_DEBIAS", "1").lower() in ("1", "true", "yes")
 
+    @staticmethod
+    def _alpha_edge_relaxed_enabled():
+        """[FIX P46] Relaxed refit forced when alpha* sits at the grid bottom.
+
+        A pinned alpha* means the CV curve never turned up inside the grid: the
+        data supports no sparsity, and the L1 coefficients then carry the full
+        shrinkage bias (Mg8C120 v4: ||x|| 608 vs 2363 unbiased, re 7.5% vs 1.3%).
+        The relaxed (unpenalized-on-support) refit is the generalizing answer, so
+        it is enabled even when the wrapper set PHEASY_LASSO_DEBIAS=0 -- which is
+        exactly how the shipped v4 fit lost it.  PHEASY_LASSO_EDGE_RELAXED=0
+        disables.
+        """
+        return os.environ.get("PHEASY_LASSO_EDGE_RELAXED", "1").lower() in ("1", "true", "yes")
+
     def _debias(self, A, y, coef):
         """OLS refit on the nonzero support (relaxed LASSO)."""
         sup = np.flatnonzero(np.abs(coef) > 0)
@@ -3670,6 +5515,7 @@ class Optimizer(object):
             new[sup] = coef_sub
             r_new = float(np.linalg.norm(np.asarray(A @ new).ravel() - y))
             r_old = float(np.linalg.norm(np.asarray(A @ coef).ravel() - y))
+            self._record_debias(r_new, r_old, "gram")
             if r_new <= r_old:
                 return new
             return coef
@@ -3687,6 +5533,7 @@ class Optimizer(object):
             new[sup] = coef_sub
             r_new = float(np.linalg.norm(np.asarray(A @ new).ravel() - y))
             r_old = float(np.linalg.norm(np.asarray(A @ coef).ravel() - y))
+            self._record_debias(r_new, r_old, "operator")
             if r_new <= r_old:
                 return new
             return coef
@@ -3699,9 +5546,24 @@ class Optimizer(object):
         # support that is inconsistent with the data scale)
         r_new = float(np.linalg.norm(np.asarray(A @ new).ravel() - y))
         r_old = float(np.linalg.norm(np.asarray(A @ coef).ravel() - y))
+        self._record_debias(r_new, r_old, "dense")
         if r_new <= r_old:
             return new
         return coef
+
+    def _record_debias(self, r_new, r_old, stage):
+        """Say whether the relaxed-LASSO refit was actually kept.
+
+        The residual guard is right to drop a refit whose residual grew -- that
+        is what stops a corrupted support solve from shipping -- but dropping it
+        silently means the declared stage vanishes: on c7 float32 the pristine
+        CGLS debias came back `invalid_search_direction`, the guard rejected it,
+        and the results still read debias_backend=gpu_cgls with no hint that the
+        L1 shrinkage had NOT been removed.  Record the decision and its numbers.
+        """
+        self._debias_accepted = bool(r_new <= r_old)
+        self._debias_residuals = (float(r_new), float(r_old))
+        self._debias_stage = stage
 
     def _resident_debias_available(self):
         """True when the resident operator is retained and CUDA is on.
@@ -3730,7 +5592,13 @@ class Optimizer(object):
         from . import gpu_backend as gb
         res_op = self._model._operator
         try:
-            coef_sub, _info = gb.solve_resident_subset(res_op, y, sup, raise_on_nonconvergence=False)
+            coef_sub, _info = gb.solve_resident_subset(res_op, y, sup,
+                                                        raise_on_nonconvergence=False)
+            # Keep the debias certificate.  It was discarded, and the residual
+            # guard below then silently dropped the whole stage when the solve
+            # came back corrupted -- on c7 float32 that made the declared
+            # relaxed-LASSO refit a no-op with nothing in the results saying so.
+            self._debias_solver_info = dict(_info) if isinstance(_info, dict) else _info
             coef_sub = gb._to_numpy(coef_sub, np.float64)
             scale = getattr(self._model, "column_scale_", None)
             if scale is not None:

@@ -87,7 +87,15 @@ class ResidentNumericsTests(unittest.TestCase):
     def test_optimizer_standardization_uses_resident_math_and_physical_coefficients(self):
         dense = np.diag([1., 2., 3., 4.])
         A = opt.TwoLevelSM(sp.csr_matrix(dense), sp.eye(4, format="csr"))
-        with patch.object(gb, "available", return_value=True), patch.object(gb, "enabled", return_value=True), patch.object(gb, "device", return_value="cpu"), patch.dict(os.environ, {"PHEASY_GPU_LASSO_RESIDENT": "1", "PHEASY_LASSO_DEBIAS": "0"}), patch.object(A, "col_norms", side_effect=AssertionError("host normalization forbidden")):
+        # PHEASY_LASSO_EDGE_RELAXED=0 is required here: [FIX P46] forces the relaxed
+        # (debiased) refit whenever alpha* sits at the grid bottom -- even with
+        # PHEASY_LASSO_DEBIAS=0 -- and this fixture has a ONE-point grid, so alpha*
+        # is always at the bottom.  That behaviour is deliberate (it is how the
+        # shipped v4 fit recovered the relaxed solution); this test is about host
+        # normalization staying off the resident path and the physical-scale
+        # coefficients, so it pins the valve off instead of asserting the old
+        # soft-threshold result under the new default.
+        with patch.object(gb, "available", return_value=True), patch.object(gb, "enabled", return_value=True), patch.object(gb, "device", return_value="cpu"), patch.dict(os.environ, {"PHEASY_GPU_LASSO_RESIDENT": "1", "PHEASY_LASSO_DEBIAS": "0", "PHEASY_LASSO_EDGE_RELAXED": "0"}), patch.object(A, "col_norms", side_effect=AssertionError("host normalization forbidden")):
             model = opt.Optimizer("lasso", alpha=[.1], cv=2, standardize=True, tol=1e-10, alpha_auto=False)
             model.fit(A, np.array([2., -2., .1, 0.]))
         # Unit normalized design is identity; soft threshold is n*alpha=.4.

@@ -128,10 +128,23 @@ class TestOperatorRidgeGPU(unittest.TestCase):
                 probe = adapter(source)
                 budget = probe.estimated_peak_bytes
                 probe.close()
-                with patch.object(gb, "_device_free_bytes", return_value=budget), patch.object(torch, "as_tensor", side_effect=AssertionError("upload before budget rejection")):
+                # The budget is (free + OWN live device bytes) * fraction since the
+                # R1 fix: a real card keeps counting the process's own factors as
+                # headroom, so simulating "the card can give us exactly budget"
+                # means zeroing the own-bytes term too.  Patching only
+                # _device_free_bytes left a few MB of live context bytes in the
+                # budget and a 1-byte overflow no longer tripped the pre-flight.
+                #
+                # [FIX] Patch _device_available_bytes, the single value the estimate
+                # actually budgets with, instead of only its inputs: otherwise the
+                # verdict depends on how much VRAM earlier tests in the same module
+                # happened to leave allocated (this test passed alone and failed in
+                # the suite).  With it pinned, the peak is a pure function of the
+                # matrix and extra_workspace_bytes.
+                with patch.object(gb, "_device_available_bytes", return_value=budget), patch.object(gb, "_device_free_bytes", return_value=budget), patch.object(gb, "_device_own_bytes", return_value=None), patch.object(torch, "as_tensor", side_effect=AssertionError("upload before budget rejection")):
                     with self.assertRaises(MemoryError):
                         adapter(source, extra_workspace_bytes=1)
-                with patch.object(gb, "_device_free_bytes", return_value=budget+128):
+                with patch.object(gb, "_device_available_bytes", return_value=budget+128), patch.object(gb, "_device_free_bytes", return_value=budget+128), patch.object(gb, "_device_own_bytes", return_value=None):
                     accepted = adapter(source, extra_workspace_bytes=128)
                 self.assertEqual(accepted.estimated_peak_bytes, budget+128)
                 accepted.close()
@@ -365,14 +378,13 @@ class TestOperatorOLSFallback(unittest.TestCase):
         A = opt.TwoLevelSM(sp.eye(6, format="csr"), sp.eye(6, format="csr"))
         y = np.arange(6.)
         model = opt.Optimizer("OLS", use_gpu=True)
-        # PHEASY_OLS_JACOBI=0 is required for this scenario to exist at all: the
-        # matrix-free default is Jacobi ON, and the resident OLS branch skips
-        # itself (setting fallback_reason = "...ridge/Jacobi options") whenever
-        # Jacobi or a ridge is requested, so the injected upload failure below
-        # would never be attempted.  Same env as
-        # test_resident_ols_honors_limits_and_ridge_option, which already knew
-        # this.  The assertion intent is unchanged: a *failed* resident upload
-        # must be reported in fallback_reason.
+        # PHEASY_OLS_JACOBI=0 is a leftover from when Jacobi made the resident OLS
+        # skip itself; it is no longer required, because Jacobi is applied ON the
+        # resident operator.  The scenario is unchanged either way: the injected
+        # upload failure below happens at GpuTwoLevelOperator construction, which
+        # precedes the Jacobi column-norm step.  The assertion intent is
+        # unchanged: a *failed* resident upload must be reported in
+        # fallback_reason.
         with patch.dict(os.environ, {"PHEASY_GPU_OLS_RESIDENT": "1", "PHEASY_OLS_JACOBI": "0"}), patch.object(gb, "enabled", return_value=True), patch.object(gb, "GpuTwoLevelOperator", side_effect=RuntimeError("injected upload failure")):
             model.fit(A, y)
         self.assertEqual(model.results["execution_backend"], "cpu_lsmr")
@@ -383,31 +395,37 @@ class TestOperatorOLSFallback(unittest.TestCase):
         self.assertNotIn("fallback_reason", model.results)
         self.assertNotIn("execution_backend", model.results)
 
-    def test_matrix_free_default_skips_resident_ols(self):
-        """Default (Jacobi unset) must NOT reach the resident GPU OLS.
+    def test_matrix_free_default_reaches_resident_ols(self):
+        """Default (Jacobi unset) now DOES reach the resident GPU OLS.
 
-        Jacobi defaults ON for matrix-free input, and the resident OLS branch
-        implements neither Jacobi nor a ridge, so it skips itself and sets
-        fallback_reason to the ridge/Jacobi message before it ever builds a
-        GpuTwoLevelOperator.  So the resident OLS is unreachable under the
-        default configuration and every OLS fit lands on CPU LSMR -- a
-        deliberate trade-off (Jacobi is what keeps LSMR from stalling at
-        istop=7 on 1e5-unknown systems), but a silent one.  Pin it down: if a
-        later change makes the resident OLS reachable by default, this test
-        fails and the GPU.md / README claims have to be re-measured.
+        Jacobi is implemented ON the resident operator instead of being a reason
+        to skip it: the column norms become GpuTwoLevelOperator.scale, so CGLS
+        runs on the same scaled system the CPU path builds and only the
+        back-transform x = z / scale is added.  Jacobi therefore no longer
+        disqualifies the resident path -- only a ridge request does.
+
+        This replaces test_matrix_free_default_skips_resident_ols, the tripwire
+        that fired when 2c71bac made the resident OLS reachable by default (its
+        own docstring asked for exactly this re-measurement).
         """
         from core import gpu_backend as gb
         A = opt.TwoLevelSM(sp.eye(6, format="csr"), sp.eye(6, format="csr"))
         y = np.arange(6.)
         model = opt.Optimizer("OLS", use_gpu=True)
-        with patch.dict(os.environ, {"PHEASY_GPU_OLS_RESIDENT": "1"}):
+        with patch.dict(os.environ, {"PHEASY_GPU_OLS_RESIDENT": "1"}), \
+                patch.object(gb, "enabled", return_value=True), \
+                patch.object(gb, "GpuTwoLevelOperator") as operator, \
+                patch.object(gb, "iterative_lstsq",
+                             return_value=(y, {"itn": 1, "backend": "gpu_test"})):
             os.environ.pop("PHEASY_OLS_JACOBI", None)   # the default spelling
-            with patch.object(gb, "enabled", return_value=True), \
-                    patch.object(gb, "GpuTwoLevelOperator") as operator:
-                model.fit(A, y)
-                operator.assert_not_called()
-        self.assertEqual(model.results["execution_backend"], "cpu_lsmr")
-        self.assertIn("ridge/Jacobi", model.results["fallback_reason"])
+            model.fit(A, y)
+            operator.assert_called_once()
+        # execution_backend comes from the solver info, so a "gpu_test" backend
+        # proves the resident branch returned and CPU LSMR never ran.
+        self.assertEqual(model.results["execution_backend"], "gpu_test")
+        self.assertNotIn("fallback_reason", model.results)
+        # Jacobi is applied GPU-side rather than used to skip the path.
+        self.assertTrue(model.results["solver_info"]["jacobi_applied"])
 
     def test_resident_ols_honors_limits_and_ridge_option(self):
         from core import gpu_backend as gb
@@ -424,6 +442,8 @@ class TestOperatorOLSFallback(unittest.TestCase):
             model.fit(A, y)
             operator.assert_not_called()
         np.testing.assert_allclose(model.predict(A), y / (1 + .2 * 6), atol=1e-8)
-        self.assertIn("ridge/Jacobi", model.results["fallback_reason"])
+        # Jacobi is implemented on the resident operator, so the only remaining
+        # reason to fall back is the ridge option itself.
+        self.assertIn("does not implement the ridge option", model.results["fallback_reason"])
 
 if __name__ == "__main__": unittest.main()

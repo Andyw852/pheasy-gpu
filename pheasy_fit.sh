@@ -79,6 +79,29 @@
 #    bash pheasy_fit.sh FIT_METHOD=ALASSO C3_CUTOFF=5.2
 #    bash pheasy_fit.sh FIT_METHOD=RFE    C3_CUTOFF=5.2
 #    bash pheasy_fit.sh FIT_METHOD=RIDGE  C3_CUTOFF=5.2 MU_MIN=-6 MU_MAX=-2
+#
+#  ---------------------------------------------------------------------------
+#  怎么读每个方法的结果证书（fit_manifest.json / 日志）
+#  ---------------------------------------------------------------------------
+#  fit_manifest.json 的 results 里带完整求解证书：
+#    execution_backend  —— 实际跑的路径（gpu_resident_iterative / gpu_twolevel_* /
+#                          cpu_lsmr_ridge / ...）。凡是以 cpu_ 开头的都说明没用上 GPU。
+#    fit_accepted       —— 验收闸门。false 先看 solver_info.stop_reason：
+#        convergence / precision_floor —— 落在实测精度地板上并被认证（可信）；
+#        stall_above_floor             —— 实测地板已经超出可认证上限（这个精度解不了），
+#                                        证书里 stall_floor 就是它到过的值；
+#        iteration_limit               —— 预算（迭代数）不够，不是精度不够。
+#    atol_effective / tolerance_floor —— 请求的容差 vs 工作精度能到的地板。float32
+#        因子 + 岭增广时地板是 eps*||A||/sqrt(alpha)（上限 1e-3），无惩罚最小二乘是
+#        10*eps（≈1.19e-6）。**不要用放大的 --tol 硬凑通过**：判据是相对量
+#        (||A^T r|| <= tol*||A||*||r||)，在 ||r|| 还大时也能满足 —— 实测满尺寸 OLS 用
+#        atol=3e-3 在 45 步就"认证"了，残差却比按实测地板停下的那次差 20 倍。
+#    environment        —— 本次运行的全部 PHEASY_* 设置（复现用；也记录决定判词的
+#                          PHEASY_CGLS_PROBE_START / PHEASY_FISTA_AUTO_FLOOR 等）。
+#
+#  多方法并行、一卡一 fit 的编排脚本：fit_scripts/fit_3090_parallel.sh（它会把
+#  每个方法的结果汇总成一张表）。生产包装（含 3090 默认值）：fit_scripts/fit_3090.sh。
+#  两个脚本的头部都有各自的方法表与踩坑备注。
 # =============================================================================
 set -uo pipefail
 
@@ -110,7 +133,7 @@ MU_MAX=-2
 SM_DTYPE=float32
 NCPU=8
 LASSO_SPARSE=0          # PHEASY_LASSO_SPARSE
-LASSO_TWOLEVEL=0        # PHEASY_LASSO_TWOLEVEL
+LASSO_TWOLEVEL=1        # PHEASY_LASSO_TWOLEVEL；避免大体系物化 dense SM
 
 _ALLOWED="FIT_METHOD FIT_ORDER C2_CUTOFF C3_CUTOFF C4_CUTOFF NULL_SPACE_EPS \
 NDATA FORCE_REBUILD STANDARDIZE LASSO_TOL LASSO_MAX_ITER CV NMU ALPHA_DECADES \
@@ -295,4 +318,4 @@ for fn, keys in (('fc2.hdf5', ('fc2', 'force_constants')),
             print('%-9s max = %.4f' % (k, float(np.max(np.abs(np.asarray(f[k]))))))
     except (OSError, StopIteration):
         pass
-" || exit 1
+" || echo "[fc-max] summary skipped (rc=$?) -- non-fatal  # [FIX fc-max]"

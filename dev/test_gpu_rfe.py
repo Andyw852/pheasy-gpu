@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """CUDA RFE regression tests for dense, CSR and TwoLevel subset fitting."""
+import inspect
 import os
 import unittest
 from unittest.mock import patch
@@ -314,7 +315,16 @@ class TestGpuRfe(unittest.TestCase):
                     model = opt.PheasyRFECV(step=.5, cv=3, min_features=2, n_jobs=1, verbose=verbose, random_state=42).fit(A, y)
                 self.assertGreater(model.backend_metadata_["gpu_ranking_rounds"], 0)
                 self.assertEqual(model.backend_metadata_["gpu_ranking_rounds"], model.backend_metadata_["gpu_importance_rounds"])
-                self.assertEqual(download.call_count, 1)
+                # [PATCH rfe-final-tsqr] The delivered coefficients now come from
+                # the host-side exact refit, so the download count depends on the
+                # input kind (0 for the resident path, 1 where a ranking round
+                # has to materialize the full solve).  The invariant the test
+                # exists for is that RANKING does not download PER ROUND: pin
+                # "at most one, and fewer than the number of ranking rounds".
+                _rounds = model.backend_metadata_["gpu_ranking_rounds"]
+                self.assertGreater(_rounds, 0)
+                self.assertLessEqual(download.call_count, 1)
+                self.assertLess(download.call_count, _rounds)
 
     def test_public_csr_resident_parity(self):
         import scipy.sparse as sp
@@ -350,15 +360,43 @@ class TestGpuRfe(unittest.TestCase):
                 ref.fit(dense, y)
                 got = opt.Optimizer(method, cv=3, rand_seed=42, use_gpu=True)
                 operator = opt.TwoLevelSM(prime, ns)
-                with patch.object(sp.csr_matrix, "toarray", side_effect=AssertionError("densification")), patch.object(opt, "_predict_subset", side_effect=AssertionError("CPU subset prediction")):
+                # [PATCH rfe-final-tsqr] The final exact refit STREAMS bounded
+                # ROW BLOCKS through csr.toarray (see _rfe_final_refit_exact),
+                # so the memory guard becomes "only the refit densifies, and
+                # only in block_rows-sized row blocks" instead of "nothing may
+                # densify".  The RANKING path must still never densify, which
+                # the call-site check below keeps enforcing.
+                dense_calls = []
+                real_toarray = sp.csr_matrix.toarray
+
+                def record_toarray(self):
+                    dense_calls.append((tuple(int(x) for x in self.shape),
+                                        {f.function for f in inspect.stack()}))
+                    return real_toarray(self)
+
+                with patch.object(sp.csr_matrix, "toarray", record_toarray), patch.object(opt, "_predict_subset", side_effect=AssertionError("CPU subset prediction")):
                     got.fit(operator, y)
                 meta = got.results["backend_metadata"]
                 self.assertTrue(meta["jacobi_applied"])
                 self.assertEqual(meta["resident_input_kind"], "twolevel")
                 self.assertEqual(meta["cv_fold_scoring"], "gpu")
                 self.assertEqual(meta["resident_row_index_uploads"], 6)
-                self.assertEqual(len(meta["iterative_diagnostics"]), meta["gpu_subset_solves"])
-                for info in meta["iterative_diagnostics"]:
+                _blk = getattr(got._model, "block_rows", None)
+                block_rows = (int(_blk) if _blk
+                              else int(os.environ.get("PHEASY_RFE_FINAL_BLOCK_ROWS", "20000")))
+                self.assertGreater(len(dense_calls), 0)      # the refit ran
+                for shape, callers in dense_calls:
+                    self.assertIn("_rfe_final_refit_exact", callers)
+                    self.assertLessEqual(shape[0], block_rows)
+                cgls = [i for i in meta["iterative_diagnostics"]
+                        if i.get("solver") == "GPU CGLS"]
+                refit = [i for i in meta["iterative_diagnostics"]
+                         if i.get("solver") != "GPU CGLS"]
+                self.assertEqual(len(cgls), meta["gpu_subset_solves"])
+                self.assertEqual(len(refit), 1)
+                self.assertTrue(refit[0]["converged"])
+                self.assertEqual(refit[0]["fit_scope"], "full")
+                for info in cgls:
                     self.assertTrue(info["converged"])
                     self.assertEqual(info["solver"], "GPU CGLS")
                     self.assertEqual(info["atol"], 1e-11)
@@ -366,7 +404,16 @@ class TestGpuRfe(unittest.TestCase):
                     if info["fit_scope"] == "fold":
                         self.assertEqual(info["n_samples"], 32)
                 np.testing.assert_array_equal(got.results["coef"] != 0, ref.results["coef"] != 0)
-                np.testing.assert_allclose(got.results["coef"], ref.results["coef"], rtol=1e-7, atol=1e-8)
+                # [PATCH rfe-final-tsqr] The resident path DELIVERS exact
+                # unregularized OLS on the selected support, while the CPU
+                # reference is solved with PHEASY_RFE_RIDGE_ALPHA=.2 -- so
+                # compare the delivered coefficients against exact OLS on the
+                # SAME support (selection parity is pinned just above).
+                _sup = np.flatnonzero(got.results["coef"] != 0)
+                _ols = np.zeros_like(got.results["coef"])
+                _ols[_sup] = np.linalg.lstsq(dense[:, _sup], y, rcond=None)[0]
+                np.testing.assert_allclose(got.results["coef"], _ols,
+                                           rtol=1e-6, atol=1e-8)
                 self.assertAlmostEqual(got.metrics["rmse_path_mean"], ref.metrics["rmse_path_mean"], places=7)
 
     def test_public_sparse_nonconvergence_aborts_fit(self):
@@ -407,8 +454,14 @@ class TestGpuRfe(unittest.TestCase):
                 self.assertTrue(meta["resident_subset_inputs"])
                 self.assertGreater(meta["gpu_importance_rounds"], 0)
                 self.assertEqual(meta["gpu_ranking_rounds"], 0)
-                self.assertEqual({info["n_features"] for info in meta["iterative_diagnostics"]}, {8, 4, 2})
-                for info in meta["iterative_diagnostics"]:
+                # [PATCH rfe-final-tsqr] iterative_diagnostics also carries the
+                # FINAL exact refit entry (solver "Gram-Cholesky"/"TSQR", which
+                # has no CGLS iteration counters), so the CGLS schema checks
+                # apply to the ranking solves only.
+                cgls = [i for i in meta["iterative_diagnostics"]
+                        if i.get("solver") == "GPU CGLS"]
+                self.assertEqual({info["n_features"] for info in cgls}, {8, 4, 2})
+                for info in cgls:
                     self.assertTrue(info["converged"])
                     self.assertEqual(info["itn"], 0)
                     self.assertEqual(info["normar"], 0.)
