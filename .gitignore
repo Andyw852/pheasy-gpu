@@ -29,3 +29,8 @@ AGENTS.local.md
 cs.log
 tmp/
 test/dsh-session-*/
+
+# fit result dirs / one-off artifacts (regenerated per run, not source)
+userfit_*/
+rfe_support.npy
+wangchao_3090
