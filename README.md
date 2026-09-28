@@ -60,6 +60,19 @@ unless `PHEASY_ALLOW_UNACCEPTED_FIT=1` is set.
 | `RFE-OLS-TSQR` | RFE with a Q-less tall-skinny QR base solver |
 | `RIDGE` | L2 with cross-validated alpha |
 
+`PHEASY_HARM_DENSE=1` (or `HARM_DENSE=true` in `pheasy_fit.sh`) makes the
+sparse methods (LASSO, ALASSO, RFE, RFE-OLS-TSQR, ARDR, RVM) act on the
+anharmonic block only: the harmonic (FC2) columns carry no L1 penalty / a flat
+prior / are never eliminated, and are refitted jointly.  The alpha grid is then
+anchored at the anharmonic KKT threshold on the residual of the FC2-only OLS.
+On the Gram paths (CPU and GPU dense FISTA) the harmonic block is eliminated
+exactly (Schur complement) and the anharmonic block is Jacobi-scaled before
+FISTA runs, and the matrix-free resident path iterates in Jacobi-scaled
+coordinates; without this, raw FC2/FC3 column scales (~40x apart) make FISTA
+crawl while its relative KKT already looks converged.
+With `--fix_fc2` the harmonic block is not fitted at all and the flag is moot.
+See `dev/test_harm_dense.py` for the contract.
+
 ## Typical workflow
 
 ```bash

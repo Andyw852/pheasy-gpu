@@ -1464,6 +1464,33 @@ class WorkFlow(object):
                 settings.MODEL = "RFE"
                 print("[run_pheasy] PHEASY_USE_RFE=1 detected, "
                       "switching LASSO -> RFE", flush=True)
+            # [HARM_DENSE] PHEASY_HARM_DENSE=1: the sparse methods prune the
+            # anharmonic block only.  The reduced parameter vector is ordered
+            # [HARM | ANHARM3 | ANHARM4 ...] (NS_full = block_diag(ns_harm, ...),
+            # and the rotational sum rules act inside the harmonic block only),
+            # so the free set is the first ns_harm.shape[1] columns.  With
+            # FIX_FC2 the harmonic block is not in SM at all: nothing to do.
+            _unpenalized = None
+            from pheasy_gpu.core.optimizer import harm_dense_enabled as _hd_on
+            if _hd_on():
+                if settings.FIX_FC2:
+                    logger.info("PHEASY_HARM_DENSE=1 ignored: FIX_FC2 already "
+                                "removes the harmonic block from the fit.")
+                elif settings.MAX_ORDER < 3:
+                    logger.info("PHEASY_HARM_DENSE=1 ignored: MAX_ORDER=2 has no "
+                                "anharmonic block to sparsify.")
+                else:
+                    _n_harm = int(spmat.load_npz("ns_harm.npz").shape[1])
+                    if not 0 < _n_harm < SM.shape[1]:
+                        raise ValueError(
+                            "PHEASY_HARM_DENSE: ns_harm.npz has %d free columns but "
+                            "SM has %d; the null space and the sensing matrix do not "
+                            "belong together" % (_n_harm, SM.shape[1]))
+                    _unpenalized = np.zeros(SM.shape[1], dtype=bool)
+                    _unpenalized[:_n_harm] = True
+                    logger.info("PHEASY_HARM_DENSE=1: %d harmonic columns are never "
+                                "penalized or pruned; %d anharmonic columns are "
+                                "sparsified." % (_n_harm, SM.shape[1] - _n_harm))
             # Auto-derive the LASSO/ALASSO alpha grid from the data (default),
             # so the shell script no longer needs the derive_alpha_grid logic.
             alpha_kwargs = {}
@@ -1501,7 +1528,8 @@ class WorkFlow(object):
                         SM, FM, nalpha=settings.NALPHA,
                         decades=float(os.environ.get("PHEASY_ALPHA_DECADES",
                                                      str(settings.ALPHA_DECADES))),
-                        standardize=settings.STANDARDIZE, mu_shift=_shift)
+                        standardize=settings.STANDARDIZE, mu_shift=_shift,
+                        unpenalized=_unpenalized)
                     alpha_kwargs["alpha"] = _grid
                     logger.info("- alpha_auto: grid [%.3e, %.3e] (%d alphas)"
                                 % (_grid[0], _grid[-1], len(_grid)))
@@ -1528,6 +1556,7 @@ class WorkFlow(object):
                 # the old Optimizer hard-coded env/4.0 and ignored this CLI flag.
                 decades=float(os.environ.get("PHEASY_ALPHA_DECADES",
                                              str(settings.ALPHA_DECADES))),
+                unpenalized=_unpenalized,
                 **alpha_kwargs,
             )
             if settings.MODEL.upper() == "LASSO":
@@ -1737,6 +1766,13 @@ class WorkFlow(object):
             logger.info(
                 "- Non-zero IFC terms: {}".format(np.count_nonzero(fit_results["coef"]))
             )
+            if "nnz_penalized" in fit_results:
+                # [HARM_DENSE] per-block sparsity: the pruned fraction must be
+                # read against the penalized (anharmonic) block, not the total.
+                logger.info("- Non-zero HARM (unpenalized): {} / {}".format(
+                    fit_results["nnz_unpenalized"], fit_results["unpenalized_columns"]))
+                logger.info("- Non-zero ANHARM (penalized): {} / {}".format(
+                    fit_results["nnz_penalized"], fit_results["n_penalized"]))
 
             if not fit_results.get("fit_accepted", True):
                 _allow_unaccepted = os.environ.get("PHEASY_ALLOW_UNACCEPTED_FIT", "0").lower() in ("1", "true", "yes", "on")

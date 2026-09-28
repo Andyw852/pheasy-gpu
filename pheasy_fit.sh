@@ -47,6 +47,10 @@
 #  │   LASSO_SPARSE   PHEASY_LASSO_SPARSE=1 走稀疏 SM(默认 0=稠密)      │
 #  │   LASSO_TWOLEVEL PHEASY_LASSO_TWOLEVEL=1 两级matvec(连稀疏乘积都不  │
 #  │                  物化，仅当稀疏乘积也放不下内存时才划算)            │
+#  │ 【稀疏化范围】                                                       │
+#  │   HARM_DENSE     true = 二阶块不惩罚/不剪 (PHEASY_HARM_DENSE=1)，   │
+#  │                  LASSO/ALASSO/RFE/RFE-OLS-TSQR(及 ARDR/RVM) 只稀疏  │
+#  │                  化三阶；二阶随三阶联合重拟合 (默认 false)           │
 #  └─────────────────────────────────────────────────────────────────────┘
 #
 #  其它常用环境变量：
@@ -134,10 +138,11 @@ SM_DTYPE=float32
 NCPU=8
 LASSO_SPARSE=0          # PHEASY_LASSO_SPARSE
 LASSO_TWOLEVEL=1        # PHEASY_LASSO_TWOLEVEL；避免大体系物化 dense SM
+HARM_DENSE=false        # PHEASY_HARM_DENSE；true = 只稀疏化非谐块
 
 _ALLOWED="FIT_METHOD FIT_ORDER C2_CUTOFF C3_CUTOFF C4_CUTOFF NULL_SPACE_EPS \
 NDATA FORCE_REBUILD STANDARDIZE LASSO_TOL LASSO_MAX_ITER CV NMU ALPHA_DECADES \
-MU_MIN MU_MAX SM_DTYPE NCPU LASSO_SPARSE LASSO_TWOLEVEL"
+MU_MIN MU_MAX SM_DTYPE NCPU LASSO_SPARSE LASSO_TWOLEVEL HARM_DENSE"
 for kv in "$@"; do
   case "$kv" in
     *=*)
@@ -172,6 +177,9 @@ if [ "$LASSO_SPARSE" = "1" ] || [ "$LASSO_SPARSE" = "true" ]; then
 fi
 if [ "$LASSO_TWOLEVEL" = "1" ] || [ "$LASSO_TWOLEVEL" = "true" ]; then
   export PHEASY_LASSO_TWOLEVEL=1
+fi
+if [ "$HARM_DENSE" = "1" ] || [ "$HARM_DENSE" = "true" ]; then
+  export PHEASY_HARM_DENSE=1
 fi
 
 _STRUCT_FILES="cs.pkl neighbor_list.pkl ns_harm.npz ns_anharm3.npz ns_anharm4.npz"

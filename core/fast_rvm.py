@@ -53,8 +53,15 @@ def _delete_sigma(Sigma, pos):
 
 
 def _run_faml(G, b, diagG, n, beta, tol=1e-6, max_steps=None, add_batch=1,
-              alpha_ceiling=1e12, refresh_every=0, verbose=False):
-    """One fast marginal-likelihood run at fixed beta (incremental updates)."""
+              alpha_ceiling=1e12, refresh_every=0, verbose=False, free_idx=None,
+              alpha_free=0.0):
+    """One fast marginal-likelihood run at fixed beta (incremental updates).
+
+    [HARM_DENSE] ``free_idx`` basis functions start IN the model with a flat
+    prior (precision ``alpha_free``, default 0) and are never deleted or
+    re-estimated, so the sparse search runs over the remaining (anharmonic)
+    columns only -- the fast-RVM form of unpenalized covariates.
+    """
     p = int(diagG.shape[0])
     S = np.empty(0, dtype=np.int64)
     alpha = {}
@@ -68,6 +75,7 @@ def _run_faml(G, b, diagG, n, beta, tol=1e-6, max_steps=None, add_batch=1,
     converged = False
     n_steps = 0
     refresh_every = int(refresh_every or 0)
+    is_free = np.zeros(p, dtype=bool)
 
     def recompute_stats():
         k = len(S)
@@ -78,6 +86,14 @@ def _run_faml(G, b, diagG, n, beta, tol=1e-6, max_steps=None, add_batch=1,
         Rv = R.T @ v
         return (beta * diagG - beta * beta * np.einsum("ai,ai->i", M, M),
                 beta * b - beta * beta * (M.T @ Rv))
+
+    if free_idx is not None and len(free_idx):
+        is_free[np.asarray(free_idx, dtype=np.int64)] = True
+        S = np.asarray(np.flatnonzero(is_free), dtype=np.int64)
+        alpha = {int(i): float(alpha_free) for i in S}
+        Sigma = _refresh_sigma(G, S, alpha, beta)
+        v = np.asarray(b[S], dtype=np.float64)
+        Sq, Qq = recompute_stats()
 
     for step in range(int(max_steps)):
         n_steps = step + 1
@@ -92,6 +108,12 @@ def _run_faml(G, b, diagG, n, beta, tol=1e-6, max_steps=None, add_batch=1,
         act_action = []
         for j in range(k):
             i = int(S[j])
+            if is_free[i]:
+                # flat prior: no delete, no re-estimate, never the best move
+                act_gain[j] = -np.inf
+                act_action.append(("fixed", None))
+                gain[i] = -np.inf
+                continue
             a = float(alpha[i])
             denom = a - Sq[i]
             if denom <= 1e-300:
@@ -203,15 +225,19 @@ def _run_faml(G, b, diagG, n, beta, tol=1e-6, max_steps=None, add_batch=1,
             "converged": bool(converged)}
 
 
-def _prune_and_refit(G, b, active, alpha, beta, threshold):
+def _prune_and_refit(G, b, active, alpha, beta, threshold, free_idx=None):
     """Zero the active coefficients whose precision exceeds threshold.
 
     ARDRegression prunes lambda >= threshold_lambda; the fast maximization
     keeps any finite alpha, so the same rule is applied at the end.  The
-    retained coefficients are re-solved exactly on that support.
+    retained coefficients are re-solved exactly on that support.  Free
+    ([HARM_DENSE]) basis functions are always retained.
     """
     p = int(G.shape[0])
     keep = alpha < float(threshold)
+    if free_idx is not None and len(free_idx):
+        keep = keep | np.isin(np.asarray(active, dtype=np.int64),
+                              np.asarray(free_idx, dtype=np.int64))
     S = np.asarray(active[keep], dtype=np.int64)
     coef = np.zeros(p, dtype=np.float64)
     if S.size:
@@ -228,13 +254,17 @@ def _prune_and_refit(G, b, active, alpha, beta, threshold):
 
 def fast_rvm(G, b, yty, n_samples, y_var=None, beta=None, beta_iters=5,
              tol=1e-6, max_steps=None, add_batch=1, alpha_ceiling=1e12,
-             prune_threshold=1e4, refresh_every=0, verbose=False):
+             prune_threshold=1e4, refresh_every=0, verbose=False, free=None,
+             alpha_free=0.0):
     """Fit the sparse Bayesian regression model on the Gram (G, b).
 
     G = X^T X (p x p), b = X^T y, yty = y^T y, n_samples = rows of X.
     beta = 1/sigma^2 is the noise precision.  When beta is None it starts at
     1/var(y) and is re-estimated from the residual, re-running the fast
     maximization, for beta_iters rounds.
+
+    free ([HARM_DENSE], bool mask): basis functions kept in the model with a
+    flat prior -- never deleted, re-estimated or pruned.
 
     Returns a dict with coef, active, alpha, beta and diagnostics.
     """
@@ -243,6 +273,12 @@ def fast_rvm(G, b, yty, n_samples, y_var=None, beta=None, beta_iters=5,
     n = int(n_samples)
     yty = float(yty)
     diagG = np.diag(G).copy()
+    free_idx = None
+    if free is not None:
+        _fm = np.asarray(free, dtype=bool).ravel()
+        if _fm.shape != diagG.shape:
+            raise ValueError("fast_rvm free mask must have one entry per feature")
+        free_idx = np.flatnonzero(_fm) if _fm.any() else None
     if beta is None:
         v0 = y_var if y_var is not None else yty / max(n, 1)
         beta = 1.0 / max(float(v0), _TINY)
@@ -250,7 +286,8 @@ def fast_rvm(G, b, yty, n_samples, y_var=None, beta=None, beta_iters=5,
     for it in range(max(1, int(beta_iters))):
         last = _run_faml(G, b, diagG, n, beta, tol=tol, max_steps=max_steps,
                          add_batch=add_batch, alpha_ceiling=alpha_ceiling,
-                         refresh_every=refresh_every, verbose=verbose)
+                         refresh_every=refresh_every, verbose=verbose,
+                         free_idx=free_idx, alpha_free=alpha_free)
         coef = last["coef"]
         rss = yty - 2.0 * float(coef @ b) + float(coef @ (G @ coef))
         rss = max(rss, _TINY)
@@ -262,13 +299,15 @@ def fast_rvm(G, b, yty, n_samples, y_var=None, beta=None, beta_iters=5,
             beta = beta_new
             last = _run_faml(G, b, diagG, n, beta, tol=tol, max_steps=max_steps,
                              add_batch=add_batch, alpha_ceiling=alpha_ceiling,
-                             refresh_every=refresh_every, verbose=False)
+                             refresh_every=refresh_every, verbose=False,
+                             free_idx=free_idx, alpha_free=alpha_free)
             break
         beta = beta_new
     last["beta"] = float(beta)
     if prune_threshold and prune_threshold > 0:
         coef, S, a = _prune_and_refit(G, b, last["active"], last["alpha"],
-                                      last["beta"], prune_threshold)
+                                      last["beta"], prune_threshold,
+                                      free_idx=free_idx)
         last["coef"] = coef
         last["active"] = S
         last["alpha"] = a

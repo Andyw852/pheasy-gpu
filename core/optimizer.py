@@ -441,8 +441,180 @@ def lasso_alpha_grid(lo, hi, nalpha):
     return np.logspace(np.log10(lo), np.log10(hi), n)
 
 
+# ---------------------------------------------------------------------------
+# [HARM_DENSE] unpenalized columns: sparsify the anharmonic block only.
+#
+# The reduced parameter vector is [HARM | ANHARM3 | ANHARM4 ...] because the
+# null space is block_diag(ns_harm, ns_anharm3, ...) (symmetry_constraints; the
+# rotational sum rules act inside the harmonic block only, so no free parameter
+# mixes orders).  "FC2 dense, FC3 sparse" is the classic unpenalized-covariate
+# problem (glmnet penalty.factor = 0):
+#
+#     min_x 1/(2n)||A x - y||^2 + alpha * sum_{j not free} w_j |x_j|
+#
+# By Frisch-Waugh-Lovell it is exactly the penalized fit of the anharmonic block
+# on the data with the harmonic columns projected out, followed by an OLS of the
+# harmonic block on the remaining residual.  Every method has to honour it in
+# its OWN mechanism: a zero L1 weight for FISTA, a fixed flat prior for ARD/RVM,
+# a protected set for RFE -- a zero entry in penalty_weights alone is not
+# enough (alpha_max, ALASSO's weighted grid, sklearn backends, debias support,
+# the zero tolerance and the elimination loops all ignore it).
+# ---------------------------------------------------------------------------
+def harm_dense_enabled():
+    """PHEASY_HARM_DENSE=1: never penalize / prune the second-order block."""
+    return os.environ.get("PHEASY_HARM_DENSE", "0").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def _as_free_mask(unpenalized, n_features):
+    """Normalize an unpenalized spec (bool mask or index list) to a bool mask.
+
+    Returns None when nothing is free, so every caller keeps its historical
+    code path bit-for-bit when the feature is off.
+    """
+    if unpenalized is None:
+        return None
+    u = np.asarray(unpenalized)
+    if u.dtype == bool:
+        if u.shape != (int(n_features),):
+            raise ValueError("unpenalized mask has shape %s, expected (%d,)"
+                             % (u.shape, int(n_features)))
+        mask = u.copy()
+    else:
+        idx = np.asarray(u, dtype=np.int64).ravel()
+        if idx.size and (idx.min() < 0 or idx.max() >= int(n_features)):
+            raise ValueError("unpenalized indices out of range [0, %d)" % int(n_features))
+        mask = np.zeros(int(n_features), dtype=bool)
+        mask[idx] = True
+    if not mask.any():
+        return None
+    if mask.all():
+        raise ValueError("every column is unpenalized: there is nothing left to "
+                         "sparsify (use OLS)")
+    return mask
+
+
+def _free_penalty_weights(free, weights=None):
+    """Per-column L1 weights with an exact zero on the free columns."""
+    if free is None:
+        return weights
+    w = (np.ones(free.shape[0], dtype=np.float64) if weights is None
+         else np.array(weights, dtype=np.float64).ravel())
+    w[free] = 0.0
+    return w
+
+
+def _free_block_ols(A, y, free, rows=None):
+    """OLS of y on the free columns only: returns (beta_free, residual).
+
+    For alpha >= alpha_max this IS the unpenalized-block LASSO solution
+    (penalized block exactly zero, free block plain OLS), so it is both the
+    anchor of the alpha grid and the exact warm start of the alpha path.
+    ``rows`` restricts the fit to a CV training fold (no validation leakage);
+    the residual is then returned on those rows only.
+    """
+    fidx = np.flatnonzero(free)
+    y64 = np.asarray(y, dtype=np.float64).ravel()
+    beta = np.asarray(_solve_subset(A, y64, rows, fidx), dtype=np.float64).ravel()
+    x = np.zeros(A.shape[1], dtype=np.float64)
+    x[fidx] = beta
+    pred = np.asarray(A @ x, dtype=np.float64).ravel()
+    r = y64 - pred
+    if rows is not None:
+        r = r[np.asarray(rows, dtype=np.intp)]
+    return beta, r
+
+
+class _GramShape(object):
+    """Shape/precision carrier for _fista_lasso on a precomputed (reduced) Gram.
+
+    With gram=(G, b) _fista_lasso never multiplies by A; it only reads its shape
+    (size of x, default n_samples) and, in a warning, its stored precision.
+    """
+
+    def __init__(self, n_rows, n_cols, precision=np.float64):
+        self.shape = (int(n_rows), int(n_cols))
+        self.dtype = np.dtype(precision)
+
+
+class _FreeBlockReduction(object):
+    """[HARM_DENSE] exact elimination of the unpenalized block from (G, b).
+
+        min_x 1/2 x^T G x - b^T x + sum_{j in P} pen_j |x_j|,  block F unpenalized
+
+    For fixed x_P the free block is plain least squares, x_F = G_FF^-1 (b_F -
+    G_FP x_P) (Frisch-Waugh-Lovell), so the problem in x_P alone has the Schur
+    complement S = G_PP - G_PF G_FF^-1 G_FP and s = b_P - G_PF G_FF^-1 b_F.  It is
+    then Jacobi-scaled, z = d * x_P with d = sqrt(diag S), and the L1 weights
+    become w_P / d.  Both steps are exact reparametrizations (same minimizer).
+
+    Why: iterating FISTA on the full (G, b) with a zero-weight block is correct
+    but first-order methods pay for conditioning -- the step is 1/lambda_max(G),
+    set by the large FC2 columns, while the FC3 directions have curvature smaller
+    by the squared column-norm ratio (~42^2 on MnIn2Se4 raw columns).  Measured
+    there: 2000 iterations left 24-50 % error in the FC3 block although the
+    relative KKT (normalized by the FC2-dominated max|b|) already read 2e-4.  On
+    the reduced, unit-diagonal Gram neither the free block nor the column scales
+    enter the iteration, and the KKT certificate is relative to the penalized
+    block's own gradient.
+    """
+
+    def __init__(self, G, b, free, penalty_weights=None):
+        free = np.asarray(free, dtype=bool)
+        self.p = int(G.shape[0])
+        self.F = np.flatnonzero(free)
+        self.P = np.flatnonzero(~free)
+        G = np.asarray(G, dtype=np.float64)
+        b = np.asarray(b, dtype=np.float64).ravel()
+        Gff = G[np.ix_(self.F, self.F)]
+        Gfp = G[np.ix_(self.F, self.P)]
+        try:
+            cf = spla.cho_factor(Gff, check_finite=False)
+            self.C = spla.cho_solve(cf, Gfp, check_finite=False)
+            self.beta = spla.cho_solve(cf, b[self.F], check_finite=False)
+        except (np.linalg.LinAlgError, ValueError):
+            Gp = np.linalg.pinv(Gff)
+            self.C = Gp @ Gfp
+            self.beta = Gp @ b[self.F]
+        S = G[np.ix_(self.P, self.P)] - Gfp.T @ self.C
+        S = 0.5 * (S + S.T)
+        s = b[self.P] - Gfp.T @ self.beta
+        dg = np.clip(np.diag(S), 0.0, None)
+        # a penalized column inside the span of the free block has no residual
+        # variance: leave it unscaled (its reduced column is ~0 and it stays 0)
+        d = np.where(dg > 1e-300 * max(float(dg.max(initial=0.0)), 1.0), np.sqrt(dg), 1.0)
+        self.d = d
+        self.S = S / d[:, None] / d[None, :]
+        self.s = s / d
+        w = (np.ones(self.P.size) if penalty_weights is None
+             else np.asarray(penalty_weights, dtype=np.float64).ravel()[self.P])
+        self.w = w / d
+        self.lipschitz = _top_eigval(self.S)
+
+    def to_full(self, z):
+        x_p = np.asarray(z, dtype=np.float64).ravel() / self.d
+        x = np.zeros(self.p, dtype=np.float64)
+        x[self.P] = x_p
+        x[self.F] = self.beta - self.C @ x_p
+        return x
+
+
+def _free_block_x0(G, b, free):
+    """Warm start [OLS on the free block, 0] from a Gram pair (G, b)."""
+    fidx = np.flatnonzero(free)
+    x0 = np.zeros(G.shape[0], dtype=np.float64)
+    Gff = np.asarray(G[np.ix_(fidx, fidx)], dtype=np.float64)
+    bf = np.asarray(b, dtype=np.float64)[fidx]
+    try:
+        c, lower = spla.cho_factor(Gff, check_finite=False)
+        x0[fidx] = spla.cho_solve((c, lower), bf, check_finite=False)
+    except (np.linalg.LinAlgError, ValueError):
+        x0[fidx] = np.linalg.lstsq(Gff, bf, rcond=None)[0]
+    return x0
+
+
 def derive_alpha_grid(A, y, nalpha=100, decades=4.0, standardize=False,
-                     mu_shift=0.0):
+                     mu_shift=0.0, unpenalized=None):
     """Derive a LASSO/ALASSO alpha grid from the data.
 
     alpha_max = max_j |X_j^T y| / n  is the smallest alpha for which the LASSO
@@ -451,6 +623,13 @@ def derive_alpha_grid(A, y, nalpha=100, decades=4.0, standardize=False,
     ``standardize`` is True the columns are first scaled to unit L2 norm (the
     same scaling the Optimizer applies), so the returned grid lives in the
     standardized space.
+
+    [HARM_DENSE] With ``unpenalized`` (the FC2 columns) the threshold is the one
+    of the PENALIZED block on the residual of the unpenalized OLS fit:
+        alpha_max = max_{j penalized} |X_j^T (y - X_F b_F)| / n,
+    b_F = OLS of y on the free columns.  Taking max|X^T y| over all columns
+    instead anchors the grid at the harmonic gradient, which is orders of
+    magnitude above the anharmonic one, so most grid points zero every FC3.
 
     Memory efficient: chunked accumulation for dense (mmap-friendly) input,
     sparse matvec for sparse / LinearOperator input.
@@ -461,6 +640,9 @@ def derive_alpha_grid(A, y, nalpha=100, decades=4.0, standardize=False,
     p = A.shape[1]
     y64 = np.asarray(y, dtype=np.float64).ravel()
     g = np.zeros(p, dtype=np.float64)
+    free = _as_free_mask(unpenalized, p)
+    if free is not None:
+        _beta_f, y64 = _free_block_ols(A, y64, free)
 
     if sp.issparse(A) or _is_linear_operator(A):
         g = np.asarray(A.T @ y64).ravel().astype(np.float64)
@@ -481,6 +663,13 @@ def derive_alpha_grid(A, y, nalpha=100, decades=4.0, standardize=False,
             cn = np.where(cn < 1e-30, 1.0, cn)
             g = g / cn
 
+    if free is not None:
+        # The free block is orthogonal to its own OLS residual; drop it from the
+        # threshold explicitly so round-off there can never set the grid top.
+        g = np.where(free, 0.0, g)
+        print("[HARM_DENSE] alpha_max from the penalized block on the residual of "
+              "the unpenalized OLS fit (%d free / %d penalized columns)"
+              % (int(free.sum()), int((~free).sum())), flush=True)
     a_max = float(np.abs(g).max()) / n
     a_max *= 10.0 ** float(mu_shift)
     if not np.isfinite(a_max) or a_max <= 0:
@@ -2599,6 +2788,41 @@ class _LassoCVIterative:
         mse_path = np.zeros((n_alphas, len(splits)))
         x_folds = [None] * len(splits)   # [FIX P28] per-fold warm-start
         x_full = None                    # full-data warm-start for the alpha path
+        # [HARM_DENSE] with an unpenalized block x = 0 is no longer the solution
+        # at the top of the grid: the free block is plain OLS there.  Start every
+        # path (each fold on ITS OWN training rows -- no validation leakage, see
+        # FIX P28) from that exact solution instead of making the capped CV
+        # solves fit the whole harmonic block from zero at the largest alpha.
+        _free = (None if self.penalty_weights is None
+                 else (np.asarray(self.penalty_weights, dtype=np.float64).ravel() == 0.0))
+        red_full = red_folds = None
+        _prec = _array_precision(A)
+        _no_y = np.zeros(1)
+        if _free is not None and _free.any():
+            if use_gram:
+                # Exact elimination of the free block + Jacobi scaling of what is
+                # left (_FreeBlockReduction): FISTA iterates on the penalized
+                # block only, so the path starts at z = 0, which IS the solution
+                # at the top of the grid, and each fold uses its own training Gram.
+                red_folds = [_FreeBlockReduction(G_tr, b_tr, _free, self.penalty_weights)
+                             for G_tr, b_tr in gram_folds]
+                red_full = _FreeBlockReduction(gram_full[0], gram_full[1], _free,
+                                               self.penalty_weights)
+                print("[HARM_DENSE] Gram FISTA on the penalized block only: %d free "
+                      "columns eliminated exactly (Schur complement), %d penalized "
+                      "columns Jacobi-scaled" % (int(_free.sum()), int((~_free).sum())),
+                      flush=True)
+            else:
+                _fidx = np.flatnonzero(_free)
+                x_folds = []
+                for tr, _va in splits:
+                    _x = np.zeros(A.shape[1], dtype=np.float64)
+                    _x[_fidx] = _free_block_ols(A, y64, _free, rows=tr)[0]
+                    x_folds.append(_x)
+                x_full = np.zeros(A.shape[1], dtype=np.float64)
+                x_full[_fidx] = _free_block_ols(A, y64, _free)[0]
+                print("[HARM_DENSE] FISTA paths warm-started from the unpenalized-block "
+                      "OLS (%d free columns, LSMR)" % int(_free.sum()), flush=True)
         best_i = 0
         best_mean = float("inf")
         best_x = None
@@ -2623,7 +2847,22 @@ class _LassoCVIterative:
             def _fold_fit(k):
                 tr, va = splits[k]
                 info = {}
-                if use_gram:
+                if red_folds is not None:
+                    # [HARM_DENSE] reduced problem; the warm start carried in
+                    # x_folds[k] is the reduced (scaled) vector z.
+                    red = red_folds[k]
+                    coef = _fista_lasso(_GramShape(len(tr), red.P.size, _prec), _no_y,
+                                        alpha, x0=x_folds[k],
+                                        max_iter=cv_max_iter, tol=cv_tol,
+                                        lipschitz=red.lipschitz,
+                                        penalty_weights=red.w,
+                                        gram=(red.S, red.s),
+                                        n_samples=len(tr), _info=info,
+                                        warn_nonconvergence=False,
+                                        auto_floor=False)
+                    pred = np.asarray(A_va_list[k] @ red.to_full(coef),
+                                      dtype=np.float64).ravel()
+                elif use_gram:
                     # [FIX P34] the Gram encodes A[tr], so pass the TRAIN fold's
                     # row count: the L1 threshold is (n_tr * alpha), not
                     # (n_full * alpha) -- otherwise the fold fits at ~(K/(K-1))x
@@ -2677,7 +2916,17 @@ class _LassoCVIterative:
             mse_path[a_i] = fold_mse
             mean = float(fold_mse.mean())
             # warm-start the next (smaller) alpha from this alpha's full fit
-            if use_gram:
+            if red_full is not None:
+                x_full = _fista_lasso(_GramShape(A.shape[0], red_full.P.size, _prec),
+                                      _no_y, alpha, x0=x_full,
+                                      max_iter=cv_max_iter, tol=cv_tol,
+                                      lipschitz=red_full.lipschitz,
+                                      penalty_weights=red_full.w,
+                                      gram=(red_full.S, red_full.s),
+                                      n_samples=A.shape[0], _info=_cv_info,
+                                      warn_nonconvergence=False,
+                                      auto_floor=False)
+            elif use_gram:
                 x_full = _fista_lasso(A, y64, alpha, x0=x_full,
                                       max_iter=cv_max_iter, tol=cv_tol,
                                       lipschitz=lip_full,
@@ -2795,13 +3044,28 @@ class _LassoCVIterative:
         # iteration budget (FISTA is O(1/k^2), and the scaled ALASSO matrix is
         # more ill-conditioned); 5000 warm-started steps already reach ~1e-5.
         _finfo = {"n_iter": 0}
-        self.coef_ = _fista_lasso(A, y64, self.alpha_, x0=best_x,
-                                  max_iter=self.max_iter,
-                                  tol=float(self.tol),
-                                  lipschitz=lip_full if use_gram else self._lipschitz,
-                                  penalty_weights=self.penalty_weights,
-                                  _info=_finfo,
-                                  gram=gram_full if use_gram else None)
+        if red_full is not None:
+            _z = _fista_lasso(_GramShape(A.shape[0], red_full.P.size, _prec), _no_y,
+                              self.alpha_, x0=best_x,
+                              max_iter=self.max_iter,
+                              tol=float(self.tol),
+                              lipschitz=red_full.lipschitz,
+                              penalty_weights=red_full.w,
+                              _info=_finfo,
+                              gram=(red_full.S, red_full.s),
+                              n_samples=A.shape[0])
+            self.coef_ = red_full.to_full(_z)
+            # the certificate is for the reduced problem: relative to the
+            # penalized block's own gradient, not the FC2-dominated max|A^T y|
+            _finfo["harm_dense_reduction"] = "schur_complement+jacobi"
+        else:
+            self.coef_ = _fista_lasso(A, y64, self.alpha_, x0=best_x,
+                                      max_iter=self.max_iter,
+                                      tol=float(self.tol),
+                                      lipschitz=lip_full if use_gram else self._lipschitz,
+                                      penalty_weights=self.penalty_weights,
+                                      _info=_finfo,
+                                      gram=gram_full if use_gram else None)
         self.intercept_ = 0.0
         self.alphas_ = self.alphas
         self.mse_path_ = mse_path
@@ -2828,7 +3092,8 @@ class _LassoCVModel:
     """Thin wrapper around sklearn LassoCV with correct alpha grid and grouped CV."""
 
     def __init__(self, alphas, cv, tol, max_iter, rand_seed, n_jobs,
-                 fit_intercept=False, group_size=None, selection="cyclic"):
+                 fit_intercept=False, group_size=None, selection="cyclic",
+                 unpenalized=None):
         self.alphas = np.asarray(alphas, dtype=np.float64)
         self.cv = cv
         self.tol = tol
@@ -2838,13 +3103,31 @@ class _LassoCVModel:
         self.fit_intercept = fit_intercept
         self.group_size = group_size
         self.selection = selection
+        # [HARM_DENSE] bool mask (or indices) of columns that carry NO L1 penalty
+        self.unpenalized = unpenalized
+
+    def _backend(self, A, free):
+        """_lasso_backend, except that an unpenalized block needs a solver with
+        per-column L1 weights: sklearn's coordinate descent has none (no
+        penalty.factor), so the dense CPU case runs the Gram FISTA instead."""
+        backend = _lasso_backend(A)
+        if free is not None and backend == "dense":
+            print("[HARM_DENSE] sklearn LassoCV has no per-column penalty; using the "
+                  "CPU FISTA backend (Gram path when it fits PHEASY_GRAM_MAX_GB)",
+                  flush=True)
+            backend = "iterative"
+        return backend
 
     def fit(self, A, y, sample_weight=None):
-        if _lasso_backend(A) == "gpu_resident":
+        free = _as_free_mask(self.unpenalized, A.shape[1])
+        pw = _free_penalty_weights(free)
+        backend = self._backend(A, free)
+        if backend == "gpu_resident":
             from . import gpu_backend
             it = gpu_backend.GpuTwoLevelLassoCV(
                 self.alphas, self.cv, self.tol, self.max_iter, self.rand_seed,
-                fit_intercept=self.fit_intercept, group_size=self.group_size)
+                fit_intercept=self.fit_intercept, group_size=self.group_size,
+                unpenalized=free)
             it.fit(A, y, sample_weight=sample_weight)
             self.model_ = it
             for name in ("coef_", "intercept_", "alpha_", "alphas_", "mse_path_",
@@ -2852,11 +3135,12 @@ class _LassoCVModel:
                          "_alpha_at_min", "_alpha_at_min_flat", "_alpha_at_min_hitcap"):
                 setattr(self, name, getattr(it, name))
             return self
-        if _lasso_backend(A) == "iterative":
+        if backend == "iterative":
             it = _LassoCVIterative(
                 self.alphas, self.cv, self.tol, self.max_iter, self.rand_seed,
                 None, fit_intercept=self.fit_intercept,
-                group_size=self.group_size, selection=self.selection)
+                group_size=self.group_size, selection=self.selection,
+                penalty_weights=pw)
             it.fit(A, y, sample_weight=sample_weight)
             self.model_ = it
             self.coef_ = it.coef_
@@ -2872,12 +3156,13 @@ class _LassoCVModel:
             self._alpha_at_min_hitcap = getattr(it, "_alpha_at_min_hitcap", False)
             return self
 
-        if _lasso_backend(A) == "gpu":
+        if backend == "gpu":
             gb = _gpu()
             it = gb.GpuLassoCV(
                 self.alphas, self.cv, self.tol, self.max_iter, self.rand_seed,
                 self.n_jobs, fit_intercept=self.fit_intercept,
-                group_size=self.group_size, selection=self.selection)
+                group_size=self.group_size, selection=self.selection,
+                penalty_weights=pw)
             it.fit(_to_dense_f64(A), y, sample_weight=sample_weight)
             self.model_ = it
             self.coef_ = it.coef_
@@ -2979,14 +3264,33 @@ class _AdaptiveLassoCV(_LassoCVModel):
         if sample_weight is not None:
             raise NotImplementedError("ALASSO sample weights are not supported end-to-end: the adaptive pilot is unweighted")
         n_samples = A.shape[0]
+        free = _as_free_mask(self.unpenalized, A.shape[1])
         beta0 = self._initial_estimate(A, y)
         self._weights = 1.0 / (np.abs(beta0) + self.eps) ** self.gamma
+        # [HARM_DENSE] exact zero weight on the free block: those columns are
+        # never shrunk or pruned, whatever the pilot says about them.
+        self._weights = _free_penalty_weights(free, self._weights)
+        _pen = np.ones(A.shape[1], dtype=bool) if free is None else ~free
         # [FIX] eps-floor fraction: the fraction of pilot coefficients at/below
         # eps. Underdetermined ridge pilots can either FLATTEN (weights ~uniform)
         # or SATURATE at the 1/eps ceiling -- two opposite failure modes that a
         # single weight-dispersion number cannot separate. 0.0 = flattened,
         # ~1.0 = most weights pinned at the 1/eps ceiling.
-        self._beta0_floor = float(np.mean(np.abs(beta0) < self.eps))
+        self._beta0_floor = float(np.mean(np.abs(beta0[_pen]) < self.eps))
+        # [HARM_DENSE] the KKT thresholds below belong to the PENALIZED block
+        # on the residual of the free-block OLS (alpha >= alpha_max leaves the
+        # free block at exactly that OLS).  Using A^T y over every column with
+        # w_free = 0 divides by the 1e-300 guard: alpha_max ~ 1e300, and the
+        # 200-point cap spreads the grid over ~300 decades.
+        _y_kkt = [np.asarray(y, dtype=np.float64).ravel(), free is None]
+
+        def _kkt_target():
+            # lazy: only the weighted-auto grid and the manual-grid diagnostic
+            # need it, and on an operator it costs one LSMR on the free block
+            if not _y_kkt[1]:
+                _y_kkt[0] = _free_block_ols(A, _y_kkt[0], free)[1]
+                _y_kkt[1] = True
+            return _y_kkt[0]
 
         # [FIX P35] derive the alpha grid in the WEIGHTED space:
         # (A/w)^T y = (A^T y)/w, so alpha_max = max_j |(A^T y)_j / w_j| / n.
@@ -3015,10 +3319,11 @@ class _AdaptiveLassoCV(_LassoCVModel):
             # acceptable because these thresholds only set grid ENDPOINTS.
             _A_dt = A.dtype if hasattr(A, "dtype") else np.float64
             _g_raw = np.abs(np.asarray(
-                A.T @ np.asarray(y, dtype=np.float64).ravel().astype(_A_dt, copy=False),
+                A.T @ _kkt_target().astype(_A_dt, copy=False),
                 dtype=np.float64)).ravel()
+            _g_raw = np.where(_pen, _g_raw, 0.0)
             _a_uw = float(_g_raw.max()) / n_samples
-            _g = _g_raw / np.maximum(self._weights, 1e-300)
+            _g = _g_raw / np.where(_pen, np.maximum(self._weights, 1e-300), 1.0)
             _a_max = float(_g.max()) / n_samples
         elif _manual and self.alphas.size > 1:
             # [FIX P40] manual grid diagnostic: one rmatvec (guarded by
@@ -3029,9 +3334,11 @@ class _AdaptiveLassoCV(_LassoCVModel):
             if _diag:
                 _A_dt = A.dtype if hasattr(A, "dtype") else np.float64
                 _g_raw = np.abs(np.asarray(
-                    A.T @ np.asarray(y, dtype=np.float64).ravel().astype(_A_dt, copy=False),
+                    A.T @ _kkt_target().astype(_A_dt, copy=False),
                     dtype=np.float64)).ravel()
-                _a_max = float((_g_raw / np.maximum(self._weights, 1e-300)).max()) / n_samples
+                _g_raw = np.where(_pen, _g_raw, 0.0)
+                _a_max = float((_g_raw / np.where(_pen, np.maximum(self._weights, 1e-300),
+                                                  1.0)).max()) / n_samples
 
         if _override:
             if _a_max > 0 and np.isfinite(_a_max) and _a_uw > 0 and np.isfinite(_a_uw):
@@ -3127,7 +3434,11 @@ class _AdaptiveLassoCV(_LassoCVModel):
                   "path, PHEASY_ALASSO_WEIGHTED_GRID=0)."
                   % (float(self.alphas.min()), float(self.alphas.max())), flush=True)
 
-        if _lasso_backend(A) == "iterative":
+        # [HARM_DENSE] the dense sklearn branch below column-scales A by 1/w,
+        # which is a division by zero on the free block; _backend() moves an
+        # unpenalized fit onto the weighted FISTA instead.
+        backend = self._backend(A, free)
+        if backend == "iterative":
             # [FIX P26] penalized form: pass per-coordinate weights w_j and
             # fit on the ORIGINAL columns (no column-scaling), so the FISTA
             # Lipschitz stays ||A||^2 and convergence is as fast as plain
@@ -3153,7 +3464,7 @@ class _AdaptiveLassoCV(_LassoCVModel):
             self._alpha_at_min_hitcap = getattr(it, "_alpha_at_min_hitcap", False)
             return self
 
-        if _lasso_backend(A) == "gpu":
+        if backend == "gpu":
             gb = _gpu()
             it = gb.GpuLassoCV(
                 self.alphas, self.cv, self.tol, self.max_iter, self.rand_seed,
@@ -3216,7 +3527,7 @@ class _AdaptiveLassoCV(_LassoCVModel):
             "n_iter": self.n_iter_,
             "maxiter": int(self.max_iter),
             "tol": float(self.tol),
-            "weight_dispersion": float(np.std(np.log(np.maximum(self._weights,
+            "weight_dispersion": float(np.std(np.log(np.maximum(self._weights[_pen],
                                                              1e-300)))),
             "beta0_floor_fraction": float(getattr(self, "_beta0_floor", float("nan"))),
         }
@@ -3232,7 +3543,7 @@ class _AdaptiveLassoCV(_LassoCVModel):
 def _ardr_evidence_gram(G, b, yty, n_samples, y_var, threshold_lambda=1e4,
                         max_iter=300, tol=1e-3, alpha_1=1e-6, alpha_2=1e-6,
                         lambda_1=1e-6, lambda_2=1e-6, gpu=None, verbose=False,
-                        checkpoint=None):
+                        checkpoint=None, free=None):
     """ARD evidence maximization driven by the Gram matrix alone.
 
     sklearn.linear_model.ARDRegression's update touches only G = X^T X,
@@ -3248,6 +3559,13 @@ def _ardr_evidence_gram(G, b, yty, n_samples, y_var, threshold_lambda=1e4,
     backend is supplied.  The hard limit that remains is the p x p Gram itself:
     O(p^2) memory and O(p^3) per evidence iteration.
 
+    [HARM_DENSE] ``free`` (bool mask) gives those coefficients a flat prior:
+    their precision is pinned at PHEASY_ARDR_FREE_LAMBDA (default 1e-12, i.e.
+    prior std 1e6 in coefficient units) instead of being re-estimated, so they
+    are never pruned and are not shrunk; their gamma_j ~ 1 still counts them as
+    well-determined in the noise update.  This is the REML form of ARD with
+    unpenalized covariates.
+
     Returns (coef, alpha, lambda_, n_iter, stop_reason, sse).
     """
     import numpy as np
@@ -3258,6 +3576,16 @@ def _ardr_evidence_gram(G, b, yty, n_samples, y_var, threshold_lambda=1e4,
     tiny = float(np.finfo(np.float64).tiny)
     eps = float(np.finfo(np.float64).eps)
     thr = float(threshold_lambda)
+    free_mask = None
+    if free is not None:
+        free_mask = np.asarray(free, dtype=bool).ravel()
+        if free_mask.shape != (p,):
+            raise ValueError("ARDR free mask must have one entry per feature")
+        if not free_mask.any():
+            free_mask = None
+    lam_free = float(os.environ.get("PHEASY_ARDR_FREE_LAMBDA", "1e-12"))
+    if free_mask is not None and not (0.0 <= lam_free < thr):
+        raise ValueError("PHEASY_ARDR_FREE_LAMBDA must be in [0, threshold_lambda)")
     # Gram-form sse suffers catastrophic cancellation when the fit is
     # near-perfect (many features, few samples): yty and 2 b.c - c^T G c cancel
     # to below machine precision, sse clamps to tiny, and alpha = n/sse explodes
@@ -3283,6 +3611,10 @@ def _ardr_evidence_gram(G, b, yty, n_samples, y_var, threshold_lambda=1e4,
         Gt = gpu._to_torch(np.asarray(G, dtype=np.float64), torch.float64)
         bt = gpu._to_torch(np.asarray(b, dtype=np.float64), torch.float64)
         lam = torch.ones(p, dtype=torch.float64, device=dev)
+        free_t = None
+        if free_mask is not None:
+            free_t = torch.as_tensor(free_mask, dtype=torch.bool, device=dev)
+            lam = torch.where(free_t, torch.full_like(lam, lam_free), lam)
         keep = torch.ones(p, dtype=torch.bool, device=dev)
         coef = torch.zeros(p, dtype=torch.float64, device=dev)
         alpha_ = 1.0 / (y_var + eps)
@@ -3308,6 +3640,9 @@ def _ardr_evidence_gram(G, b, yty, n_samples, y_var, threshold_lambda=1e4,
             sse = max(yty - 2.0 * float(ck @ bk) + float(ck @ (Gk @ ck)), _sse_floor)
             gamma = 1.0 - lam_k * Ainv.diagonal()
             lam = lam.index_copy(0, idx, (gamma + 2.0 * lambda_1) / (ck * ck + 2.0 * lambda_2))
+            if free_t is not None:
+                # [HARM_DENSE] flat prior: pinned, never re-estimated or pruned
+                lam = torch.where(free_t, torch.full_like(lam, lam_free), lam)
             alpha_ = (n - float(gamma.sum()) + 2.0 * alpha_1) / (sse + 2.0 * alpha_2)
             coef = coef * keep
             coef = coef.index_copy(0, idx, ck)
@@ -3371,6 +3706,8 @@ def _ardr_evidence_gram(G, b, yty, n_samples, y_var, threshold_lambda=1e4,
 
     alpha_ = 1.0 / (y_var + eps)
     lam = np.ones(p, dtype=np.float64)
+    if free_mask is not None:
+        lam[free_mask] = lam_free
     keep = np.ones(p, dtype=bool)
     coef = np.zeros(p, dtype=np.float64)
     coef_old = None
@@ -3384,6 +3721,8 @@ def _ardr_evidence_gram(G, b, yty, n_samples, y_var, threshold_lambda=1e4,
         _z = np.load(checkpoint, allow_pickle=True)
         coef = np.asarray(_z["coef"], dtype=np.float64)
         lam = np.asarray(_z["lam"], dtype=np.float64)
+        if free_mask is not None:
+            lam[free_mask] = lam_free
         alpha_ = float(_z["alpha_"])
         if "coef_old" in _z.files:
             coef_old = np.asarray(_z["coef_old"], dtype=np.float64)
@@ -3410,6 +3749,8 @@ def _ardr_evidence_gram(G, b, yty, n_samples, y_var, threshold_lambda=1e4,
         sse = max(yty - float(ck @ bk) - alpha_ * float(lam_k @ (sigma_bk ** 2)), _sse_floor)
         gamma = 1.0 - lam_k * diag_sigma
         lam[idx] = (gamma + 2.0 * lambda_1) / (ck * ck + 2.0 * lambda_2)
+        if free_mask is not None:
+            lam[free_mask] = lam_free   # [HARM_DENSE] flat prior, never pruned
         alpha_ = (n - float(gamma.sum()) + 2.0 * alpha_1) / (sse + 2.0 * alpha_2)
         coef[:] = 0.0
         coef[idx] = ck
@@ -3479,7 +3820,9 @@ class _ARDRModel:
     def __init__(self, threshold_lambda=1e4, thresholds=None, cv=5,
                  max_iter=300, tol=1e-3, fit_intercept=False, rand_seed=None,
                  group_size=None, alpha_1=1e-6, alpha_2=1e-6,
-                 lambda_1=1e-6, lambda_2=1e-6, n_jobs=None):
+                 lambda_1=1e-6, lambda_2=1e-6, n_jobs=None, unpenalized=None):
+        # [HARM_DENSE] columns with a flat prior (never pruned)
+        self.unpenalized = unpenalized
         if thresholds is None:
             self.thresholds = np.asarray([float(threshold_lambda)], dtype=np.float64)
         else:
@@ -3537,6 +3880,14 @@ class _ARDRModel:
                 "ARDR received a matrix-free LinearOperator/TwoLevelSM with "
                 "PHEASY_ARDR_GRAM=0. Enable the Gram path (the default) or pass "
                 "the dense/sparse sensing matrix.")
+        if _as_free_mask(self.unpenalized, A.shape[1]) is not None and not gram_mode:
+            # sklearn ARDRegression re-estimates and prunes EVERY precision; it
+            # has no way to hold a block at a flat prior.  The Gram loop is the
+            # same evidence iteration and can.
+            print("[HARM_DENSE] ARDR: sklearn ARDRegression cannot exempt the "
+                  "harmonic block from pruning; using the Gram evidence loop "
+                  "(in-sample score, no CV folds)", flush=True)
+            gram_mode = True
         if gram_mode:
             return self._fit_gram(A, y64)
         A64 = _to_dense_f64(A)
@@ -3671,7 +4022,8 @@ class _ARDRModel:
             alpha_2=self.alpha_2, lambda_1=self.lambda_1, lambda_2=self.lambda_2,
             gpu=gb,
             verbose=os.environ.get("PHEASY_ARDR_VERBOSE", "1").lower()
-            in ("1", "true", "yes", "on"))
+            in ("1", "true", "yes", "on"),
+            free=_as_free_mask(self.unpenalized, p))
 
         self.model_ = None
         self.coef_ = np.asarray(coef, dtype=np.float64)
@@ -3913,7 +4265,10 @@ class _RFECVBase:
     def __init__(self, step=0.1, cv=5, min_features=1, n_jobs=None,
                  verbose=False, random_state=None, solver="lstsq", ridge_alpha=0.0,
                  patience=5, lsmr_maxiter=5000, lsmr_atol=1e-8, lsmr_btol=1e-8,
-                 block_rows=None, diag_floor=1e-12):
+                 block_rows=None, diag_floor=1e-12, protected=None):
+        # [HARM_DENSE] columns that are never eliminated (the FC2 block).  With
+        # a protected set, step / min_features count the ELIMINABLE columns only.
+        self.protected = protected
         self.step = float(step)
         self.cv = int(cv)
         self.min_features = int(min_features)
@@ -3973,6 +4328,11 @@ class _RFECVBase:
         y = np.asarray(y, dtype=np.float64).ravel()
         n_samples, n_features = A.shape
         self.n_features_in_ = n_features
+        protected = _as_free_mask(self.protected, n_features)
+        if protected is not None and self.verbose:
+            print("[HARM_DENSE] RFE: %d protected (harmonic) columns are never "
+                  "eliminated; step/min_features apply to the %d eliminable ones"
+                  % (int(protected.sum()), int((~protected).sum())), flush=True)
 
         col_norms = _col_norms(A)
         # Reuse training norms as a right preconditioner, not as a change to
@@ -4247,6 +4607,15 @@ class _RFECVBase:
                 _support_override = np.asarray(np.load(_sup_npy), dtype=np.int64).ravel()
                 print("[RFE] support override loaded: %d features from %s"
                       % (_support_override.size, _sup_npy), flush=True)
+                if protected is not None:
+                    # [HARM_DENSE] a saved support must not drop FC2 columns
+                    _n0 = _support_override.size
+                    _support_override = np.union1d(_support_override,
+                                                   np.flatnonzero(protected))
+                    if _support_override.size != _n0:
+                        print("[HARM_DENSE] support override: added %d protected "
+                              "columns that the saved support lacked"
+                              % (_support_override.size - _n0), flush=True)
             except Exception as _exc:
                 print("[RFE] support override load failed (%s); running rounds"
                       % type(_exc).__name__, flush=True)
@@ -4254,9 +4623,13 @@ class _RFECVBase:
         while _support_override is None:
             idx = np.where(active)[0]
             n_active = len(idx)
+            # [HARM_DENSE] only non-protected columns take part in elimination
+            elim_local = (np.arange(n_active) if protected is None
+                          else np.flatnonzero(~protected[idx]))
+            n_elim = int(elim_local.size)
             # Keep the initial no-elimination fast path, but evaluate the
             # minimum support reached by elimination before selecting a model.
-            if n_active <= self.min_features and round_num == 0:
+            if n_elim <= self.min_features and round_num == 0:
                 break
 
             defer_download = (resident_A is not None
@@ -4315,13 +4688,17 @@ class _RFECVBase:
                           flush=True)
                 break
 
-            if n_active <= self.min_features:
+            if n_elim <= self.min_features:
                 break
 
             imp = None
-            n_remove = max(1, int(round(n_active * self.step)))
-            n_remove = min(n_remove, n_active - self.min_features)
+            n_remove = max(1, int(round(n_elim * self.step)))
+            n_remove = min(n_remove, n_elim - self.min_features)
             rank_backend = _gpu() if os.environ.get("PHEASY_GPU_RFE_RANKING", "0").lower() in ("1", "true", "yes", "on") else None
+            if protected is not None:
+                # [HARM_DENSE] rank on the host: the order is restricted to the
+                # eliminable subset, and the ranking is O(p) either way.
+                rank_backend = None
             if rank_backend is not None:
                 import torch
                 if resident_A is not None:
@@ -4350,7 +4727,9 @@ class _RFECVBase:
                 if coef_active is None:
                     coef_active = resident_backend._to_numpy(full_fit_coef, np.float64)
                 imp = np.abs(coef_active) * col_norms[idx]
-                remove_local = np.argsort(imp)[:n_remove]
+                # elim_local == arange(n_active) without a protected set, so this
+                # is the historical argsort(imp)[:n_remove] bit-for-bit.
+                remove_local = elim_local[np.argsort(imp[elim_local])[:n_remove]]
             active[idx[remove_local]] = False
             round_num += 1
 
@@ -4453,13 +4832,14 @@ class PheasyRFECV(_RFECVBase):
 
     def __init__(self, step=0.05, cv=5, ridge_alpha=0.0, lsmr_maxiter=3000,   # [FIX P21]
                  lsmr_atol=1e-8, lsmr_btol=1e-8, n_jobs=None, min_features=1,
-                 verbose=True, random_state=None, patience=5):
+                 verbose=True, random_state=None, patience=5, protected=None):
         # [FIX P09] lsmr_* used to be dropped here
         super().__init__(step=step, cv=cv, min_features=min_features, n_jobs=n_jobs,
                          verbose=verbose, random_state=random_state,
                          solver="lstsq", ridge_alpha=ridge_alpha,
                          patience=patience, lsmr_maxiter=lsmr_maxiter,
-                         lsmr_atol=lsmr_atol, lsmr_btol=lsmr_btol)
+                         lsmr_atol=lsmr_atol, lsmr_btol=lsmr_btol,
+                         protected=protected)
 
 
 class PheasyRFE_OLS_TSQR(_RFECVBase):
@@ -4475,11 +4855,12 @@ class PheasyRFE_OLS_TSQR(_RFECVBase):
 
     def __init__(self, step=0.05, patience=5, min_features=100, block_rows=40000,
                  diag_floor=1e-12, cv=5, verbose=True,
-                 random_state=None, n_jobs=None):
+                 random_state=None, n_jobs=None, protected=None):
         super().__init__(step=step, cv=cv, min_features=min_features, n_jobs=n_jobs,
                          verbose=verbose, random_state=random_state,
                          solver="qr", ridge_alpha=0.0, patience=patience,
-                         block_rows=block_rows, diag_floor=diag_floor)
+                         block_rows=block_rows, diag_floor=diag_floor,
+                         protected=protected)
         # [FIX P35] BIC/AIC are genuinely independent stopping rules (the
         # CV+1-SE path makes RFE and RFE-OLS-TSQR numerically identical).
         # NOTE: with the grouped-CV n_eff (configuration count, often tens),
@@ -4521,7 +4902,15 @@ class Optimizer(object):
         alpha_auto=True,
         decades=4.0,
         use_gpu=None,
+        unpenalized=None,
     ):
+        """unpenalized ([HARM_DENSE]): bool mask or index list of columns that
+        are never penalized, shrunk or eliminated by the sparse methods (LASSO,
+        ALASSO, ARDR, RVM, RFE, RFE-OLS-TSQR).  run_pheasy sets it to the
+        harmonic block when PHEASY_HARM_DENSE=1.  OLS is unaffected; RIDGE
+        still shrinks every column (it does not sparsify)."""
+        self._unpenalized = unpenalized
+        self._free_mask = None
         self._method = method
         self._alpha_min = alpha_min
         self._alpha_max = alpha_max
@@ -4764,6 +5153,27 @@ class Optimizer(object):
             F = F.ravel()
         F64 = np.asarray(F, dtype=np.float64).ravel()
 
+        # [HARM_DENSE] columns never penalized / pruned by the sparse methods.
+        free = _as_free_mask(self._unpenalized, A.shape[1])
+        for _k in ("unpenalized_columns", "nnz_unpenalized", "n_penalized",
+                   "nnz_penalized", "unpenalized_note"):
+            self._results.pop(_k, None)
+        if free is not None:
+            if method in ("RIDGE",):
+                self._results["unpenalized_note"] = (
+                    "RIDGE ignores the unpenalized mask: L2 shrinks every column "
+                    "and does not sparsify")
+                print("[HARM_DENSE] note: RIDGE still shrinks the harmonic block "
+                      "(the mask applies to the sparsifying methods)", flush=True)
+                free = None
+            elif method == "OLS":
+                free = None          # nothing is penalized anyway
+            else:
+                print("[HARM_DENSE] %s: %d unpenalized (never pruned) columns, %d "
+                      "penalized" % (method, int(free.sum()), int((~free).sum())),
+                      flush=True)
+        self._free_mask = free
+
         if _is_linear_operator(A) and method in ("RIDGE", "LASSO", "ALASSO"):
             if self._fit_intercept:
                 raise NotImplementedError("fit_intercept is not supported for operator penalized fits; use a supported dense path or fit_intercept=False")
@@ -4819,7 +5229,8 @@ class Optimizer(object):
                     init_alpha=float(os.environ.get("PHEASY_ALASSO_RIDGE_ALPHA", "1e-3")),
                     eps=float(os.environ.get("PHEASY_ALASSO_EPS", "1e-8")),
                     nalpha=self._nalpha, decades=self._decades,
-                    alpha_auto=self._alpha_auto and not self._alpha_user_supplied)
+                    alpha_auto=self._alpha_auto and not self._alpha_user_supplied,
+                    unpenalized=free)
                 self._model.fit(A, F64, sample_weight=weights,
                                 retain_operator=self._debias_enabled())
                 coef = self._model.coef_
@@ -4842,14 +5253,16 @@ class Optimizer(object):
                 self._model = _LassoCVModel(
                     self._alpha, self._cv, self._tol, self._max_iter, self._rand_seed,
                     _lasso_n_jobs(A),
-                    fit_intercept=self._fit_intercept, group_size=self._group_size)
+                    fit_intercept=self._fit_intercept, group_size=self._group_size,
+                    unpenalized=free)
                 self._model.fit(A_fit, F64, sample_weight=weights)
                 coef = self._model.coef_
         elif method == "LASSO":
             self._model = _LassoCVModel(
                 self._alpha, self._cv, self._tol, self._max_iter, self._rand_seed,
                 _lasso_n_jobs(A),
-                fit_intercept=self._fit_intercept, group_size=self._group_size)
+                fit_intercept=self._fit_intercept, group_size=self._group_size,
+                unpenalized=free)
             self._model.fit(A_fit, F64, sample_weight=weights)
             coef = self._model.coef_
         elif method == "ALASSO":
@@ -4862,7 +5275,8 @@ class Optimizer(object):
                 eps=float(os.environ.get("PHEASY_ALASSO_EPS", "1e-8")),
                 nalpha=self._nalpha,
                 decades=self._decades,
-                alpha_auto=self._alpha_auto and not self._alpha_user_supplied)
+                alpha_auto=self._alpha_auto and not self._alpha_user_supplied,
+                unpenalized=free)
             self._model.fit(A_fit, F64, sample_weight=weights)
             coef = self._model.coef_
         elif method == "ARDR":
@@ -4878,6 +5292,7 @@ class Optimizer(object):
                 rand_seed=self._rand_seed,
                 group_size=self._group_size,
                 n_jobs=None,
+                unpenalized=free,
             )
             self._model.fit(A_fit, F64, sample_weight=weights)
             coef = self._model.coef_
@@ -4905,7 +5320,9 @@ class Optimizer(object):
                 add_batch=int(os.environ.get("PHEASY_RVM_ADD_BATCH", "1")),
                 prune_threshold=float(os.environ.get("PHEASY_RVM_THRESHOLD", "1e4")),
                 verbose=os.environ.get("PHEASY_RVM_VERBOSE", "1").lower()
-                in ("1", "true", "yes", "on"))
+                in ("1", "true", "yes", "on"),
+                free=free,
+                alpha_free=float(os.environ.get("PHEASY_RVM_FREE_ALPHA", "0")))
             _c_rvm = np.asarray(_res["coef"], dtype=np.float64)
             _rss_rvm = (float(F64 @ F64) - 2.0 * float(_c_rvm @ b_rvm)
                         + float(_c_rvm @ (G_rvm @ _c_rvm)))
@@ -4933,7 +5350,8 @@ class Optimizer(object):
                 # operator is in hand.
                 lsmr_atol=float(os.environ.get("PHEASY_LSQR_ATOL", 1e-8)),
                 lsmr_btol=float(os.environ.get("PHEASY_LSQR_BTOL", 1e-8)),
-                verbose=True, random_state=self._rand_seed)
+                verbose=True, random_state=self._rand_seed,
+                protected=free)
             self._model.fit(A, F64, sample_weight=weights)
             coef = self._model.coef_
         elif method == "RFE-OLS-TSQR":
@@ -4948,7 +5366,8 @@ class Optimizer(object):
                 block_rows=int(os.environ.get("PHEASY_TSQR_BLOCK_ROWS", "40000")),
                 diag_floor=float(os.environ.get("PHEASY_TSQR_DIAG_FLOOR", "1e-12")),
                 patience=int(os.environ.get("PHEASY_RFE_PATIENCE", "5")),
-                verbose=True, random_state=self._rand_seed)
+                verbose=True, random_state=self._rand_seed,
+                protected=free)
             self._model.fit(A, F64, sample_weight=weights)
             coef = self._model.coef_
         elif method == "RIDGE":
@@ -5236,9 +5655,35 @@ class Optimizer(object):
         _default_tol = "1e-12" if method in ("LASSO", "ALASSO") else "0"
         _zero_tol = float(os.environ.get("PHEASY_COEF_ZERO_TOL", _default_tol))
         if _zero_tol > 0:
-            coef = np.where(np.abs(coef) < _zero_tol, 0.0, coef)
+            _small = np.abs(coef) < _zero_tol
+            if free is not None:
+                _small &= ~free          # [HARM_DENSE] the free block is never zeroed
+            coef = np.where(_small, 0.0, coef)
         self._results["coef"] = coef
         self._model.coef_ = self._results["coef"]
+        if free is not None:
+            # [HARM_DENSE] report sparsity PER BLOCK.  A single "nonzero / total"
+            # mixes the never-pruned harmonic block into the denominator, which
+            # understates the pruned anharmonic fraction (e.g. 37 of 1101 reads
+            # 3.4 %, but it is 37 of the 219 penalized terms, 16.9 %).
+            _nnz_pen = int(np.count_nonzero(coef[~free]))
+            self._results["unpenalized_columns"] = int(free.sum())
+            self._results["nnz_unpenalized"] = int(np.count_nonzero(coef[free]))
+            self._results["n_penalized"] = int((~free).sum())
+            self._results["nnz_penalized"] = _nnz_pen
+            print("[HARM_DENSE] nonzero: unpenalized %d/%d, penalized %d/%d "
+                  "(%.1f%% of the penalized block pruned)"
+                  % (self._results["nnz_unpenalized"], int(free.sum()), _nnz_pen,
+                     int((~free).sum()),
+                     100.0 * (1.0 - _nnz_pen / max(int((~free).sum()), 1))),
+                  flush=True)
+            if _nnz_pen == 0:
+                warnings.warn(
+                    "[HARM_DENSE] every penalized (anharmonic) coefficient is zero: "
+                    "the regularization is above the anharmonic KKT threshold.  "
+                    "Force constants from this fit carry NO three-phonon scattering "
+                    "and any RTA thermal conductivity computed from them diverges.",
+                    RuntimeWarning, stacklevel=2)
 
         if method in ("LASSO", "ALASSO"):
             self._results["alpha"] = float(self._model.alpha_)
@@ -5489,6 +5934,11 @@ class Optimizer(object):
     def _debias(self, A, y, coef):
         """OLS refit on the nonzero support (relaxed LASSO)."""
         sup = np.flatnonzero(np.abs(coef) > 0)
+        _free = getattr(self, "_free_mask", None)
+        if _free is not None:
+            # [HARM_DENSE] the unpenalized block is part of the model by
+            # definition, whatever value its coefficients happen to take.
+            sup = np.union1d(sup, np.flatnonzero(_free))
         # Full support still has L1 shrinkage and must be refitted.
         # Only empty support has no least-squares problem to solve.
         if sup.size == 0:

@@ -1371,6 +1371,64 @@ def _soft_threshold_t(x, thr):
     return x - torch.clamp(x, min=-thr, max=thr)
 
 
+class _FreeBlockReductionT(object):
+    """[HARM_DENSE] torch twin of optimizer._FreeBlockReduction.
+
+    Eliminates the unpenalized block F exactly from (G, b) -- Schur complement
+    S = G_PP - G_PF G_FF^-1 G_FP, s = b_P - G_PF G_FF^-1 b_F (Frisch-Waugh-Lovell)
+    -- and Jacobi-scales the rest (z = d x_P, d = sqrt(diag S), weights w_P / d).
+    Exact reparametrization; FISTA then never iterates the free block, and its
+    step is no longer set by the large FC2 columns.
+    """
+
+    def __init__(self, Gt, bt, free_t, pw_t):
+        import torch
+        self.p = int(Gt.shape[0])
+        self.F = torch.nonzero(free_t, as_tuple=False).reshape(-1)
+        self.P = torch.nonzero(~free_t, as_tuple=False).reshape(-1)
+        Gff = Gt.index_select(0, self.F).index_select(1, self.F)
+        Gfp = Gt.index_select(0, self.F).index_select(1, self.P)
+        Gpp = Gt.index_select(0, self.P).index_select(1, self.P)
+        bf = bt.index_select(0, self.F)
+        bp = bt.index_select(0, self.P)
+        C = beta = None
+        try:
+            L = torch.linalg.cholesky(Gff)
+            C = torch.cholesky_solve(Gfp, L)
+            beta = torch.cholesky_solve(bf.unsqueeze(1), L).squeeze(1)
+            if not (bool(torch.isfinite(C).all()) and bool(torch.isfinite(beta).all())):
+                C = None
+        except RuntimeError:
+            C = None
+        if C is None:
+            # CUDA cholesky / gels can fail silently or loudly on a singular
+            # block; the rcond-thresholded pseudo-inverse is the safe fallback.
+            Gp = torch.linalg.pinv(Gff)
+            C = Gp @ Gfp
+            beta = Gp @ bf
+        S = Gpp - Gfp.T @ C
+        S = 0.5 * (S + S.T)
+        s = bp - Gfp.T @ beta
+        dg = torch.clamp(torch.diagonal(S), min=0.0)
+        top = float(dg.max().item()) if dg.numel() else 0.0
+        d = torch.where(dg > 1e-300 * max(top, 1.0), torch.sqrt(dg), torch.ones_like(dg))
+        self.d = d
+        self.C = C
+        self.beta = beta
+        self.S = S / d[:, None] / d[None, :]
+        self.s = s / d
+        self.w = pw_t.index_select(0, self.P).to(dtype=S.dtype) / d
+        self.lip = _power_lipschitz(self.S)
+
+    def to_full(self, z):
+        import torch
+        x_p = z / self.d
+        x = torch.zeros(self.p, dtype=z.dtype, device=z.device)
+        x[self.P] = x_p
+        x[self.F] = self.beta - self.C @ x_p
+        return x
+
+
 def _fista_gram(Gt, bt, alpha, x0=None, max_iter=3000, tol=1e-7,
                 lipschitz=None, penalty_weights=None, n_samples=None, _info=None):
     """FISTA LASSO on the precomputed Gram: min 0.5||Ax-y||^2 + alpha sum w|x|.
@@ -1629,18 +1687,46 @@ class GpuLassoCV(object):
         if pw is not None and not isinstance(pw, torch.Tensor):
             pw = torch.as_tensor(np.ascontiguousarray(pw, dtype=np.float64),
                                  dtype=torch.float64, device=At.device)
+        red_full = red_folds = None
+        if pw is not None:
+            # [HARM_DENSE] zero weight == unpenalized column.  Eliminate that
+            # block exactly from every Gram (each fold from ITS OWN training
+            # Gram, so nothing leaks from the validation rows) and Jacobi-scale
+            # the rest: FISTA then iterates on the penalized block only, starting
+            # from z = 0, which is the exact top-of-grid solution.  See
+            # optimizer._FreeBlockReduction for why iterating the free block
+            # inside FISTA is too slow on raw FC2/FC3 column scales.
+            _free_t = pw == 0
+            if bool(_free_t.any()):
+                red_folds = [_FreeBlockReductionT(G_tr, b_tr, _free_t, pw)
+                             for G_tr, b_tr in gram_folds]
+                red_full = _FreeBlockReductionT(G_full, b_full, _free_t, pw)
+                print("[HARM_DENSE] GPU Gram FISTA on the penalized block only: %d "
+                      "free columns eliminated exactly (Schur complement), %d "
+                      "penalized columns Jacobi-scaled"
+                      % (int(_free_t.sum().item()), int((~_free_t).sum().item())),
+                      flush=True)
 
         for a_i in range(n_alphas - 1, -1, -1):
             alpha = float(self.alphas[a_i])
             fold_mse = np.zeros(len(splits))
             for k, (tr, va) in enumerate(splits):
                 _fold_info = {}
-                coef, nit = _fista_gram(gram_folds[k][0], gram_folds[k][1], alpha,
-                                        x0=x_folds[k], max_iter=cv_max_iter, tol=cv_tol,
-                                        lipschitz=lip_folds[k], penalty_weights=pw,
-                                        n_samples=len(tr), _info=_fold_info)
+                if red_folds is not None:
+                    _r = red_folds[k]
+                    coef, nit = _fista_gram(_r.S, _r.s, alpha, x0=x_folds[k],
+                                            max_iter=cv_max_iter, tol=cv_tol,
+                                            lipschitz=_r.lip, penalty_weights=_r.w,
+                                            n_samples=len(tr), _info=_fold_info)
+                    coef_full = _r.to_full(coef)
+                else:
+                    coef, nit = _fista_gram(gram_folds[k][0], gram_folds[k][1], alpha,
+                                            x0=x_folds[k], max_iter=cv_max_iter, tol=cv_tol,
+                                            lipschitz=lip_folds[k], penalty_weights=pw,
+                                            n_samples=len(tr), _info=_fold_info)
+                    coef_full = coef
                 va_t = torch.as_tensor(np.asarray(va), dtype=torch.long, device=At.device)
-                pred = A_va_list[k] @ coef
+                pred = A_va_list[k] @ coef_full
                 x_folds[k] = coef
                 _cv_max_n_iter = max(_cv_max_n_iter, nit)
                 if nit >= cv_max_iter and not _fold_info.get("converged", False):
@@ -1651,10 +1737,17 @@ class GpuLassoCV(object):
             mean = float(fold_mse.mean())
 
             _full_info = {}
-            x_full, nit = _fista_gram(G_full, b_full, alpha, x0=x_full,
-                                      max_iter=cv_max_iter, tol=cv_tol,
-                                      lipschitz=lip_full, penalty_weights=pw,
-                                      n_samples=n_samples, _info=_full_info)
+            if red_full is not None:
+                x_full, nit = _fista_gram(red_full.S, red_full.s, alpha, x0=x_full,
+                                          max_iter=cv_max_iter, tol=cv_tol,
+                                          lipschitz=red_full.lip,
+                                          penalty_weights=red_full.w,
+                                          n_samples=n_samples, _info=_full_info)
+            else:
+                x_full, nit = _fista_gram(G_full, b_full, alpha, x0=x_full,
+                                          max_iter=cv_max_iter, tol=cv_tol,
+                                          lipschitz=lip_full, penalty_weights=pw,
+                                          n_samples=n_samples, _info=_full_info)
             # Full-data warm-start solve: feeds the "max iterations" message but
             # must not set the hit-cap flag (that is a CV-convergence diagnosis).
             _cv_max_n_iter = max(_cv_max_n_iter, nit)
@@ -1719,11 +1812,23 @@ class GpuLassoCV(object):
 
         self.alpha_ = float(self.alphas[best_i])
         final_info = {}
-        coef_t, nfin = _fista_gram(G_full, b_full, self.alpha_, x0=best_x,
-                                   max_iter=self.max_iter,
-                                   tol=float(self.tol),
-                                   lipschitz=lip_full, penalty_weights=pw,
-                                   n_samples=n_samples, _info=final_info)
+        if red_full is not None:
+            z_t, nfin = _fista_gram(red_full.S, red_full.s, self.alpha_, x0=best_x,
+                                    max_iter=self.max_iter,
+                                    tol=float(self.tol),
+                                    lipschitz=red_full.lip,
+                                    penalty_weights=red_full.w,
+                                    n_samples=n_samples, _info=final_info)
+            coef_t = red_full.to_full(z_t)
+            # certificate of the reduced problem: relative to the penalized
+            # block's own gradient, not the FC2-dominated max|A^T y|
+            final_info["harm_dense_reduction"] = "schur_complement+jacobi"
+        else:
+            coef_t, nfin = _fista_gram(G_full, b_full, self.alpha_, x0=best_x,
+                                       max_iter=self.max_iter,
+                                       tol=float(self.tol),
+                                       lipschitz=lip_full, penalty_weights=pw,
+                                       n_samples=n_samples, _info=final_info)
         self.coef_ = _to_numpy(coef_t, np.float64)
         self.intercept_ = 0.0
         self.alphas_ = self.alphas
@@ -3727,7 +3832,7 @@ class GpuTwoLevelLassoCV(GpuLassoCV):
     """
     def __init__(self, *args, standardize=False, adaptive=False, gamma=1.0,
                  init_alpha=1e-3, eps=1e-8, nalpha=None, decades=4.0,
-                 alpha_auto=True, **kwargs):
+                 alpha_auto=True, unpenalized=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.standardize = standardize
         self.adaptive = bool(adaptive)
@@ -3737,6 +3842,8 @@ class GpuTwoLevelLassoCV(GpuLassoCV):
         self.nalpha = int(nalpha) if nalpha else len(self.alphas)
         self.decades = float(decades)
         self.alpha_auto = bool(alpha_auto)
+        # [HARM_DENSE] bool mask of columns with no L1 penalty (FC2 block)
+        self.unpenalized = unpenalized
         self.penalty_weights_ = None
 
     def fit(self, A, y, sample_weight=None, retain_operator=False):
@@ -3825,9 +3932,61 @@ class GpuTwoLevelLassoCV(GpuLassoCV):
             print("[gpu_resident] exact normalization started", flush=True)
             op.normalize()
             print("[gpu_resident] normalization done elapsed=%.2fs" % (time.monotonic() - started), flush=True)
+        # [HARM_DENSE] internal Jacobi scaling for an UNstandardized fit.  The
+        # free block stays inside the matrix-free iteration here, and on raw
+        # columns the FC2/FC3 norm ratio (~40x) squares into the curvature spread
+        # FISTA has to crawl through.  Iterate in z = s*x (s = column norms) and
+        # carry the model in the weights, w_z = w_x / s: an exact
+        # reparametrization, so the unstandardized objective is unchanged.
+        jac = None
+        if (not self.standardize and self.unpenalized is not None
+                and bool(np.asarray(self.unpenalized, dtype=bool).any())
+                and os.environ.get("PHEASY_HARM_DENSE_JACOBI", "1").strip().lower()
+                not in ("0", "false", "no", "off")):
+            op.normalize()
+            jac = op.scale.clone()
+            print("[HARM_DENSE] resident: internal Jacobi scaling (unstandardized "
+                  "model kept through the L1 weights)", flush=True)
         print("[gpu_resident] Lipschitz estimate started", flush=True)
         L = op.lipschitz()
         print("[gpu_resident] Lipschitz estimate ready elapsed=%.2fs" % (time.monotonic() - started), flush=True)
+        # [HARM_DENSE] unpenalized block.  Three things change, all derived from
+        # ONE resident OLS of y on the free columns (x_top):
+        #   * the L1 weight of every free column is exactly 0 (LASSO and ALASSO);
+        #   * the KKT thresholds of the alpha grid are taken over the PENALIZED
+        #     columns on the residual y - A x_top.  The old ALASSO rule divided
+        #     by clamp(w, tiny) = tiny on the free block, overflowed to inf, and
+        #     the non-finite amax then silently kept the MANUAL grid;
+        #   * x_top is the exact solution at alpha >= alpha_max, so it seeds the
+        #     full path, and each fold is seeded with the same solve on its own
+        #     training rows (no validation leakage).
+        free_np = None
+        if self.unpenalized is not None:
+            _fm = np.asarray(self.unpenalized, dtype=bool).ravel()
+            if _fm.shape != (A.shape[1],):
+                raise ValueError("unpenalized mask must have one entry per feature")
+            if _fm.any():
+                free_np = _fm
+        free_t = free_idx_np = pen_mask_t = x_top = g_res = None
+        if free_np is not None:
+            free_idx_np = np.flatnonzero(free_np)
+            free_t = torch.as_tensor(free_np, dtype=torch.bool, device=op.device)
+            pen_mask_t = (~free_t).to(op._value_dtype)
+            if jac is not None:
+                pen_mask_t = pen_mask_t / jac      # unit x-space weight -> z-space
+            _xf, _finfo = solve_resident_subset(op, yt, free_idx_np,
+                                                raise_on_nonconvergence=False)
+            x_top = torch.zeros(A.shape[1], dtype=op._value_dtype, device=op.device)
+            x_top[torch.as_tensor(free_idx_np, dtype=torch.long, device=op.device)] = \
+                _xf.to(op._value_dtype)
+            g_res = op.rmatvec(yt - op.matvec(x_top))
+            g_res = torch.where(free_t, torch.zeros_like(g_res), g_res)
+            self.free_ols_info_ = dict(_finfo) if isinstance(_finfo, dict) else _finfo
+            print("[HARM_DENSE] resident: %d unpenalized columns; free-block OLS "
+                  "converged=%s elapsed=%.2fs"
+                  % (int(free_idx_np.size),
+                     (_finfo or {}).get("converged") if isinstance(_finfo, dict) else _finfo,
+                     time.monotonic() - started), flush=True)
         penalty_weights = None
         pilot_info = None
         if self.adaptive:
@@ -3853,20 +4012,33 @@ class GpuTwoLevelLassoCV(GpuLassoCV):
             # still usable, but nothing else in the fit would say so.
             self.pilot_info_ = dict(pilot_info) if isinstance(pilot_info, dict) else pilot_info
             pilot = torch.as_tensor(pilot, dtype=op._value_dtype, device=op.device)
+            if jac is not None:
+                pilot = pilot / jac      # [HARM_DENSE] pilot back in model (x) units
             penalty_weights_t = torch.pow(pilot.abs() + self.eps, -self.gamma)
             if not bool(torch.isfinite(penalty_weights_t).all().item()):
                 raise RuntimeError("Resident GPU ALASSO pilot produced nonfinite penalty weights")
-            # Keep solver weights on CUDA; retain only a diagnostic snapshot.
-            penalty_weights = penalty_weights_t
+            _pen_view = penalty_weights_t
+            if free_t is not None:
+                _pen_view = penalty_weights_t[~free_t]
+                penalty_weights_t = penalty_weights_t * (~free_t).to(penalty_weights_t.dtype)   # [HARM_DENSE]
+            # Keep solver weights on CUDA; retain only a diagnostic snapshot
+            # (model-space weights; the solver gets them in the iteration space).
             self.penalty_weights_ = _to_numpy(penalty_weights_t, np.float64)
-            print("[gpu_resident] adaptive pilot=GPU CGLS gamma=%.6g weight_range=[%.6e, %.6e]" % (self.gamma, float(penalty_weights_t.min().item()), float(penalty_weights_t.max().item())), flush=True)
+            if jac is not None:
+                penalty_weights_t = penalty_weights_t / jac
+            penalty_weights = penalty_weights_t
+            print("[gpu_resident] adaptive pilot=GPU CGLS gamma=%.6g weight_range=[%.6e, %.6e]%s" % (self.gamma, float(_pen_view.min().item()), float(_pen_view.max().item()), " (penalized block; free block 0)" if free_t is not None else ""), flush=True)
             if self.alpha_auto:
-                _g_w = torch.abs(op.rmatvec(yt))
-                weighted_kkt = torch.max(_g_w / torch.clamp(penalty_weights_t, min=torch.finfo(yt.dtype).tiny)) / A.shape[0]
+                _g_w = torch.abs(op.rmatvec(yt)) if g_res is None else torch.abs(g_res)
+                _w_den = (penalty_weights_t if free_t is None else
+                          torch.where(free_t, torch.ones_like(penalty_weights_t), penalty_weights_t))
+                weighted_kkt = torch.max(_g_w / torch.clamp(_w_den, min=torch.finfo(yt.dtype).tiny)) / A.shape[0]
                 # [FIX P46] the ALASSO rule (P37) anchors the bottom at the MIN of
                 # the weighted and unweighted thresholds; the unweighted one comes
                 # from the same rmatvec, so it is free here.
-                unweighted_kkt = float(torch.max(_g_w).item()) / A.shape[0]
+                # (with the internal Jacobi the gradient is in z units; the
+                # unweighted threshold of the unstandardized model is |A^T r| = s*|g_z|)
+                unweighted_kkt = float(torch.max(_g_w if jac is None else _g_w * jac).item()) / A.shape[0]
                 amax = float(weighted_kkt.item())
                 if amax > 0 and np.isfinite(amax):
                     self.alphas = _lasso_grid(amax, min(amax, unweighted_kkt),
@@ -3879,7 +4051,9 @@ class GpuTwoLevelLassoCV(GpuLassoCV):
             # is already normalized (when standardize=True), so op.rmatvec(yt)
             # yields A.T y / ||col|| -- the standardized-space gradient the grid
             # needs -- matching derive_alpha_grid(standardize=True) exactly.
-            g = op.rmatvec(yt)
+            g = op.rmatvec(yt) if g_res is None else g_res
+            if jac is not None:
+                g = g * jac      # [HARM_DENSE] threshold of the unstandardized model
             amax = float(torch.max(torch.abs(g)).item()) / A.shape[0]
             if amax > 0 and np.isfinite(amax):
                 # [FIX P46] same span floor as derive_alpha_grid: this resident
@@ -3888,6 +4062,9 @@ class GpuTwoLevelLassoCV(GpuLassoCV):
                 self.alphas = _lasso_grid(amax, amax, self.decades,
                                           max(self.nalpha, len(self.alphas)),
                                           A.shape[0], A.shape[1])
+        if free_t is not None and penalty_weights is None:
+            # [HARM_DENSE] plain LASSO: unit weight on the penalized block only
+            penalty_weights = pen_mask_t
         cv_tol = float(os.environ.get("PHEASY_CV_TOL", str(max(self.tol, 1e-3))))
         # CV only needs the MSE *ranking* across alphas, not a tight solution per
         # alpha. The mid-grid alphas (the sparse->dense transition) converge
@@ -3922,6 +4099,13 @@ class GpuTwoLevelLassoCV(GpuLassoCV):
                 vat = torch.as_tensor(va, dtype=torch.int64, device=worker.device)
                 values = torch.empty(len(self.alphas), dtype=target.dtype, device=worker.device)
                 x = None
+                if free_idx_np is not None:
+                    # [HARM_DENSE] top-of-grid solution on THIS fold's rows
+                    _xk, _ = solve_resident_subset(worker, target, free_idx_np, rows=tr,
+                                                   raise_on_nonconvergence=False)
+                    x = torch.zeros(A.shape[1], dtype=target.dtype, device=worker.device)
+                    x[torch.as_tensor(free_idx_np, dtype=torch.long,
+                                      device=worker.device)] = _xk.to(target.dtype)
                 infos = []
                 for i in range(len(self.alphas) - 1, -1, -1):
                     # CV folds are a capped, ranking-only approximation by design:
@@ -3980,7 +4164,7 @@ class GpuTwoLevelLassoCV(GpuLassoCV):
         tied = means <= means[best_i] * (1 + rtol) + 1e-300
         self.alpha_ = float(self.alphas[best_i])
         # Preserve independent full-data descending warm-start path.
-        x = None
+        x = None if x_top is None else x_top.clone()   # [HARM_DENSE] exact at the top
         for i in range(len(self.alphas) - 1, best_i - 1, -1):
             # The alpha-path walk is warm-started and capped on purpose (each
             # alpha only needs to be roughly right to rank the grid).
