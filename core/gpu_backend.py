@@ -1645,9 +1645,24 @@ class GpuLassoCV(object):
                                  self.group_size)
         n_alphas = len(self.alphas)
 
+        # [ACC] convert the penalty weights ONCE per fit, not once per
+        # (fold, alpha): with nalpha=100 and cv=5 the old code performed 600
+        # host->device transfers plus 600 device allocations of a p-vector
+        # inside the hot loop.
+        pw = self.penalty_weights
+        if pw is not None and not isinstance(pw, torch.Tensor):
+            pw = torch.as_tensor(np.ascontiguousarray(pw, dtype=np.float64),
+                                 dtype=torch.float64, device=At.device)
+        # [HARM_DENSE] zero weight == unpenalized column.  With such a block
+        # every solve below runs on the reduced Gram (_FreeBlockReductionT), which
+        # carries its own Lipschitz constant, so lambda_max of the unreduced
+        # Grams (an eigvalsh per fold) would never be used: skip it.
+        _free_t = (pw == 0) if pw is not None else None
+        _reduce = _free_t is not None and bool(_free_t.any())
+
         G_full = At.T @ At
         b_full = At.T @ yt
-        lip_full = _power_lipschitz(G_full)
+        lip_full = None if _reduce else _power_lipschitz(G_full)
 
         gram_folds = []
         lip_folds = []
@@ -1658,7 +1673,7 @@ class GpuLassoCV(object):
             G_va = A_va.T @ A_va
             b_va = A_va.T @ yt[va_t]
             gram_folds.append((G_full - G_va, b_full - b_va))
-            lip_folds.append(_power_lipschitz(G_full - G_va))
+            lip_folds.append(None if _reduce else _power_lipschitz(G_full - G_va))
             A_va_list.append(A_va)
 
         cv_tol = float(os.environ.get(
@@ -1679,33 +1694,23 @@ class GpuLassoCV(object):
         # problem on a perfectly converged path.
         _cv_hit_cap = False
 
-        # [ACC] convert the penalty weights ONCE per fit, not once per
-        # (fold, alpha): with nalpha=100 and cv=5 the old code performed 600
-        # host->device transfers plus 600 device allocations of a p-vector
-        # inside the hot loop.
-        pw = self.penalty_weights
-        if pw is not None and not isinstance(pw, torch.Tensor):
-            pw = torch.as_tensor(np.ascontiguousarray(pw, dtype=np.float64),
-                                 dtype=torch.float64, device=At.device)
         red_full = red_folds = None
-        if pw is not None:
-            # [HARM_DENSE] zero weight == unpenalized column.  Eliminate that
-            # block exactly from every Gram (each fold from ITS OWN training
-            # Gram, so nothing leaks from the validation rows) and Jacobi-scale
-            # the rest: FISTA then iterates on the penalized block only, starting
-            # from z = 0, which is the exact top-of-grid solution.  See
-            # optimizer._FreeBlockReduction for why iterating the free block
-            # inside FISTA is too slow on raw FC2/FC3 column scales.
-            _free_t = pw == 0
-            if bool(_free_t.any()):
-                red_folds = [_FreeBlockReductionT(G_tr, b_tr, _free_t, pw)
-                             for G_tr, b_tr in gram_folds]
-                red_full = _FreeBlockReductionT(G_full, b_full, _free_t, pw)
-                print("[HARM_DENSE] GPU Gram FISTA on the penalized block only: %d "
-                      "free columns eliminated exactly (Schur complement), %d "
-                      "penalized columns Jacobi-scaled"
-                      % (int(_free_t.sum().item()), int((~_free_t).sum().item())),
-                      flush=True)
+        if _reduce:
+            # [HARM_DENSE] eliminate the unpenalized block exactly from every
+            # Gram (each fold from ITS OWN training Gram, so nothing leaks from
+            # the validation rows) and Jacobi-scale the rest: FISTA then iterates
+            # on the penalized block only, starting from z = 0, which is the
+            # exact top-of-grid solution.  See optimizer._FreeBlockReduction for
+            # why iterating the free block inside FISTA is too slow on raw
+            # FC2/FC3 column scales.
+            red_folds = [_FreeBlockReductionT(G_tr, b_tr, _free_t, pw)
+                         for G_tr, b_tr in gram_folds]
+            red_full = _FreeBlockReductionT(G_full, b_full, _free_t, pw)
+            print("[HARM_DENSE] GPU Gram FISTA on the penalized block only: %d "
+                  "free columns eliminated exactly (Schur complement), %d "
+                  "penalized columns Jacobi-scaled"
+                  % (int(_free_t.sum().item()), int((~_free_t).sum().item())),
+                  flush=True)
 
         for a_i in range(n_alphas - 1, -1, -1):
             alpha = float(self.alphas[a_i])

@@ -344,6 +344,93 @@ class IllConditionedTests(HarmDenseBase):
         self.assert_free_kept(m.coef_, free)
 
 
+class LipschitzCostTests(HarmDenseBase):
+    """The reduced solves need an upper bound on lambda_max(S) only, and the
+    unreduced Grams' lambda_max is never used once the free block is
+    eliminated -- so it must not be computed (an O(p^3) eigvalsh per fold,
+    measured ~150 s at p=1872 on a slow LAPACK)."""
+
+    ENV = {"PHEASY_LASSO_DEBIAS": "0", "PHEASY_LASSO_EDGE_RELAXED": "0",
+           "PHEASY_COEF_ZERO_TOL": "0"}
+
+    def test_lanczos_bound_is_a_tight_upper_bound(self):
+        rng = np.random.default_rng(5)
+        n = 300
+        for gap in (1.0, 1e-3, 0.0):          # separated / near-degenerate / double top
+            Q, _ = np.linalg.qr(rng.normal(size=(n, n)))
+            ev = np.sort(rng.uniform(0.0, 1.0, n))
+            ev[-1], ev[-2] = 5.0, 5.0 - gap
+            S = (Q * ev) @ Q.T
+            S = 0.5 * (S + S.T)
+            exact = float(np.linalg.eigvalsh(S)[-1])
+            # the exact eigvalsh must not be reached, not even as a fallback
+            with patch.dict(os.environ, {"PHEASY_LIPSCHITZ_LANCZOS_P": "0"}), \
+                    patch.object(opt, "_top_eigval",
+                                 side_effect=AssertionError("exact eigvalsh used")):
+                L = opt._top_eigval_upper(S)
+            self.assertGreaterEqual(L, exact, "gap %g" % gap)
+            self.assertLess(L, 1.03 * exact, "gap %g" % gap)
+        # at or below the size threshold: the exact value, no margin
+        self.assertEqual(opt._top_eigval_upper(S), opt._top_eigval(S))
+
+    def test_cpu_gram_path_skips_unreduced_eigvalsh(self):
+        A, y, free = make_illcond_problem(11)
+        a = 0.005 * penalized_alpha_max(A, y, free)
+        ref = fwl_reference(A, y, free, a)
+        n_pen = int((~free).sum())
+        real = opt._top_eigval
+        for lanczos_p in ("1024", "0"):
+            sizes = []
+
+            def spy(G, _sizes=sizes):
+                _sizes.append(int(np.shape(G)[0]))
+                return real(G)
+
+            with patch.dict(os.environ, dict(self.ENV, PHEASY_LIPSCHITZ_LANCZOS_P=lanczos_p)), \
+                    patch.object(opt, "_top_eigval", spy):
+                o = opt.Optimizer("LASSO", alpha=[a], cv=3, rand_seed=0, tol=1e-12,
+                                  max_iter=3000, unpenalized=free)
+                o.fit(A, y)
+            c = o.results["coef"]
+            self.assertEqual(o.results["regularized_solver_info"].get("harm_dense_reduction"),
+                             "schur_complement+jacobi")
+            self.assertLess(np.linalg.norm(c - ref) / np.linalg.norm(ref), 1e-7, lanczos_p)
+            self.assert_free_kept(c, free)
+            if lanczos_p == "0":
+                self.assertEqual(sizes, [], "Lanczos path fell back to eigvalsh")
+            else:
+                # 3 folds + full data, each on the reduced (penalized-only) Gram
+                self.assertEqual(sizes, [n_pen] * 4)
+
+    @unittest.skipIf(torch is None, "torch not installed")
+    def test_gpu_dense_path_skips_unreduced_eigvalsh(self):
+        A, y, free = make_illcond_problem(11)
+        a = 0.005 * penalized_alpha_max(A, y, free)
+        ref = fwl_reference(A, y, free, a)
+        real = gb._power_lipschitz
+        env = {"PHEASY_CV_TOL": "1e-10", "PHEASY_CV_MAX_ITER": "3000"}
+        for pw, expect in ((opt._free_penalty_weights(free), int((~free).sum())),
+                           (None, A.shape[1])):         # control: no free block
+            sizes = []
+
+            def spy(Gt, *args, _sizes=sizes, **kw):
+                _sizes.append(int(Gt.shape[0]))
+                return real(Gt, *args, **kw)
+
+            with patch.object(gb, "available", return_value=True), \
+                    patch.object(gb, "enabled", return_value=True), \
+                    patch.object(gb, "device", return_value="cpu"), \
+                    patch.object(gb, "_power_lipschitz", spy), \
+                    patch.dict(os.environ, env):
+                m = gb.GpuLassoCV([a], 3, 1e-12, 3000, 0, group_size=ROWS,
+                                  penalty_weights=pw)
+                m.fit(A, y)
+            self.assertEqual(sizes, [expect] * 4)
+            if pw is not None:
+                self.assertLess(np.linalg.norm(m.coef_ - ref) / np.linalg.norm(ref), 1e-7)
+                self.assert_free_kept(m.coef_, free)
+
+
 class EliminationAndBayesTests(HarmDenseBase):
     def test_rfe_and_tsqr_never_eliminate_free_columns(self):
         for method, env in (("RFE", {"PHEASY_RFE_STEP": "0.2",

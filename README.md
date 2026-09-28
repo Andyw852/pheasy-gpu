@@ -69,7 +69,10 @@ On the Gram paths (CPU and GPU dense FISTA) the harmonic block is eliminated
 exactly (Schur complement) and the anharmonic block is Jacobi-scaled before
 FISTA runs, and the matrix-free resident path iterates in Jacobi-scaled
 coordinates; without this, raw FC2/FC3 column scales (~40x apart) make FISTA
-crawl while its relative KKT already looks converged.
+crawl while its relative KKT already looks converged.  The reduced solves take
+their step from an upper bound on lambda_max of the reduced Gram (CPU: Lanczos
+above `PHEASY_LIPSCHITZ_LANCZOS_P`, default 1024 penalized columns, exact
+eigvalsh below), and lambda_max of the unreduced Grams is no longer computed.
 With `--fix_fc2` the harmonic block is not fitted at all and the flag is moot.
 See `dev/test_harm_dense.py` for the contract.
 

@@ -589,7 +589,9 @@ class _FreeBlockReduction(object):
         w = (np.ones(self.P.size) if penalty_weights is None
              else np.asarray(penalty_weights, dtype=np.float64).ravel()[self.P])
         self.w = w / d
-        self.lipschitz = _top_eigval(self.S)
+        # an upper bound is all FISTA needs; Lanczos above
+        # PHEASY_LIPSCHITZ_LANCZOS_P instead of an O(p^3) eigvalsh per fold
+        self.lipschitz = _top_eigval_upper(self.S)
 
     def to_full(self, z):
         x_p = np.asarray(z, dtype=np.float64).ravel() / self.d
@@ -1196,6 +1198,43 @@ def _top_eigval(G):
     except TypeError:
         # older scipy without subset_by_index: full eigendecomposition fallback
         return float(spla.eigvalsh(G)[-1])
+
+
+def _top_eigval_upper(S):
+    """Upper bound on lambda_max of a symmetric PSD matrix, for a FISTA step.
+
+    [HARM_DENSE] used for the reduced Gram of _FreeBlockReduction.  The exact
+    eigvalsh above is an O(p^3) tridiagonal reduction; measured ~150 s at
+    p=1872 on a slow LAPACK, and a CV fit needs it K+1 times.  FISTA only
+    needs L >= lambda_max, so above PHEASY_LIPSCHITZ_LANCZOS_P (default 1024)
+    this runs Lanczos (ARPACK eigsh: a few dozen O(p^2) matvecs).  The top Ritz
+    value theta is a Rayleigh quotient (<= lambda_max) and an eigenvalue lies
+    within the residual ||S v - theta v|| of it, so theta + ||r|| bounds the
+    eigenvalue it converged to; the PHEASY_FISTA_LIPSCHITZ_SAFETY margin (same
+    knob and default as _estimate_lipschitz) covers a near-degenerate top
+    cluster.  Any ARPACK failure falls back to the exact eigvalsh.
+    """
+    S = np.asarray(S, dtype=np.float64)
+    n = int(S.shape[0])
+    if n <= max(int(os.environ.get("PHEASY_LIPSCHITZ_LANCZOS_P", "1024")), 2):
+        return _top_eigval(S)
+    try:
+        from scipy.sparse.linalg import eigsh
+        v0 = np.random.default_rng(0).standard_normal(n)   # deterministic, generic
+        # the residual is added below, so tol only has to make the Ritz pair
+        # converge; maxiter bounds a pathological cluster (-> exact fallback)
+        w, V = eigsh(S, k=1, which="LA", tol=1e-8, v0=v0, maxiter=2000)
+        theta = float(w[0])
+        v = np.asarray(V[:, 0], dtype=np.float64)
+        v = v / max(float(np.linalg.norm(v)), np.finfo(float).tiny)
+        resid = float(np.linalg.norm(S @ v - theta * v))
+        safety = max(float(os.environ.get("PHEASY_FISTA_LIPSCHITZ_SAFETY", "1.02")), 1.0)
+        L = (theta + resid) * safety
+        if not (np.isfinite(L) and L > 0.0):
+            raise ValueError("non-finite Lanczos estimate %r" % L)
+        return L
+    except Exception:
+        return _top_eigval(S)
 
 
 def _gram_smprime(SM_prime, block_rows=None):
@@ -2728,11 +2767,18 @@ class _LassoCVIterative:
         lip_full = None
         lip_folds = None
         A_va_list = None
+        # [HARM_DENSE] zero penalty weight == unpenalized column.  With such a
+        # block the Gram path solves the reduced problem (_FreeBlockReduction,
+        # below), which carries its own Lipschitz constant, so lambda_max of the
+        # unreduced Grams -- an O(p^3) eigvalsh per fold -- would never be used.
+        _free = (None if self.penalty_weights is None
+                 else (np.asarray(self.penalty_weights, dtype=np.float64).ravel() == 0.0))
+        _reduce = _free is not None and bool(_free.any())
         if _gram_budget_ok(A):
             try:
                 G_full, b_full, _P = _compute_gram(A, y64)
                 gram_full = (G_full, b_full)
-                lip_full = _top_eigval(G_full)
+                lip_full = None if _reduce else _top_eigval(G_full)
                 gram_folds = []
                 lip_folds = []
                 # [FIX P34] A_va_list holds the K disjoint VALIDATION slices
@@ -2747,7 +2793,7 @@ class _LassoCVIterative:
                     G_va, b_va, _ = _compute_gram(A_va, y64[va])
                     G_tr = G_full - G_va
                     gram_folds.append((G_tr, b_full - b_va))
-                    lip_folds.append(_top_eigval(G_tr))
+                    lip_folds.append(None if _reduce else _top_eigval(G_tr))
                     A_va_list.append(A_va)
                 use_gram = True
                 print("[optimizer] Gram path: G=%dx%d built (PHEASY_GRAM_MAX_GB=%s); "
@@ -2793,12 +2839,11 @@ class _LassoCVIterative:
         # path (each fold on ITS OWN training rows -- no validation leakage, see
         # FIX P28) from that exact solution instead of making the capped CV
         # solves fit the whole harmonic block from zero at the largest alpha.
-        _free = (None if self.penalty_weights is None
-                 else (np.asarray(self.penalty_weights, dtype=np.float64).ravel() == 0.0))
+        # (_free / _reduce are resolved before the Gram build above.)
         red_full = red_folds = None
         _prec = _array_precision(A)
         _no_y = np.zeros(1)
-        if _free is not None and _free.any():
+        if _reduce:
             if use_gram:
                 # Exact elimination of the free block + Jacobi scaling of what is
                 # left (_FreeBlockReduction): FISTA iterates on the penalized
@@ -2808,6 +2853,7 @@ class _LassoCVIterative:
                              for G_tr, b_tr in gram_folds]
                 red_full = _FreeBlockReduction(gram_full[0], gram_full[1], _free,
                                                self.penalty_weights)
+                self._lipschitz = red_full.lipschitz
                 print("[HARM_DENSE] Gram FISTA on the penalized block only: %d free "
                       "columns eliminated exactly (Schur complement), %d penalized "
                       "columns Jacobi-scaled" % (int(_free.sum()), int((~_free).sum())),
