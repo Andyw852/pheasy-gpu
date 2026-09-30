@@ -76,6 +76,22 @@
 #    PHEASY_ALPHA_NMAX=       ALASSO 加权网格格点数硬上限 (默认 200)
 #    PHEASY_ALASSO_GRID_DIAG= 手动网格尺度假错配诊断 rmatvec (默认 1, 仅
 #                              --no-alpha_auto 路径生效)
+#    [FIX CV-RES] 大体系 LASSO/ALASSO "alpha* 永远钉在网格下端" 的修复：
+#    PHEASY_CV_ALPHA_AWARE=1  每个 alpha 的 CV 求解容差 = min(tol, 0.1*该 alpha 的
+#                             L1 惩罚水平)；KKT 残差高于惩罚水平的 alpha 判为"未分辨"
+#                             并排除 (0=回退旧的固定 1e-3 容差)
+#    PHEASY_CV_OLS_REFERENCE=1 用每折精确最小二乘作为 alpha->0 端点；若 OLS 的 CV
+#                             不劣于所有已分辨 alpha，则 alpha_opt=0、直接交付 OLS
+#                             (manifest: cv_selected_ols_limit=true)
+#    PHEASY_CV_FOLD_MODE=contiguous  按构型连续分块的 CV 折 (interleaved=旧
+#                             GroupKFold 轮转发牌；MD 抽帧数据会相邻帧泄漏)
+#    [FIX CV-EXT] CV 曲线在网格下端仍在下降时自动向下延伸网格 (同样的对数密度,
+#                 每折从上一个解热启动), 直到极小值被夹住 / 与 OLS 极限持平 / 预算用完;
+#                 延伸后的 alpha* 若优于 OLS 就是真正的正则化最优, 不再报"等同未正则化"
+#    PHEASY_CV_EXTEND_DECADES=6  最多向下延伸的 decade 数 (0=关闭)
+#    PHEASY_CV_EXTEND_STEP=2     每轮延伸的 decade 数
+#    PHEASY_RIDGE_ALPHA_AUTO=1 RIDGE 网格按 A^T A 谱尺度扩展 (MU_MIN/MU_MAX 区间仍包含在内)
+#    PHEASY_ARD_STD=unit_variance  ARDR/RVM --std 用单位方差 (旧: unit_norm)
 #
 #  示例：
 #    bash pheasy_fit.sh FIT_METHOD=OLS    C3_CUTOFF=5.2

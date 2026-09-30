@@ -338,6 +338,20 @@ def _to_dense_f64(A):
     return np.ascontiguousarray(A, dtype=np.float64)
 
 
+def _dense_for_gpu(A):
+    """[FIX HOST-MEM] dense host array for a GPU solve, in its OWN precision.
+
+    The GPU helpers widen to float64 on the device (gpu_backend._to_torch); the
+    old _to_dense_f64 call made that float64 copy on the HOST first, i.e. an
+    extra 2x of a float32 sensing matrix in RAM for every dense GPU solve.
+    """
+    if sp.issparse(A):
+        return A.toarray()
+    if isinstance(A, np.ndarray):
+        return A
+    return _to_dense_f64(A)
+
+
 def _is_linear_operator(A):
     return (not isinstance(A, np.ndarray)) and (not sp.issparse(A)) and hasattr(A, "matvec")
 
@@ -692,9 +706,9 @@ def derive_alpha_grid(A, y, nalpha=100, decades=4.0, standardize=False,
 def _make_cv_splits(n_samples, cv, random_state=None, group_size=None):
     """Return a list of (train_idx, val_idx) index arrays.
 
-    Identical to core/gpu_backend._make_cv_splits (GPU and CPU CV must agree).
+    core/gpu_backend._make_cv_splits delegates here (GPU and CPU CV must agree).
     """
-    global _WARNED_UNGROUPED_CV, _WARNED_NO_SEED
+    global _WARNED_NO_SEED
     if cv is None or cv <= 1:
         cv = min(3, n_samples)
     cv = int(cv)
@@ -707,6 +721,19 @@ def _make_cv_splits(n_samples, cv, random_state=None, group_size=None):
                 # would leak rows of the same configuration across train/val folds,
                 # silently biasing the CV estimate (FIX P23).
                 eff_cv = int(min(cv, n_groups))
+                if _cv_fold_mode() == "contiguous":
+                    # [FIX CV-FOLD] contiguous blocks of configurations.  sklearn's
+                    # GroupKFold deals equal-size groups out ROUND-ROBIN (fold k =
+                    # configs k, k+K, k+2K, ...), so every validation config has its
+                    # trajectory neighbours in the training set.  Frames cut from an
+                    # MD run (tools/prepare_dataset.py --frac) are correlated over
+                    # the low-frequency periods, so that is the same leak as an
+                    # ungrouped CV one level up: it biases alpha*/ridge toward 0.
+                    fold_of = (np.arange(n_groups) * eff_cv) // n_groups
+                    fold_rows = fold_of[groups]
+                    all_rows = np.arange(n_samples)
+                    return [(all_rows[fold_rows != k], all_rows[fold_rows == k])
+                            for k in range(eff_cv)]
                 gkf = GroupKFold(n_splits=eff_cv)
                 return list(gkf.split(np.zeros(n_samples, dtype=np.int8),
                                       np.zeros(n_samples, dtype=np.int8), groups))
@@ -735,6 +762,294 @@ def _make_cv_splits(n_samples, cv, random_state=None, group_size=None):
             "the fit reproducible.", RuntimeWarning, stacklevel=2)
     kf = KFold(n_splits=cv, shuffle=True, random_state=random_state)
     return list(kf.split(np.arange(n_samples)))
+
+
+def _env_on(name, default):
+    return os.environ.get(name, default).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _cv_fold_mode():
+    """PHEASY_CV_FOLD_MODE: 'contiguous' (default) or 'interleaved' (legacy GroupKFold)."""
+    mode = os.environ.get("PHEASY_CV_FOLD_MODE", "contiguous").strip().lower()
+    if mode not in ("contiguous", "interleaved"):
+        raise ValueError("PHEASY_CV_FOLD_MODE must be 'contiguous' or 'interleaved', got %r"
+                         % mode)
+    return mode
+
+
+# ---------------------------------------------------------------------------
+# [FIX CV-RES] alpha-resolved cross-validation for the FISTA LASSO/ALASSO paths.
+#
+# Every FISTA backend used to stop a CV solve on a RELATIVE KKT residual
+# (max violation / max|A^T y|) of PHEASY_CV_TOL -- 1e-3 on the GPU backends --
+# for EVERY alpha.  The L1 term of alpha, in the same units, is only
+# alpha / alpha_max: 1e-6 at the bottom of a 6-decade grid.  Below
+# alpha ~ cv_tol * alpha_max the stopping test is therefore satisfied by any
+# iterate whose gradient is under the tolerance, whatever alpha is: the
+# warm-started path stops after its 20-iteration check, each grid point just
+# adds another 20 iterations of (accelerated) gradient descent, and the CV MSE
+# falls toward the grid bottom because the ITERATION COUNT grows, not because
+# alpha shrinks.  alpha* then pins to the bottom of any grid (4, 6, 8, 10
+# decades -- as measured on Mg8C120) and the fit is reported as "effectively
+# unregularized" by construction.  In float32 the certificate cannot go below
+# ~1e-4 at all (measured 2.5e-4 on the Mg8C120 operator), so the lower three
+# decades of the default grid are pure optimisation noise.
+#
+# The fix, shared by the resident, the GPU-Gram and the CPU FISTA paths:
+#   * per-alpha tolerance  tol_a = min(tol, rho * alpha*n*q / scale): the KKT
+#     residual must be a fraction rho (PHEASY_CV_ALPHA_TOL_RATIO, 0.1) of the
+#     L1 penalty level itself (q = median penalty weight);
+#   * an (alpha, fold) solve counts as RESOLVED only when its KKT residual is
+#     below the penalty level; after PHEASY_CV_UNRESOLVED_STOP (2) unresolved
+#     alphas in a row a fold stops descending (smaller alphas are harder);
+#   * the alpha -> 0 end is measured EXACTLY: the least-squares fit of every
+#     training fold (Gram solve / CGLS / LSQR) gives the OLS limit of the path;
+#   * alpha* is the CV minimum over the resolved alphas plus that OLS limit.
+# When the OLS limit wins, the data support no L1 penalty and the model is
+# returned as OLS with alpha_ = 0 -- a certified conclusion instead of an
+# iteration-count artefact.  PHEASY_LASSO_1SE=1 picks the sparsest resolved
+# alpha within one standard error.  PHEASY_CV_ALPHA_AWARE=0 restores the old
+# behaviour.
+# ---------------------------------------------------------------------------
+def _cv_alpha_aware_cfg():
+    """(enabled, rho, unresolved_stop, ols_reference) for the resolved CV."""
+    on = _env_on("PHEASY_CV_ALPHA_AWARE", "1")
+    rho = float(os.environ.get("PHEASY_CV_ALPHA_TOL_RATIO", "0.1"))
+    if not (np.isfinite(rho) and 0.0 < rho <= 1.0):
+        raise ValueError("PHEASY_CV_ALPHA_TOL_RATIO must be in (0, 1], got %r" % rho)
+    stop = max(1, int(os.environ.get("PHEASY_CV_UNRESOLVED_STOP", "2")))
+    ols = on and _env_on("PHEASY_CV_OLS_REFERENCE", "1")
+    return on, rho, stop, ols
+
+
+def _cv_extend_cfg():
+    """[FIX CV-EXT] (max_decades, step_decades) for extending the grid DOWNWARD.
+
+    When the CV curve is still falling at the smallest grid alpha, the grid
+    stopped too early (ALASSO in particular -- its weights reach 1/eps, so its
+    path needs many decades to reach OLS), and the reported "effectively
+    unregularized" verdict was a property of the grid, not of the data.  The CV
+    then continues each fold's warm-start chain PHEASY_CV_EXTEND_STEP (2) decades
+    at a time, up to PHEASY_CV_EXTEND_DECADES (6) below the original grid, until
+    the minimum is interior, the curve has flattened onto the exact OLS limit,
+    or the solver can no longer resolve the alphas; only then is it compared
+    with the OLS limit.  Auto grids only (the OLS reference is on).  0 disables.
+    """
+    return (max(0.0, float(os.environ.get("PHEASY_CV_EXTEND_DECADES", "6"))),
+            max(0.5, float(os.environ.get("PHEASY_CV_EXTEND_STEP", "2"))))
+
+
+def _extension_grid(alphas, step_decades):
+    """Alphas strictly below min(alphas), same log density, spanning step decades."""
+    a = np.sort(np.asarray(alphas, dtype=np.float64))
+    lo, hi = float(a[0]), float(a[-1])
+    per_dec = ((a.size - 1) / np.log10(hi / lo)) if (a.size > 1 and hi > lo) else 4.0
+    n = max(2, int(np.ceil(step_decades * per_dec)))
+    new = np.logspace(np.log10(lo) - step_decades, np.log10(lo), n + 1)[:-1]
+    return new[new < lo * (1.0 - 1e-12)]
+
+
+def _cv_plateau_rtol():
+    """[FIX CV-RES] PHEASY_CV_PLATEAU_RTOL (1e-5): a fold stops descending once its
+    validation MSE changed by less than this (relative) over two consecutive
+    RESOLVED alphas.  The rest of the path is then the alpha -> 0 plateau, which
+    the exact OLS reference already represents (only used when it is on).
+    0 disables."""
+    return max(0.0, float(os.environ.get("PHEASY_CV_PLATEAU_RTOL", "1e-5")))
+
+
+def _plateau_step(state, mse, resolved, rtol):
+    """Update a fold's plateau state [prev_mse, flat_count]; True = stop."""
+    if rtol <= 0 or not resolved or not np.isfinite(mse):
+        state[0], state[1] = (mse if resolved else None), 0
+        return False
+    prev = state[0]
+    if prev is not None and abs(mse - prev) <= rtol * max(abs(prev), np.finfo(float).tiny):
+        state[1] += 1
+    else:
+        state[1] = 0
+    state[0] = mse
+    return state[1] >= 2
+
+
+def _penalty_ref(penalty_weights):
+    """Typical per-column L1 weight: median of the positive weights (1 if none)."""
+    if penalty_weights is None:
+        return 1.0
+    w = np.asarray(penalty_weights, dtype=np.float64).ravel()
+    w = w[np.isfinite(w) & (w > 0)]
+    return float(np.median(w)) if w.size else 1.0
+
+
+def _alpha_tolerance(tol, alpha, n_samples, pen_q, kkt_scale, rho):
+    """(tol_alpha, penalty_relative) -- see the [FIX CV-RES] block above."""
+    pen_rel = float(alpha) * float(n_samples) * float(pen_q) / max(float(kkt_scale),
+                                                                  np.finfo(float).tiny)
+    if rho is None:
+        return float(tol), pen_rel
+    return min(float(tol), float(rho) * pen_rel), pen_rel
+
+
+def _select_cv_alpha(alphas, mse_path, resolved, ols_mse=None, label="[CV]",
+                     quiet=False):
+    """[FIX CV-RES] alpha* from the RESOLVED part of the path plus the OLS limit.
+
+    alphas    ascending grid (n_alpha,)
+    mse_path  (n_alpha, K) validation MSE, NaN where a fold skipped the alpha
+    resolved  (n_alpha, K) bool, True when the fold solve's KKT residual was
+              below the L1 penalty level (the solution reflects alpha)
+    ols_mse   (K,) validation MSE of the per-fold least-squares fit (the
+              alpha -> 0 limit), or None / non-finite entries when unavailable
+
+    Returns a dict with best (index, or -1 for the OLS limit), valid (mask of
+    alphas resolved in every fold), at_min / at_max / flat flags and the means.
+    """
+    alphas = np.asarray(alphas, dtype=np.float64)
+    mse = np.asarray(mse_path, dtype=np.float64)
+    res = np.asarray(resolved, dtype=bool)
+    n_alpha, n_fold = mse.shape
+    valid = res.all(axis=1) & np.isfinite(mse).all(axis=1)
+    means = np.full(n_alpha, np.nan)
+    means[valid] = mse[valid].mean(axis=1)
+    ols = None
+    if ols_mse is not None:
+        _o = np.asarray(ols_mse, dtype=np.float64).ravel()
+        if _o.size == n_fold and np.isfinite(_o).all():
+            ols = _o
+    rtol = float(os.environ.get("PHEASY_LASSO_TIE_RTOL", "1e-9"))
+    out = {"valid": valid, "means": means, "ols_mean": None if ols is None else float(ols.mean()),
+           "best": None, "at_min": False, "at_max": False, "flat": False,
+           "n_valid": int(valid.sum()), "fallback": False}
+    if not valid.any() and ols is None:
+        # Nothing was resolved and there is no exact reference: keep the old
+        # plain argmin over whatever finite means exist, and say so loudly.
+        finite = np.isfinite(mse).all(axis=1)
+        if not finite.any():
+            raise RuntimeError("%s no alpha produced a finite CV score" % label)
+        fm = np.full(n_alpha, np.inf)
+        fm[finite] = mse[finite].mean(axis=1)
+        best = int(np.flatnonzero(fm <= fm.min() * (1.0 + rtol) + 1e-300)[0])
+        out.update(best=best, fallback=True, at_min=(best == int(np.flatnonzero(finite)[0])),
+                   at_max=(best == n_alpha - 1), means=np.where(finite, fm, np.nan))
+        print("%s WARNING: no alpha was RESOLVED in every fold (every KKT residual "
+              "stayed above its L1 penalty).  alpha* = %.3e is the plain argmin and is "
+              "not a CV conclusion; raise PHEASY_CV_MAX_ITER (or use --std)."
+              % (label, alphas[best]), flush=True)
+        return out
+    vidx = np.flatnonzero(valid)
+    if vidx.size:
+        vm = means[vidx]
+        m_best = float(vm.min())
+        tied = vidx[vm <= m_best * (1.0 + rtol) + 1e-300]
+        best = int(tied.min())                    # ties -> smallest alpha
+        out["flat"] = bool(tied.size > 1)
+    else:
+        best, m_best = None, np.inf
+    grid_best = best                              # argmin over the grid alone
+    if ols is not None and float(ols.mean()) <= m_best * (1.0 + rtol) + 1e-300:
+        best = -1                                   # OLS limit wins (ties included)
+    ref_row = ols if best == -1 else mse[best]
+    ref_mean = float(ref_row.mean())
+    cv_best = best
+    if _env_on("PHEASY_LASSO_1SE", "0") and vidx.size:
+        se = float(ref_row.std(ddof=1) / np.sqrt(n_fold)) if n_fold > 1 else 0.0
+        cand = vidx[means[vidx] <= ref_mean + se]
+        if cand.size:
+            new_best = int(cand.max())
+            if new_best != best:
+                print("%s PHEASY_LASSO_1SE: alpha* %s -> %.6e (1 SE = %.3e above the CV "
+                      "minimum)" % (label, "0 (OLS limit)" if best == -1 else
+                                    "%.6e" % alphas[best], alphas[new_best], se), flush=True)
+            best = new_best
+    lo_valid = int(vidx.min()) if vidx.size else None
+    out["best"] = best
+    out["one_se"] = bool(best != cv_best)
+    # [FIX CV-EXT] the curve is still falling at the very first grid point: the
+    # grid should go further down -- whether or not that point beats OLS yet (a
+    # shallow minimum far below can beat both the grid bottom and the OLS limit).
+    # Only for an auto grid, i.e. when the OLS reference is in play.
+    out["extend"] = bool(grid_best is not None and grid_best == 0 and valid[0]
+                         and ols is not None)
+    out["bracketed"] = bool(ols is not None and cv_best is not None and cv_best >= 0
+                            and lo_valid is not None and cv_best == lo_valid)
+    out["at_min"] = bool(best == -1 or (ols is None and lo_valid is not None
+                                         and best == lo_valid))
+    out["at_max"] = bool(best is not None and best >= 0 and best == n_alpha - 1)
+    if quiet:
+        return out
+    n_unres = int(n_alpha - vidx.size)
+    if vidx.size:
+        print("%s alpha-resolved CV: %d of %d grid alphas resolved in all %d folds "
+              "(resolved range %.3e .. %.3e)%s"
+              % (label, vidx.size, n_alpha, n_fold, alphas[vidx.min()], alphas[vidx.max()],
+                 ("; %d alphas were not resolved in every fold (KKT residual above "
+                  "the L1 penalty, i.e. the solver cannot tell them apart, or skipped "
+                  "on the converged alpha -> 0 plateau that the OLS limit represents) "
+                  "and are excluded" % n_unres)
+                 if n_unres else ""), flush=True)
+    if ols is not None:
+        print("%s OLS limit (alpha -> 0, exact least squares per fold): CV MSE %.6e%s"
+              % (label, float(ols.mean()),
+                 (" | best resolved alpha %.3e: CV MSE %.6e" % (alphas[vidx[np.argmin(means[vidx])]],
+                                                               float(np.nanmin(means[vidx]))))
+                 if vidx.size else ""), flush=True)
+    if out["one_se"]:
+        print("%s alpha* = %.6e chosen by the one-standard-error rule (CV minimum: %s)"
+              % (label, alphas[best], "the OLS limit" if cv_best == -1 else
+                 "alpha %.3e" % alphas[cv_best]), flush=True)
+    elif best == -1:
+        print("%s alpha* = 0: the unregularized (OLS) limit cross-validates at least as "
+              "well as every resolved alpha, so the data support NO L1 penalty.  The "
+              "fit is returned as OLS (a CV conclusion, not an optimiser artefact).  "
+              "PHEASY_LASSO_1SE=1 selects the sparsest resolved alpha within one "
+              "standard error instead." % label, flush=True)
+    elif out["at_min"]:
+        print("%s WARNING: alpha* %.3e is the smallest RESOLVED alpha and no OLS "
+              "reference was computed; the CV optimum may lie below it."
+              % (label, alphas[best]), flush=True)
+    elif ols is not None and lo_valid is not None and best == lo_valid:
+        print("%s alpha* %.3e is the smallest resolved alpha and beats the OLS limit: "
+              "the optimum is bracketed in (0, %.3e] -- a regularized optimum, not an "
+              "unregularized fit (the grid could not go lower: extension budget "
+              "PHEASY_CV_EXTEND_DECADES used up, or smaller alphas are below the "
+              "solver's resolution)." % (label, alphas[best], alphas[best]),
+              flush=True)
+    elif out["at_max"]:
+        print("%s WARNING: alpha* %.3e sits at the TOP of the grid (every penalized "
+              "coefficient is zero there)." % (label, alphas[best]), flush=True)
+    else:
+        print("%s alpha* = %.6e (interior of the resolved range)" % (label, alphas[best]),
+              flush=True)
+    return out
+
+
+def _gram_ols(G, b):
+    """Least-squares solution from normal equations G x = b (PSD G)."""
+    G = np.asarray(G, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64).ravel()
+    try:
+        cf = spla.cho_factor(G, check_finite=False)
+        x = spla.cho_solve(cf, b, check_finite=False)
+        if np.isfinite(x).all():
+            return x
+    except (np.linalg.LinAlgError, ValueError):
+        pass
+    # rank deficient (e.g. an underdetermined training fold): min-norm solution
+    w, V = np.linalg.eigh(0.5 * (G + G.T))
+    cut = max(float(w.max(initial=0.0)), 0.0) * G.shape[0] * np.finfo(float).eps
+    winv = np.where(w > cut, 1.0 / np.where(w > cut, w, 1.0), 0.0)
+    return V @ (winv * (V.T @ b))
+
+
+def _dense_ols_fold_mse(A, y, splits):
+    """Validation MSE of the per-fold least-squares fit (dense / sparse input)."""
+    y64 = np.asarray(y, dtype=np.float64).ravel()
+    out = np.zeros(len(splits))
+    for k, (tr, va) in enumerate(splits):
+        coef = _solve_lstsq(A[tr], y64[tr])
+        pred = np.asarray(A[va] @ coef, dtype=np.float64).ravel()
+        out[k] = float(np.mean((pred - y64[va]) ** 2))
+    return out
 
 
 def _iterative_solver_info(result, solver):
@@ -944,6 +1259,25 @@ def _lasso_backend(A):
     if sp.issparse(A) and not _should_densify_sparse(A):
         return "iterative"
     if _gpu_dense(A) and os.environ.get("PHEASY_GPU_LASSO", "1").lower() not in ("0", "false", "no", "off"):
+        # [FIX GPU-MEM] _gpu_dense only budgets 4 n p (a dense lstsq).  The GPU
+        # LASSO also holds p x p Grams, which dominate for wide problems, so a
+        # fit that passed _gpu_dense could still die of CUDA OOM mid-CV.
+        gb = _gpu()
+        try:
+            need = gb.lasso_gram_footprint_bytes(*A.shape)
+            avail = gb.available_memory_bytes()
+        except Exception:
+            need = avail = None
+        frac = float(os.environ.get("PHEASY_GPU_MEM_FRACTION", "0.8"))
+        if need is not None and avail is not None and need > avail * frac:
+            msg = ("GPU LASSO (dense Gram) needs ~%.1f GB of VRAM (A + p x p Grams, "
+                   "n=%d p=%d) but the budget is %.1f GB; use the two-level "
+                   "resident path (PHEASY_LASSO_TWOLEVEL=1, matrix-free) for this size"
+                   % (need / 1e9, A.shape[0], A.shape[1], avail * frac / 1e9))
+            if _gpu_required():
+                raise MemoryError(msg)
+            print("[optimizer] %s; running the CPU LASSO instead" % msg, flush=True)
+            return "dense"
         return "gpu"
     return "dense"
 
@@ -953,7 +1287,7 @@ def _solve_lstsq(A, y, driver="gelsd"):
     if _is_linear_operator(A):
         return _solve_sparse_lsqr(A, y)
     if _gpu_dense(A):
-        return np.asarray(_gpu().lstsq(_to_dense_f64(A), y), dtype=np.float64)
+        return np.asarray(_gpu().lstsq(_dense_for_gpu(A), y), dtype=np.float64)
     if sp.issparse(A) and not _should_densify_sparse(A):
         return _solve_sparse_lsqr(A, y)
     A64 = _to_dense_f64(A)
@@ -1075,7 +1409,7 @@ def _solve_qr(A, y, block_rows=None, diag_floor=1e-12):
         if (os.environ.get("PHEASY_GPU_TSQR", "0").lower() in ("1", "true", "yes", "on")
                 and _gpu_dense(A)):
             try:
-                coef, _gpu_info = _gpu().gpu_tsqr(_to_dense_f64(A), y, int(block_rows), diag_floor)
+                coef, _gpu_info = _gpu().gpu_tsqr(_dense_for_gpu(A), y, int(block_rows), diag_floor)
                 return np.asarray(coef, dtype=np.float64)
             except (RuntimeError, MemoryError, np.linalg.LinAlgError) as exc:
                 if _gpu_required():
@@ -1092,7 +1426,7 @@ def _solve_qr(A, y, block_rows=None, diag_floor=1e-12):
             return coef
         return _solve_lstsq(A, y)     # rank deficient / wide -> SVD
     if _gpu_dense(A):
-        return np.asarray(_gpu().qr_solve(_to_dense_f64(A), y), dtype=np.float64)
+        return np.asarray(_gpu().qr_solve(_dense_for_gpu(A), y), dtype=np.float64)
     A64 = _to_dense_f64(A)
     y64 = np.asarray(y, dtype=np.float64).ravel()
     Q, R = spla.qr(A64, mode="economic", check_finite=False)
@@ -1451,8 +1785,13 @@ def _build_gram_matrix(A, y64, budget_gb=None, force_block=False):
 def _fista_lasso(A, y, alpha, x0=None, max_iter=3000, tol=1e-7,
                  lipschitz=None, penalty_weights=None, _info=None,
                  gram=None, n_samples=None, warn_nonconvergence=True,
-                 auto_floor=None):
+                 auto_floor=None, alpha_tol_ratio=None):
     """Solve min 0.5||A x - y||^2 + alpha * sum_j w_j |x_j| via FISTA.
+
+    alpha_tol_ratio ([FIX CV-RES]): when set, the stopping tolerance becomes
+    min(tol, ratio * alpha*n*q / max|A^T y|) -- a fraction of the L1 penalty
+    level -- and the KKT test runs every 20 iterations; _info then reports
+    penalty_relative and resolved (KKT residual below the penalty level).
 
     [FIX P26] Matvec-only LASSO so LASSO / ALASSO can run on a TwoLevelSM /
     LinearOperator and on genuinely-huge sparse matrices without ever
@@ -1510,6 +1849,10 @@ def _fista_lasso(A, y, alpha, x0=None, max_iter=3000, tol=1e-7,
     # columns. Check the L1 KKT residual at the actual iterate, not momentum z.
     rhs = np.asarray(b if gram is not None else A.T @ y64, dtype=np.float64).ravel()
     kkt_scale = max(float(np.max(np.abs(rhs), initial=0.0)), np.finfo(float).tiny)
+    # [FIX CV-RES] the tolerance must resolve the L1 term of THIS alpha
+    _aware = alpha_tol_ratio is not None
+    tol, _pen_rel = _alpha_tolerance(tol, alpha, n_samples, _penalty_ref(penalty_weights),
+                                     kkt_scale, alpha_tol_ratio)
     penalty = float(alpha) * n_samples
     if penalty_weights is not None:
         penalty = penalty * np.asarray(penalty_weights, dtype=np.float64).ravel()
@@ -1575,7 +1918,7 @@ def _fista_lasso(A, y, alpha, x0=None, max_iter=3000, tol=1e-7,
         if it % 20 == 19:
             dx = float(np.linalg.norm(x - x_prev))
             small_step = dx <= tol_eff * max(1.0, float(np.linalg.norm(x)))
-            if small_step or _valve:
+            if small_step or _valve or _aware:
                 kkt = kkt_relative(x)
                 if np.isfinite(kkt) and kkt <= tol_eff:
                     converged = True
@@ -1661,7 +2004,8 @@ def _fista_lasso(A, y, alpha, x0=None, max_iter=3000, tol=1e-7,
         _info.update(n_iter=n_iter, converged=converged, kkt_relative=kkt,
                      stop_reason=stop_reason, tol_requested=tol_requested,
                      tol_effective=tol_eff, measured_floor=measured_floor,
-                     stall_points=int(_stall_limit))
+                     stall_points=int(_stall_limit), penalty_relative=_pen_rel,
+                     resolved=bool(np.isfinite(kkt) and kkt <= _pen_rel))
     if not converged and warn_nonconvergence:
         # CV folds pass warn_nonconvergence=False and report ONE aggregated line
         # instead: a ranking-only solve that stops at the cap is not the same
@@ -2114,7 +2458,7 @@ def _ridge_solve(A, y, alpha, x0=None):
                  "yes" if x0 is not None else "no", _tr.time() - _t_r), flush=True)
         return np.asarray(res[0], dtype=np.float64)
     if _gpu_dense(A):
-        return np.asarray(_gpu().ridge_solve(_to_dense_f64(A), y64, alpha), dtype=np.float64)
+        return np.asarray(_gpu().ridge_solve(_dense_for_gpu(A), y64, alpha), dtype=np.float64)
     if alpha > 0:
         ridge = Ridge(alpha=alpha, fit_intercept=False, solver="auto")
         ridge.fit(A, y64)
@@ -2190,7 +2534,7 @@ def _solve_subset(A, y, row_idx, col_idx, ridge_alpha=0.0, qr=False,
     if ridge_alpha > 0:
         # Dense subset ridge solves use the CUDA backend when the block fits.
         if _gpu_dense(A_sub):
-            return np.asarray(_gpu().ridge_solve(_to_dense_f64(A_sub), y_sub, ridge_alpha), dtype=np.float64)
+            return np.asarray(_gpu().ridge_solve(_dense_for_gpu(A_sub), y_sub, ridge_alpha), dtype=np.float64)
         ridge = Ridge(alpha=ridge_alpha, fit_intercept=False, solver="lsqr")
         ridge.fit(A_sub, y_sub)
         return ridge.coef_
@@ -2198,7 +2542,7 @@ def _solve_subset(A, y, row_idx, col_idx, ridge_alpha=0.0, qr=False,
         # RFE ranks features by |coef|*||col||; QR (gels) is backward-stable for
         # full-rank subsets and ~50x faster than the SVD on the 3090. The SVD
         # fallback inside qr_solve catches rank-deficient subsets.
-        return np.asarray(_gpu().qr_solve(_to_dense_f64(A_sub), y_sub), dtype=np.float64)
+        return np.asarray(_gpu().qr_solve(_dense_for_gpu(A_sub), y_sub), dtype=np.float64)
     if qr:
         # [FIX P45] TSQR only pays off when the dense block does not fit in
         # memory. On a small matrix (the common case) the whole thing is one
@@ -2224,7 +2568,7 @@ def _predict_subset(A, col_idx, row_idx, coef):
         A_sub = A_sub[row_idx]
     # CV prediction is also accelerated for dense blocks that fit on CUDA.
     if _gpu_dense(A_sub):
-        return np.asarray(_gpu().predict(_to_dense_f64(A_sub), np.asarray(coef, dtype=np.float64)), dtype=np.float64).ravel()
+        return np.asarray(_gpu().predict(_dense_for_gpu(A_sub), np.asarray(coef, dtype=np.float64)), dtype=np.float64).ravel()
     return np.asarray(A_sub @ coef).ravel()
 
 
@@ -2543,7 +2887,8 @@ class TwoLevelSM(LinearOperator):
 
 
 
-def _reselect_alpha(model, A, y, sample_weight=None, grid_diag=None):
+def _reselect_alpha(model, A, y, sample_weight=None, grid_diag=None,
+                    edge_messages=True):
     """[FIX P10] Re-pick alpha from the CV path and refit if it changed.
 
     Two problems with sklearn's plain ``argmin`` here:
@@ -2610,7 +2955,9 @@ def _reselect_alpha(model, A, y, sample_weight=None, grid_diag=None):
         model._alpha_at_min and tied.size > 1
         and float(alphas[tied].min()) <= float(alphas.min()) * (1.0 + 1e-12))
     model._alpha_at_min_hitcap = model._alpha_at_min and _hit_cap
-    if model._alpha_at_min:
+    # [FIX CV-EXT] with the OLS limit in hand the caller decides the verdict: a
+    # pinned alpha* that BEATS OLS is bracketed, not "effectively unregularized".
+    if model._alpha_at_min and edge_messages:
         if grid_diag:
             print("[CV] WARNING: alpha* %.3e sits at the grid MINIMUM; %s"
                   % (new_alpha, grid_diag), flush=True)
@@ -2699,6 +3046,16 @@ def _predict_rows(A, coef, rows):
     use it when present and keep the full matvec as the fallback.
     """
     rows = np.asarray(rows, dtype=np.intp)
+    if getattr(A, "_gpu_ridge_op", None) is not None:
+        # [FIX GPU-PRED] the operator already owns resident factors (RIDGE
+        # pre-warms them): predict THROUGH them.  A column-scaled wrapper (--std
+        # -> _scale_operator) has no row_slice, so every (alpha, fold) used to
+        # fall to the full HOST SpMV below -- nnz(SM_prime) of CPU work per call
+        # in the middle of a GPU RIDGE sweep.
+        try:
+            return np.asarray(_row_slice(A, rows) @ coef, dtype=np.float64).ravel()
+        except Exception:
+            pass
     slicer = getattr(A, "row_slice", None)
     if callable(slicer):
         try:
@@ -2723,7 +3080,10 @@ class _LassoCVIterative:
     """
     def __init__(self, alphas, cv, tol, max_iter, rand_seed, n_jobs=None,
                  fit_intercept=False, group_size=None, selection="cyclic",
-                 penalty_weights=None, grid_diag=None):
+                 penalty_weights=None, grid_diag=None, ols_reference=False):
+        # [FIX CV-RES] compare the path with its exact alpha -> 0 end.  Off for
+        # direct use; Optimizer switches it on for AUTO grids (ols_limit).
+        self.ols_reference = bool(ols_reference)
         # [FIX P40] sort ascending: the alpha walk assumes smallest-first and
         # the grid-MINIMUM edge check (best_i == 0) depends on it. Callers pass
         # logspace/derive grids that are ascending, but be explicit rather than
@@ -2831,7 +3191,6 @@ class _LassoCVIterative:
             A_folds = [_row_slice(A, tr) if _is_linear_operator(A) else A[tr]
                        for tr, _ in splits]
 
-        mse_path = np.zeros((n_alphas, len(splits)))
         x_folds = [None] * len(splits)   # [FIX P28] per-fold warm-start
         x_full = None                    # full-data warm-start for the alpha path
         # [HARM_DENSE] with an unpenalized block x = 0 is no longer the solution
@@ -2869,12 +3228,19 @@ class _LassoCVIterative:
                 x_full[_fidx] = _free_block_ols(A, y64, _free)[0]
                 print("[HARM_DENSE] FISTA paths warm-started from the unpenalized-block "
                       "OLS (%d free columns, LSMR)" % int(_free.sum()), flush=True)
-        best_i = 0
-        best_mean = float("inf")
-        best_x = None
-        # [FIX P43] track the max FISTA iterations used by the CV solves so a flat
-        # tail can be attributed to hitting cv_max_iter (convergence) vs a genuinely
-        # flat curve (converged).
+        # [FIX CV-RES] alpha-resolved CV: per-alpha tolerance, resolution
+        # bookkeeping, early stop below the solver's resolution, exact OLS limit.
+        _aware, _rho, _stop_after, _ols_on = _cv_alpha_aware_cfg()
+        _ols_on = _ols_on and self.ols_reference
+        _ratio = _rho if _aware else None
+        n_folds = len(splits)
+        mse_path = np.full((n_alphas, n_folds), np.nan)
+        resolved = np.zeros((n_alphas, n_folds), dtype=bool)
+        fold_stopped = [False] * n_folds
+        fold_unres = [0] * n_folds
+        _prtol = _cv_plateau_rtol() if (_aware and _ols_on) else 0.0
+        fold_plateau = [[None, 0] for _ in range(n_folds)]
+        x_path = {}              # full-data path iterate per alpha index (warm start)
         _cv_info = {}
         _cv_max_n_iter = 0
         # [D1] "hit the cap" must mean "hit the cap WITHOUT converging" (the
@@ -2882,236 +3248,253 @@ class _LassoCVIterative:
         _cv_hit_cap = False
         _cv_max_kkt = 0.0
 
-        n_jobs = min(self.n_jobs, len(splits))
-        for a_i in range(n_alphas - 1, -1, -1):  # descending: large alpha first
-            alpha = float(self.alphas[a_i])
+        n_jobs = min(self.n_jobs, n_folds)
+        x_full_box = [x_full]
 
-            # [FIX P45] the alpha path is a warm-start chain (each fold's
-            # solution seeds the next alpha), so only FOLDS -- never alphas --
-            # may run in parallel. Each fold reads/writes its own x_folds[k] and
-            # its own _info dict, so the workers share no mutable state.
-            def _fold_fit(k):
-                tr, va = splits[k]
-                info = {}
-                if red_folds is not None:
-                    # [HARM_DENSE] reduced problem; the warm start carried in
-                    # x_folds[k] is the reduced (scaled) vector z.
-                    red = red_folds[k]
-                    coef = _fista_lasso(_GramShape(len(tr), red.P.size, _prec), _no_y,
-                                        alpha, x0=x_folds[k],
-                                        max_iter=cv_max_iter, tol=cv_tol,
-                                        lipschitz=red.lipschitz,
-                                        penalty_weights=red.w,
-                                        gram=(red.S, red.s),
-                                        n_samples=len(tr), _info=info,
-                                        warn_nonconvergence=False,
-                                        auto_floor=False)
-                    pred = np.asarray(A_va_list[k] @ red.to_full(coef),
-                                      dtype=np.float64).ravel()
-                elif use_gram:
-                    # [FIX P34] the Gram encodes A[tr], so pass the TRAIN fold's
-                    # row count: the L1 threshold is (n_tr * alpha), not
-                    # (n_full * alpha) -- otherwise the fold fits at ~(K/(K-1))x
-                    # the intended effective alpha.
-                    coef = _fista_lasso(A, y64, alpha, x0=x_folds[k],
-                                        max_iter=cv_max_iter, tol=cv_tol,
-                                        lipschitz=lip_folds[k],
-                                        penalty_weights=self.penalty_weights,
-                                        gram=gram_folds[k],
-                                        n_samples=len(tr), _info=info,
-                                        warn_nonconvergence=False,
-                                        auto_floor=False)
-                    pred = np.asarray(A_va_list[k] @ coef, dtype=np.float64).ravel()
-                else:
-                    if A_folds is not None:
-                        A_tr = A_folds[k]
+        def _walk(alphas_desc, mse_rows, res_rows):
+            """One step of every fold's warm-start chain per alpha (descending);
+            rows are aligned with alphas_desc.  [FIX CV-EXT] callable again to
+            CONTINUE the chains below the grid."""
+            nonlocal _cv_max_n_iter, _cv_hit_cap, _cv_max_kkt
+            x_full = x_full_box[0]
+            for a_j, alpha in enumerate(alphas_desc):  # descending: large alpha first
+                if _aware and all(fold_stopped):
+                    break
+                alpha = float(alpha)
+
+                # [FIX P45] the alpha path is a warm-start chain (each fold's
+                # solution seeds the next alpha), so only FOLDS -- never alphas --
+                # may run in parallel. Each fold reads/writes its own x_folds[k] and
+                # its own _info dict, so the workers share no mutable state.
+                def _fold_fit(k):
+                    if fold_stopped[k]:
+                        return None
+                    tr, va = splits[k]
+                    info = {}
+                    if red_folds is not None:
+                        # [HARM_DENSE] reduced problem; the warm start carried in
+                        # x_folds[k] is the reduced (scaled) vector z.
+                        red = red_folds[k]
+                        coef = _fista_lasso(_GramShape(len(tr), red.P.size, _prec), _no_y,
+                                            alpha, x0=x_folds[k],
+                                            max_iter=cv_max_iter, tol=cv_tol,
+                                            lipschitz=red.lipschitz,
+                                            penalty_weights=red.w,
+                                            gram=(red.S, red.s),
+                                            n_samples=len(tr), _info=info,
+                                            warn_nonconvergence=False,
+                                            auto_floor=False, alpha_tol_ratio=_ratio)
+                        pred = np.asarray(A_va_list[k] @ red.to_full(coef),
+                                          dtype=np.float64).ravel()
+                    elif use_gram:
+                        # [FIX P34] the Gram encodes A[tr], so pass the TRAIN fold's
+                        # row count: the L1 threshold is (n_tr * alpha), not
+                        # (n_full * alpha) -- otherwise the fold fits at ~(K/(K-1))x
+                        # the intended effective alpha.
+                        coef = _fista_lasso(A, y64, alpha, x0=x_folds[k],
+                                            max_iter=cv_max_iter, tol=cv_tol,
+                                            lipschitz=lip_folds[k],
+                                            penalty_weights=self.penalty_weights,
+                                            gram=gram_folds[k],
+                                            n_samples=len(tr), _info=info,
+                                            warn_nonconvergence=False,
+                                            auto_floor=False, alpha_tol_ratio=_ratio)
+                        pred = np.asarray(A_va_list[k] @ coef, dtype=np.float64).ravel()
                     else:
-                        A_tr = _row_slice(A, tr) if _is_linear_operator(A) else A[tr]
-                    # [FIX P28] warm-start from THIS fold's previous-alpha solution,
-                    # not the full-data solution: with a loose CV budget the warm
-                    # start does not fully wash out, so x_full would leak the
-                    # validation rows into the fold fit and bias CV low.
-                    coef = _fista_lasso(A_tr, y64[tr], alpha, x0=x_folds[k],
-                                        max_iter=cv_max_iter, tol=cv_tol,
-                                        lipschitz=self._lipschitz,
-                                        penalty_weights=self.penalty_weights,
-                                        _info=info, warn_nonconvergence=False,
-                                        auto_floor=False)
-                    pred = _predict_rows(A, coef, va)
-                err = pred - y64[va]
-                return (float(np.mean(err * err)), coef, int(info.get("n_iter", 0)),
-                        bool(info.get("converged", False)),
-                        float(info.get("kkt_relative", float("nan"))))
+                        if A_folds is not None:
+                            A_tr = A_folds[k]
+                        else:
+                            A_tr = _row_slice(A, tr) if _is_linear_operator(A) else A[tr]
+                        # [FIX P28] warm-start from THIS fold's previous-alpha solution,
+                        # not the full-data solution: with a loose CV budget the warm
+                        # start does not fully wash out, so x_full would leak the
+                        # validation rows into the fold fit and bias CV low.
+                        coef = _fista_lasso(A_tr, y64[tr], alpha, x0=x_folds[k],
+                                            max_iter=cv_max_iter, tol=cv_tol,
+                                            lipschitz=self._lipschitz,
+                                            penalty_weights=self.penalty_weights,
+                                            _info=info, warn_nonconvergence=False,
+                                            auto_floor=False, alpha_tol_ratio=_ratio)
+                        pred = _predict_rows(A, coef, va)
+                    err = pred - y64[va]
+                    return (float(np.mean(err * err)), coef, int(info.get("n_iter", 0)),
+                            bool(info.get("converged", False)),
+                            float(info.get("kkt_relative", float("nan"))),
+                            bool(info.get("resolved", True)))
 
-            if n_jobs > 1:
-                from joblib import Parallel, delayed
-                with _blas_limit(n_jobs):
-                    results = Parallel(n_jobs=n_jobs, prefer="threads")(
-                        delayed(_fold_fit)(k) for k in range(len(splits)))
-            else:
-                results = [_fold_fit(k) for k in range(len(splits))]
-            fold_mse = np.zeros(len(splits))
-            for k, (mse_k, coef, n_it, conv_k, kkt_k) in enumerate(results):
-                fold_mse[k] = mse_k
-                x_folds[k] = coef
-                _cv_max_n_iter = max(_cv_max_n_iter, n_it)
-                if np.isfinite(kkt_k):
-                    _cv_max_kkt = max(_cv_max_kkt, kkt_k)
-                if n_it >= cv_max_iter and not conv_k:
-                    _cv_hit_cap = True
-            mse_path[a_i] = fold_mse
-            mean = float(fold_mse.mean())
-            # warm-start the next (smaller) alpha from this alpha's full fit
-            if red_full is not None:
-                x_full = _fista_lasso(_GramShape(A.shape[0], red_full.P.size, _prec),
-                                      _no_y, alpha, x0=x_full,
-                                      max_iter=cv_max_iter, tol=cv_tol,
-                                      lipschitz=red_full.lipschitz,
-                                      penalty_weights=red_full.w,
-                                      gram=(red_full.S, red_full.s),
-                                      n_samples=A.shape[0], _info=_cv_info,
-                                      warn_nonconvergence=False,
-                                      auto_floor=False)
-            elif use_gram:
-                x_full = _fista_lasso(A, y64, alpha, x0=x_full,
-                                      max_iter=cv_max_iter, tol=cv_tol,
-                                      lipschitz=lip_full,
-                                      penalty_weights=self.penalty_weights,
-                                      gram=gram_full, _info=_cv_info,
-                                      warn_nonconvergence=False,
-                                      auto_floor=False)
-            else:
-                x_full = _fista_lasso(A, y64, alpha, x0=x_full,
-                                      max_iter=cv_max_iter, tol=cv_tol,
-                                      lipschitz=self._lipschitz,
-                                      penalty_weights=self.penalty_weights,
-                                      _info=_cv_info, warn_nonconvergence=False,
-                                      auto_floor=False)
-            # The full-data warm-start solve also reports n_iter; it feeds the
-            # "max iterations" message but must NOT set the hit-cap flag: that
-            # flag is the CONVERGENCE diagnosis for the CV solves themselves.
-            _cv_max_n_iter = max(_cv_max_n_iter, _cv_info.get("n_iter", 0))
-            # [FIX P27] <= (not <) so a tie picks the SMALLEST alpha (the one
-            # seen LAST in the descending walk), matching _reselect_alpha's
-            # tie-break toward the least-regularized member.
-            if mean <= best_mean:
-                best_mean = mean
-                best_i = a_i
-                best_x = x_full.copy()
+                if n_jobs > 1:
+                    from joblib import Parallel, delayed
+                    with _blas_limit(n_jobs):
+                        results = Parallel(n_jobs=n_jobs, prefer="threads")(
+                            delayed(_fold_fit)(k) for k in range(n_folds))
+                else:
+                    results = [_fold_fit(k) for k in range(n_folds)]
+                for k, result in enumerate(results):
+                    if result is None:
+                        continue
+                    mse_k, coef, n_it, conv_k, kkt_k, res_k = result
+                    mse_rows[a_j, k] = mse_k
+                    x_folds[k] = coef
+                    _cv_max_n_iter = max(_cv_max_n_iter, n_it)
+                    if np.isfinite(kkt_k):
+                        _cv_max_kkt = max(_cv_max_kkt, kkt_k)
+                    if n_it >= cv_max_iter and not conv_k:
+                        _cv_hit_cap = True
+                    res_rows[a_j, k] = bool(res_k) if _aware else True
+                    if _aware:
+                        fold_unres[k] = 0 if res_k else fold_unres[k] + 1
+                        if fold_unres[k] >= _stop_after:
+                            fold_stopped[k] = True
+                        if _plateau_step(fold_plateau[k], mse_k, bool(res_k), _prtol):
+                            fold_stopped[k] = True
+                # warm-start the next (smaller) alpha from this alpha's full fit
+                if red_full is not None:
+                    x_full = _fista_lasso(_GramShape(A.shape[0], red_full.P.size, _prec),
+                                          _no_y, alpha, x0=x_full,
+                                          max_iter=cv_max_iter, tol=cv_tol,
+                                          lipschitz=red_full.lipschitz,
+                                          penalty_weights=red_full.w,
+                                          gram=(red_full.S, red_full.s),
+                                          n_samples=A.shape[0], _info=_cv_info,
+                                          warn_nonconvergence=False,
+                                          auto_floor=False, alpha_tol_ratio=_ratio)
+                elif use_gram:
+                    x_full = _fista_lasso(A, y64, alpha, x0=x_full,
+                                          max_iter=cv_max_iter, tol=cv_tol,
+                                          lipschitz=lip_full,
+                                          penalty_weights=self.penalty_weights,
+                                          gram=gram_full, _info=_cv_info,
+                                          warn_nonconvergence=False,
+                                          auto_floor=False, alpha_tol_ratio=_ratio)
+                else:
+                    x_full = _fista_lasso(A, y64, alpha, x0=x_full,
+                                          max_iter=cv_max_iter, tol=cv_tol,
+                                          lipschitz=self._lipschitz,
+                                          penalty_weights=self.penalty_weights,
+                                          _info=_cv_info, warn_nonconvergence=False,
+                                          auto_floor=False, alpha_tol_ratio=_ratio)
+                # The full-data warm-start solve also reports n_iter; it feeds the
+                # "max iterations" message but must NOT set the hit-cap flag: that
+                # flag is the CONVERGENCE diagnosis for the CV solves themselves.
+                _cv_max_n_iter = max(_cv_max_n_iter, _cv_info.get("n_iter", 0))
+                x_path[alpha] = x_full.copy()
+            x_full_box[0] = x_full
 
-        # [CV-budget] ONE aggregated line instead of a warning per fold: the CV
-        # folds only RANK the alphas, so a fold that stops at the cap is not an
-        # uncertified fit -- but the reader does need to know the ranking was
-        # computed at a loose tolerance (PHEASY_CV_TOL) or a small cap.
+        _mse_d = np.full((n_alphas, n_folds), np.nan)
+        _res_d = np.zeros((n_alphas, n_folds), dtype=bool)
+        _walk(self.alphas[::-1], _mse_d, _res_d)
+        mse_path = _mse_d[::-1].copy()
+        resolved = _res_d[::-1].copy()
+
         if _cv_hit_cap:
             print("[CV] ranking budget: a fold hit cv_max_iter (%d) with relative "
-                  "KKT up to %.3e > PHEASY_CV_TOL=%.1e. CV only ranks alphas "
-                  "(differences between alphas are far larger than this gap), so "
-                  "alpha* is not affected by itself; raise PHEASY_CV_TOL toward "
-                  "1e-3 (the GPU backends' default) or raise PHEASY_CV_MAX_ITER "
-                  "to certify the ranking." % (cv_max_iter, _cv_max_kkt, cv_tol),
+                  "KKT up to %.3e.%s" % (cv_max_iter, _cv_max_kkt,
+                                         " Alphas whose KKT residual stayed above their "
+                                         "L1 penalty are excluded from the selection "
+                                         "(raise PHEASY_CV_MAX_ITER to resolve more)."
+                                         if _aware else
+                                         " Raise PHEASY_CV_MAX_ITER to certify the ranking."),
                   flush=True)
-        # [FIX P27] port _reselect_alpha's tie warning: a flat CV tail means the
-        # loose CV solver did not separate the alphas and the choice is suspect.
-        mean_path = mse_path.mean(axis=1)
-        # PHEASY_LASSO_1SE: one-standard-error rule (largest alpha within 1 SE of
-        # the CV minimum), matching _reselect_alpha and GpuLassoCV.  This class is
-        # the backend auto-selected for TwoLevelSM / LinearOperator / large sparse
-        # input, and it used to ignore the knob entirely (only _reselect_alpha,
-        # the sklearn path, read it) -- so the documented "all backends" rule was
-        # a silent no-op on the production path.
-        if os.environ.get("PHEASY_LASSO_1SE", "0").lower() in ("1", "true", "yes"):
-            _se = (float(mse_path[best_i].std(ddof=1) / np.sqrt(mse_path.shape[1]))
-                   if mse_path.shape[1] > 1 else 0.0)
-            _cand = np.flatnonzero(mean_path <= mean_path[best_i] + _se)
-            _new_i = int(_cand[np.argmax(self.alphas[_cand])])
-            if _new_i != best_i:
-                print("[CV] PHEASY_LASSO_1SE: alpha* %.6e -> %.6e (1 SE = %.3e above "
-                      "the CV minimum)" % (float(self.alphas[best_i]),
-                                           float(self.alphas[_new_i]), _se), flush=True)
-            best_i = _new_i
-            best_x = None          # the new alpha needs its own warm start
-        rtol = float(os.environ.get("PHEASY_LASSO_TIE_RTOL", "1e-9"))
-        tied = np.flatnonzero(mean_path <= best_mean * (1.0 + rtol) + 1e-300)
-        if tied.size > 1:
-            if _cv_hit_cap:
-                print("[CV] WARNING: %d alphas tie at CV MSE %.6e (%.3e ... %.3e). "
-                      "The CV solver (FISTA, tol=%.0e) hit cv_max_iter (%d) and is "
-                      "too loose to separate them -- lower PHEASY_CV_TOL / raise "
-                      "PHEASY_CV_MAX_ITER."
-                      % (tied.size, best_mean, float(self.alphas[tied].min()),
-                         float(self.alphas[tied].max()), cv_tol, cv_max_iter),
-                      flush=True)
-            else:
-                print("[CV] WARNING: %d alphas tie at CV MSE %.6e (%.3e ... %.3e); "
-                      "FISTA already converged (max %d iters < %d), so the CV tail "
-                      "is genuinely flat."
-                      % (tied.size, best_mean, float(self.alphas[tied].min()),
-                         float(self.alphas[tied].max()), _cv_max_n_iter,
-                         cv_max_iter), flush=True)
-        # [FIX P39/P41/P42/P43/P44] best_i == 0 is the SMALLEST alpha (the grid
-        # walks descending). Four causes, in priority order: (1) manual-grid scale
-        # mismatch -- a GRID-scale problem; (2) flat tail AND FISTA hit cv_max_iter
-        # -- CONVERGENCE; (3) flat tail but FISTA converged -- alpha* not
-        # well-determined; (4) the curve still falls -- model-density (treat as
-        # unregularized / compare OLS). NOTE: unlike the sklearn path (whose n_iter_
-        # is the final refit count and cannot certify convergence), _cv_max_n_iter
-        # HERE measures the actual CV-path FISTA iterations, so the 'FISTA already
-        # converged' branch is a real assertion.
-        self._alpha_at_min = (best_i == 0)
-        self._alpha_at_min_flat = (
-            self._alpha_at_min and tied.size > 1
-            and float(self.alphas[tied].min()) <= float(self.alphas.min()) * (1.0 + 1e-12))
-        self._alpha_at_min_hitcap = self._alpha_at_min_flat and _cv_hit_cap
-        if self._alpha_at_min:
-            if self.grid_diag:
-                print("[CV] WARNING: alpha* %.3e sits at the grid MINIMUM; %s"
-                      % (float(self.alphas[0]), self.grid_diag), flush=True)
-            elif self._alpha_at_min_hitcap:
-                print("[CV] WARNING: alpha* %.3e sits at the grid MINIMUM via the "
-                      "tie-break on a FLAT CV tail AND FISTA hit cv_max_iter; this "
-                      "is a CONVERGENCE problem (lower PHEASY_CV_TOL / raise "
-                      "PHEASY_CV_MAX_ITER), not a model-density conclusion."
-                      % float(self.alphas[0]), flush=True)
-            elif self._alpha_at_min_flat:
-                print("[CV] WARNING: alpha* %.3e sits at the grid MINIMUM on a flat "
-                      "CV tail, but FISTA already converged (max %d iters): alpha* "
-                      "is not well-determined by CV (not a convergence problem)."
-                      % (float(self.alphas[0]), _cv_max_n_iter), flush=True)
-            else:
-                print("[CV] WARNING: alpha* %.3e sits at the grid MINIMUM; the CV "
-                      "curve is still falling at the low end, so widening the grid "
-                      "only pushes alpha* toward OLS. Treat this fit as effectively "
-                      "unregularized (compare with OLS/RFE)."
-                      % float(self.alphas[0]), flush=True)
 
-        self.alpha_ = float(self.alphas[best_i])
-        # final refit at the chosen alpha, warm-started from the path. Cap the
-        # iteration budget (FISTA is O(1/k^2), and the scaled ALASSO matrix is
-        # more ill-conditioned); 5000 warm-started steps already reach ~1e-5.
+        # [FIX CV-RES] the alpha -> 0 end of the path, measured exactly per fold
+        ols_mse = None
+        if _ols_on:
+            ols_mse = np.full(n_folds, np.nan)
+            for k, (tr, va) in enumerate(splits):
+                if use_gram:
+                    _c = _gram_ols(*gram_folds[k])
+                    _pred = np.asarray(A_va_list[k] @ _c, dtype=np.float64).ravel()
+                else:
+                    if A_folds is not None:
+                        _A_tr = A_folds[k]
+                    else:
+                        _A_tr = _row_slice(A, tr) if _is_linear_operator(A) else A[tr]
+                    _c = _solve_lstsq(_A_tr, y64[tr])
+                    _pred = _predict_rows(A, _c, va)
+                ols_mse[k] = float(np.mean((_pred - y64[va]) ** 2))
+
+        # [FIX CV-EXT] optimum at the grid bottom and better than the OLS limit:
+        # continue every chain (folds and the full-data path) further down
+        _max_ext, _ext_step = _cv_extend_cfg()
+        extended = 0.0
+        while True:
+            _pre = _select_cv_alpha(self.alphas, mse_path, resolved, ols_mse, quiet=True)
+            if not (_pre.get("extend") and extended < _max_ext - 1e-9):
+                break
+            _step = min(_ext_step, _max_ext - extended)
+            _new = _extension_grid(self.alphas, _step)
+            print("[CV] the CV curve is still falling at the grid bottom (alpha %.3e): "
+                  "extending the grid %.1f decades down to %.3e (%d more alphas, "
+                  "warm-started)"
+                  % (float(self.alphas[0]), _step, float(_new.min()), _new.size),
+                  flush=True)
+            _mse_d = np.full((_new.size, n_folds), np.nan)
+            _res_d = np.zeros((_new.size, n_folds), dtype=bool)
+            _walk(_new[::-1], _mse_d, _res_d)
+            self.alphas = np.concatenate([_new, self.alphas])
+            mse_path = np.vstack([_mse_d[::-1], mse_path])
+            resolved = np.vstack([_res_d[::-1], resolved])
+            extended += _step
+
+        sel = _select_cv_alpha(self.alphas, mse_path, resolved, ols_mse)
+        best_i = sel["best"]
+        self.cv_resolved_ = resolved
+        self.ols_cv_mse_ = ols_mse
+        self.cv_selection_ = {"n_resolved": sel["n_valid"], "ols_mean": sel["ols_mean"],
+                              "fallback": sel["fallback"], "extended_decades": extended,
+                              "bracketed": sel.get("bracketed", False)}
+        self._alpha_is_zero = best_i == -1
+        self._alpha_at_min = bool(sel["at_min"])
+        self._alpha_at_min_flat = bool(sel["at_min"] and sel["flat"])
+        self._alpha_at_min_hitcap = bool(sel["fallback"] and _cv_hit_cap)
+        if self.grid_diag and sel["at_min"] and best_i != -1:
+            print("[CV] WARNING: alpha* sits at the grid MINIMUM; %s" % self.grid_diag,
+                  flush=True)
+
         _finfo = {"n_iter": 0}
-        if red_full is not None:
-            _z = _fista_lasso(_GramShape(A.shape[0], red_full.P.size, _prec), _no_y,
-                              self.alpha_, x0=best_x,
-                              max_iter=self.max_iter,
-                              tol=float(self.tol),
-                              lipschitz=red_full.lipschitz,
-                              penalty_weights=red_full.w,
-                              _info=_finfo,
-                              gram=(red_full.S, red_full.s),
-                              n_samples=A.shape[0])
-            self.coef_ = red_full.to_full(_z)
-            # the certificate is for the reduced problem: relative to the
-            # penalized block's own gradient, not the FC2-dominated max|A^T y|
-            _finfo["harm_dense_reduction"] = "schur_complement+jacobi"
+        if best_i == -1:
+            self.alpha_ = 0.0
+            if use_gram:
+                self.coef_ = _gram_ols(*gram_full)
+                _finfo.update(converged=True, stop_reason="exact_normal_equations")
+            else:
+                if _is_linear_operator(A) or sp.issparse(A):
+                    self.coef_ = _solve_sparse_lsqr(A, y64, info=_finfo)
+                    _finfo["n_iter"] = int(_finfo.get("itn", 0))
+                else:
+                    self.coef_ = _solve_lstsq(A, y64)
+                    _finfo.update(converged=True, stop_reason="exact_lstsq")
+            _solver = "OLS (alpha->0 limit selected by CV)"
         else:
-            self.coef_ = _fista_lasso(A, y64, self.alpha_, x0=best_x,
-                                      max_iter=self.max_iter,
-                                      tol=float(self.tol),
-                                      lipschitz=lip_full if use_gram else self._lipschitz,
-                                      penalty_weights=self.penalty_weights,
-                                      _info=_finfo,
-                                      gram=gram_full if use_gram else None)
+            self.alpha_ = float(self.alphas[best_i])
+            best_x = x_path.get(float(self.alphas[best_i]))
+            # final refit at the chosen alpha, warm-started from the path. Cap the
+            # iteration budget (FISTA is O(1/k^2), and the scaled ALASSO matrix is
+            # more ill-conditioned); 5000 warm-started steps already reach ~1e-5.
+            if red_full is not None:
+                _z = _fista_lasso(_GramShape(A.shape[0], red_full.P.size, _prec), _no_y,
+                                  self.alpha_, x0=best_x,
+                                  max_iter=self.max_iter,
+                                  tol=float(self.tol),
+                                  lipschitz=red_full.lipschitz,
+                                  penalty_weights=red_full.w,
+                                  _info=_finfo,
+                                  gram=(red_full.S, red_full.s),
+                                  n_samples=A.shape[0], alpha_tol_ratio=_ratio)
+                self.coef_ = red_full.to_full(_z)
+                # the certificate is for the reduced problem: relative to the
+                # penalized block's own gradient, not the FC2-dominated max|A^T y|
+                _finfo["harm_dense_reduction"] = "schur_complement+jacobi"
+            else:
+                self.coef_ = _fista_lasso(A, y64, self.alpha_, x0=best_x,
+                                          max_iter=self.max_iter,
+                                          tol=float(self.tol),
+                                          lipschitz=lip_full if use_gram else self._lipschitz,
+                                          penalty_weights=self.penalty_weights,
+                                          _info=_finfo,
+                                          gram=gram_full if use_gram else None,
+                                          alpha_tol_ratio=_ratio)
+            _solver = "FISTA"
         self.intercept_ = 0.0
         self.alphas_ = self.alphas
         self.mse_path_ = mse_path
@@ -3122,7 +3505,7 @@ class _LassoCVIterative:
         # results["execution_backend"] for this path and a CPU solve was
         # indistinguishable from a GPU one in the result record.
         self.regularized_solver_info_ = dict(
-            _finfo, solver="FISTA",
+            _finfo, solver=_solver,
             stage="regularized_refit_before_debias", tol=float(self.tol),
             backend=("gpu_sm_spmv" if _gpu_sm_explicit() else "cpu_iterative_fista"))
         self.n_features_in_ = A.shape[1]
@@ -3139,7 +3522,11 @@ class _LassoCVModel:
 
     def __init__(self, alphas, cv, tol, max_iter, rand_seed, n_jobs,
                  fit_intercept=False, group_size=None, selection="cyclic",
-                 unpenalized=None):
+                 unpenalized=None, ols_reference=False):
+        # [FIX CV-RES] only an AUTO grid is extended by its exact alpha -> 0 end
+        # (Optimizer passes ols_limit); an explicit grid is a request to fit AT
+        # those alphas.
+        self.ols_reference = bool(ols_reference)
         self.alphas = np.asarray(alphas, dtype=np.float64)
         self.cv = cv
         self.tol = tol
@@ -3151,6 +3538,99 @@ class _LassoCVModel:
         self.selection = selection
         # [HARM_DENSE] bool mask (or indices) of columns that carry NO L1 penalty
         self.unpenalized = unpenalized
+
+    def _copy_cv_diagnostics(self, it):
+        """[FIX CV-RES] carry the resolved-CV outcome of an inner backend."""
+        self._alpha_is_zero = bool(getattr(it, "_alpha_is_zero", False))
+        for name in ("ols_cv_mse_", "cv_resolved_", "cv_selection_"):
+            setattr(self, name, getattr(it, name, None))
+
+    def _dense_cv(self, A_cv, y, splits, sample_weight=None, grid_diag=None):
+        """sklearn LassoCV + [FIX CV-RES] exact OLS limit + [FIX CV-EXT] extension.
+
+        Returns (model, ols_fold_mse or None, decades extended below the grid).
+        """
+        ols = None
+        if (sample_weight is None and self.ols_reference
+                and _cv_alpha_aware_cfg()[3]):
+            try:
+                ols = _dense_ols_fold_mse(A_cv, y, splits)
+            except Exception as _e:                  # reference only; never fatal
+                print("[CV] OLS-limit reference skipped (%s)" % _e, flush=True)
+        max_dec, step = _cv_extend_cfg()
+        rtol = float(os.environ.get("PHEASY_LASSO_TIE_RTOL", "1e-9"))
+        alphas = np.sort(np.asarray(self.alphas, dtype=np.float64))
+        extended = 0.0
+        while True:
+            model = LassoCV(alphas=alphas, cv=splits, max_iter=self.max_iter,
+                            tol=self.tol, fit_intercept=self.fit_intercept,
+                            random_state=self.rand_seed, selection=self.selection,
+                            n_jobs=self.n_jobs)
+            model.fit(A_cv, y, sample_weight=sample_weight)
+            _reselect_alpha(model, A_cv, y, sample_weight=sample_weight,  # [FIX P10]
+                            grid_diag=grid_diag, edge_messages=ols is None)
+            # one-alpha grids come back 1-D from sklearn
+            best_mean = float(np.atleast_2d(np.asarray(model.mse_path_)).mean(axis=1).min())
+            at_bottom = float(model.alpha_) <= float(alphas.min()) * (1.0 + 1e-12)
+            # [FIX CV-EXT] keep extending while the curve still falls at the
+            # bottom; stop once it turns up, or it has flattened onto the OLS
+            # limit (nothing left to find between), or the budget is spent.
+            if (ols is None or not at_bottom or extended >= max_dec - 1e-9
+                    or abs(best_mean - float(ols.mean()))
+                    <= _cv_plateau_rtol() * float(ols.mean())):
+                break
+            _step = min(step, max_dec - extended)
+            new = _extension_grid(alphas, _step)
+            print("[CV] the CV curve is still falling at the grid bottom (alpha %.3e, "
+                  "CV MSE %.6e; OLS limit %.6e): extending the grid %.1f decades down "
+                  "to %.3e (%d more alphas)"
+                  % (float(model.alpha_), best_mean, float(ols.mean()), _step,
+                     float(new.min()), new.size), flush=True)
+            alphas = np.concatenate([new, alphas])
+            extended += _step
+        return model, ols, extended
+
+    def _dense_verdict(self, model, ols, extended, sample_weight=None):
+        """Set alpha / edge flags after _dense_cv.  True when the OLS limit wins."""
+        self._alpha_is_zero = False
+        self.ols_cv_mse_ = ols
+        means = np.atleast_2d(np.asarray(model.mse_path_, dtype=np.float64)).mean(axis=1)
+        best = float(np.nanmin(means))
+        self.cv_selection_ = {"n_resolved": int(means.size),
+                              "ols_mean": None if ols is None else float(ols.mean()),
+                              "fallback": False, "extended_decades": float(extended)}
+        if ols is None:
+            return False
+        rtol = float(os.environ.get("PHEASY_LASSO_TIE_RTOL", "1e-9"))
+        print("[CV] OLS limit (alpha -> 0, exact least squares per fold): CV MSE %.6e "
+              "| best alpha on the path: CV MSE %.6e" % (float(ols.mean()), best), flush=True)
+        if (float(ols.mean()) <= best * (1.0 + rtol) + 1e-300
+                and not _env_on("PHEASY_LASSO_1SE", "0")):
+            print("[CV] alpha* = 0: the OLS limit cross-validates at least as well as "
+                  "every alpha on the grid, so the data support no L1 penalty; "
+                  "returning OLS.", flush=True)
+            self._alpha_is_zero = True
+            self._alpha_at_min = True
+            return True
+        # OLS is worse: whatever alpha* is, it is a regularized CV optimum.  At the
+        # (extended) grid bottom it is bracketed in (0, alpha*] -- NOT "effectively
+        # unregularized", which is what the unconditional edge warning claimed.
+        at_bottom = float(model.alpha_) <= float(np.min(model.alphas_)) * (1.0 + 1e-12)
+        if at_bottom:
+            print("[CV] alpha* %.3e is the bottom of the grid (extended %.1f decades) and "
+                  "beats the OLS limit: the optimum is bracketed in (0, %.3e] -- a "
+                  "regularized optimum; raise PHEASY_CV_EXTEND_DECADES to search lower."
+                  % (float(model.alpha_), extended, float(model.alpha_)), flush=True)
+        else:
+            print("[CV] alpha* = %.6e (interior; OLS limit and grid bottom both worse)%s"
+                  % (float(model.alpha_),
+                     (", grid extended %.1f decades" % extended) if extended else ""),
+                  flush=True)
+        self._alpha_at_min = False
+        self._alpha_at_min_flat = False
+        self._alpha_at_min_hitcap = False
+        self.cv_selection_["bracketed"] = bool(at_bottom)
+        return False
 
     def _backend(self, A, free):
         """_lasso_backend, except that an unpenalized block needs a solver with
@@ -3173,9 +3653,10 @@ class _LassoCVModel:
             it = gpu_backend.GpuTwoLevelLassoCV(
                 self.alphas, self.cv, self.tol, self.max_iter, self.rand_seed,
                 fit_intercept=self.fit_intercept, group_size=self.group_size,
-                unpenalized=free)
+                unpenalized=free, ols_reference=self.ols_reference)
             it.fit(A, y, sample_weight=sample_weight)
             self.model_ = it
+            self._copy_cv_diagnostics(it)
             for name in ("coef_", "intercept_", "alpha_", "alphas_", "mse_path_",
                          "n_iter_", "regularized_solver_info_", "n_features_in_",
                          "_alpha_at_min", "_alpha_at_min_flat", "_alpha_at_min_hitcap"):
@@ -3186,9 +3667,10 @@ class _LassoCVModel:
                 self.alphas, self.cv, self.tol, self.max_iter, self.rand_seed,
                 None, fit_intercept=self.fit_intercept,
                 group_size=self.group_size, selection=self.selection,
-                penalty_weights=pw)
+                penalty_weights=pw, ols_reference=self.ols_reference)
             it.fit(A, y, sample_weight=sample_weight)
             self.model_ = it
+            self._copy_cv_diagnostics(it)
             self.coef_ = it.coef_
             self.intercept_ = it.intercept_
             self.alpha_ = it.alpha_
@@ -3208,9 +3690,10 @@ class _LassoCVModel:
                 self.alphas, self.cv, self.tol, self.max_iter, self.rand_seed,
                 self.n_jobs, fit_intercept=self.fit_intercept,
                 group_size=self.group_size, selection=self.selection,
-                penalty_weights=pw)
-            it.fit(_to_dense_f64(A), y, sample_weight=sample_weight)
+                penalty_weights=pw, ols_reference=self.ols_reference)
+            it.fit(_dense_for_gpu(A), y, sample_weight=sample_weight)
             self.model_ = it
+            self._copy_cv_diagnostics(it)
             self.coef_ = it.coef_
             self.intercept_ = it.intercept_
             self.alpha_ = it.alpha_
@@ -3226,19 +3709,8 @@ class _LassoCVModel:
 
         n_samples = A.shape[0]
         splits = _make_cv_splits(n_samples, self.cv, self.rand_seed, self.group_size)
-        model = LassoCV(
-            alphas=self.alphas,
-            cv=splits,
-            max_iter=self.max_iter,
-            tol=self.tol,
-            fit_intercept=self.fit_intercept,
-            random_state=self.rand_seed,
-            selection=self.selection,
-            n_jobs=self.n_jobs,
-        )
-        model.fit(A, y, sample_weight=sample_weight)
+        model, _ols, _ext = self._dense_cv(A, y, splits, sample_weight)
         self.model_ = model
-        _reselect_alpha(model, A, y, sample_weight=sample_weight)  # [FIX P10]
         self.coef_ = model.coef_
         self.intercept_ = model.intercept_
         self.alpha_ = model.alpha_
@@ -3249,6 +3721,14 @@ class _LassoCVModel:
         self._alpha_at_min = getattr(model, "_alpha_at_min", False)
         self._alpha_at_min_flat = getattr(model, "_alpha_at_min_flat", False)
         self._alpha_at_min_hitcap = getattr(model, "_alpha_at_min_hitcap", False)
+        if self._dense_verdict(model, _ols, _ext, sample_weight):
+            self.coef_ = np.asarray(_solve_lstsq(A, y), dtype=np.float64)
+            self.alpha_ = 0.0
+            self.regularized_solver_info_ = {
+                "solver": "OLS (alpha->0 limit selected by CV)",
+                "backend": "cpu_dense_lstsq", "converged": True,
+                "stop_reason": "exact_lstsq", "n_iter": 0, "tol": float(self.tol)}
+            return self
         # This backend iterated too, and it used to be the only LASSO path that
         # published no certificate at all: the FISTA backends (resident, GPU
         # Gram, CPU iterative) all report converged/kkt_relative and the
@@ -3494,9 +3974,11 @@ class _AdaptiveLassoCV(_LassoCVModel):
                 self.alphas, self.cv, self.tol, self.max_iter, self.rand_seed,
                 None, fit_intercept=self.fit_intercept,
                 group_size=self.group_size, selection=self.selection,
-                penalty_weights=self._weights, grid_diag=_grid_diag)
+                penalty_weights=self._weights, grid_diag=_grid_diag,
+                ols_reference=self.ols_reference)
             it.fit(A, y, sample_weight=sample_weight)
             self.model_ = it
+            self._copy_cv_diagnostics(it)
             self.coef_ = it.coef_
             self.intercept_ = it.intercept_ if self.fit_intercept else 0.0
             self.alpha_ = it.alpha_
@@ -3516,9 +3998,11 @@ class _AdaptiveLassoCV(_LassoCVModel):
                 self.alphas, self.cv, self.tol, self.max_iter, self.rand_seed,
                 self.n_jobs, fit_intercept=self.fit_intercept,
                 group_size=self.group_size, selection=self.selection,
-                penalty_weights=self._weights, grid_diag=_grid_diag)
-            it.fit(_to_dense_f64(A), y, sample_weight=sample_weight)
+                penalty_weights=self._weights, grid_diag=_grid_diag,
+                ols_reference=self.ols_reference)
+            it.fit(_dense_for_gpu(A), y, sample_weight=sample_weight)
             self.model_ = it
+            self._copy_cv_diagnostics(it)
             self.coef_ = it.coef_
             self.intercept_ = it.intercept_ if self.fit_intercept else 0.0
             self.alpha_ = it.alpha_
@@ -3534,19 +4018,12 @@ class _AdaptiveLassoCV(_LassoCVModel):
 
         A_scaled = _scale_columns(A, self._weights)
         splits = _make_cv_splits(n_samples, self.cv, self.rand_seed, self.group_size)
-        model = LassoCV(
-            alphas=self.alphas,
-            cv=splits,
-            max_iter=self.max_iter,
-            tol=self.tol,
-            fit_intercept=self.fit_intercept,
-            random_state=self.rand_seed,
-            selection=self.selection,
-            n_jobs=self.n_jobs,
-        )
-        model.fit(A_scaled, y, sample_weight=sample_weight)
-        _reselect_alpha(model, A_scaled, y, sample_weight=sample_weight,
-                       grid_diag=_grid_diag)  # [FIX P23/P43/P44]
+        # [FIX CV-EXT] the adaptive path needs the most room below its grid: its
+        # weights reach 1/eps, so it approaches OLS only decades after the
+        # unweighted one.  The OLS limit is scale-invariant (weights > 0), so the
+        # reference is computed on the weighted matrix directly.
+        model, _ols, _ext = self._dense_cv(A_scaled, y, splits, sample_weight,
+                                           grid_diag=_grid_diag)  # [FIX P23/P43/P44]
         self.model_ = model
         self.coef_ = model.coef_ / self._weights
         self.intercept_ = model.intercept_ if self.fit_intercept else 0.0
@@ -3558,6 +4035,15 @@ class _AdaptiveLassoCV(_LassoCVModel):
         self._alpha_at_min = getattr(model, "_alpha_at_min", False)
         self._alpha_at_min_flat = getattr(model, "_alpha_at_min_flat", False)
         self._alpha_at_min_hitcap = getattr(model, "_alpha_at_min_hitcap", False)
+        if self._dense_verdict(model, _ols, _ext, sample_weight):
+            # OLS predictions do not depend on the adaptive column scaling
+            self.coef_ = np.asarray(_solve_lstsq(A, y), dtype=np.float64)
+            self.alpha_ = 0.0
+            self.regularized_solver_info_ = {
+                "solver": "OLS (alpha->0 limit selected by CV)",
+                "backend": "cpu_dense_lstsq", "converged": True,
+                "stop_reason": "exact_lstsq", "n_iter": 0, "tol": float(self.tol)}
+            return self
         # Same certificate as the plain dense LASSO, and for the same reason: the
         # adaptive branch runs its OWN LassoCV on the weighted matrix and used to
         # publish nothing at all -- measured on c7 it reported
@@ -4263,20 +4749,43 @@ def _rfe_final_refit_exact(A, y, best_idx, *, block_rows=None, diag_floor=1e-12,
     else:
         print("[RFE] final exact refit: Gram normal equations (%d x %d), blocks of %d"
               % (m, n, blk), flush=True)
-        G = np.zeros((n, n), dtype=np.float64)
+        G = np.zeros((n, n), dtype=np.float64, order="F")
         rhs = np.zeros(n, dtype=np.float64)
+        try:
+            from scipy.linalg import blas as _blas_rfe
+        except Exception:                          # pragma: no cover
+            _blas_rfe = None
+        _syrk = _blas_rfe is not None and hasattr(_blas_rfe, "dsyrk")
         try:
             for i0 in range(0, m, blk):
                 i1 = min(i0 + blk, m)
                 B = _rows(i0, i1)
                 Bd = np.asarray(B.toarray() if sp.issparse(B) else B, dtype=np.float64)
-                G += Bd.T @ Bd
+                if _syrk:
+                    # [FIX RFE-MEM] G += Bd^T Bd IN PLACE (upper triangle, half
+                    # the flops).  "G += Bd.T @ Bd" materialised a second n x n
+                    # array per block: +7.2 GB of peak host memory at 30k
+                    # features, on top of G and the dense block.
+                    # Bd.T is Fortran-contiguous: no f2py copy of the block
+                    G = _blas_rfe.dsyrk(1.0, Bd.T, beta=1.0, c=G, trans=0, lower=0,
+                                        overwrite_c=1)
+                else:
+                    G += Bd.T @ Bd
                 rhs += Bd.T @ y64[i0:i1]
                 del Bd, B
         except MemoryError:
             print("[RFE] final exact refit: Gram accumulation OOM; LSMR fallback",
                   flush=True)
             return None
+        if _syrk:
+            # dsyrk filled the upper triangle only: mirror it in bounded column
+            # blocks (np.tril_indices would allocate n^2/2 index pairs)
+            _bs = 2048
+            for _j0 in range(0, n, _bs):
+                _j1 = min(_j0 + _bs, n)
+                G[_j0:_j1, :_j0] = G[:_j0, _j0:_j1].T
+                _d = G[_j0:_j1, _j0:_j1]
+                G[_j0:_j1, _j0:_j1] = np.triu(_d) + np.triu(_d, 1).T
         ridge = float(os.environ.get("PHEASY_RFE_FINAL_RIDGE", "0"))
         if ridge > 0:
             G.flat[:: n + 1] += ridge
@@ -4384,7 +4893,15 @@ class _RFECVBase:
         # Reuse training norms as a right preconditioner, not as a change to
         # feature ranking or ridge objective. Independent test data is not used;
         # CV folds share these training-pool norms as a numerical preconditioner.
-        use_scaling = os.environ.get("PHEASY_RFE_JACOBI", "0").lower() in ("1", "true", "yes")
+        # [FIX RFE-JACOBI] default ON for matrix-free input, as for OLS: the
+        # scaling is an exact change of variables for the subset least squares,
+        # but without it the float32 CGLS/LSMR on raw FC2/FC3 columns (~40x norm
+        # spread) stops at its precision floor with the small-norm FC3
+        # coefficients still inaccurate -- and those are exactly the ones the
+        # |coef|*||col|| importance ranks for elimination.
+        use_scaling = os.environ.get(
+            "PHEASY_RFE_JACOBI", "1" if _is_linear_operator(A) else "0").lower() in (
+                "1", "true", "yes")
         _qr = self._solver_name == "qr"
 
         splits = _make_cv_splits(n_samples, self.cv, self.random_state,
@@ -4949,6 +5466,7 @@ class Optimizer(object):
         decades=4.0,
         use_gpu=None,
         unpenalized=None,
+        ols_limit=None,
     ):
         """unpenalized ([HARM_DENSE]): bool mask or index list of columns that
         are never penalized, shrunk or eliminated by the sparse methods (LASSO,
@@ -4974,6 +5492,11 @@ class Optimizer(object):
         # different regularization problem than the one asked for.
         self._alpha_user_supplied = alpha is not None
         self._decades = float(decades)
+        # [FIX CV-RES] extend the LASSO/ALASSO CV path by its exact alpha -> 0
+        # (OLS) end.  Default: only for an auto grid; run_pheasy passes
+        # ols_limit=--alpha_auto because it hands its derived grid in as alpha=.
+        self._ols_limit = (bool(ols_limit) if ols_limit is not None
+                           else (self._alpha_auto and not self._alpha_user_supplied))
 
         if alpha is not None:
             self._alpha = np.asarray(alpha, dtype=np.float64)
@@ -5248,6 +5771,16 @@ class Optimizer(object):
         if self._standardize and method in ("LASSO", "ALASSO", "RIDGE", "ARDR", "RVM") and not (resident_lasso and method in ("LASSO", "ALASSO")):
             col_scale = _col_norms(A)
             col_scale = np.where(col_scale < 1e-30, 1.0, col_scale)
+            if method in ("ARDR", "RVM") and os.environ.get(
+                    "PHEASY_ARD_STD", "unit_variance").strip().lower() != "unit_norm":
+                # [FIX ARD-STD] ARD/RVM prune on an ABSOLUTE precision threshold
+                # (lambda_t = 1e4, Fransson et al. 2020 / hiphive), defined for
+                # UNIT-VARIANCE columns (StandardScaler).  Unit L2 norm makes every
+                # standardized coefficient sqrt(n) larger, i.e. the threshold
+                # effectively n times higher -- 4.5e5x at 454656 rows -- so a large
+                # fit prunes almost nothing.  PHEASY_ARD_STD=unit_norm restores it.
+                col_scale = col_scale / np.sqrt(float(A.shape[0]))
+                self._results["ard_standardization"] = "unit_variance"
             A_fit = _scale_columns(A, col_scale)
         elif self._standardize:
             # Do not drop a requested knob silently: standardization is a MODEL
@@ -5276,7 +5809,7 @@ class Optimizer(object):
                     eps=float(os.environ.get("PHEASY_ALASSO_EPS", "1e-8")),
                     nalpha=self._nalpha, decades=self._decades,
                     alpha_auto=self._alpha_auto and not self._alpha_user_supplied,
-                    unpenalized=free)
+                    unpenalized=free, ols_reference=self._ols_limit)
                 self._model.fit(A, F64, sample_weight=weights,
                                 retain_operator=self._debias_enabled())
                 coef = self._model.coef_
@@ -5300,7 +5833,7 @@ class Optimizer(object):
                     self._alpha, self._cv, self._tol, self._max_iter, self._rand_seed,
                     _lasso_n_jobs(A),
                     fit_intercept=self._fit_intercept, group_size=self._group_size,
-                    unpenalized=free)
+                    unpenalized=free, ols_reference=self._ols_limit)
                 self._model.fit(A_fit, F64, sample_weight=weights)
                 coef = self._model.coef_
         elif method == "LASSO":
@@ -5308,7 +5841,7 @@ class Optimizer(object):
                 self._alpha, self._cv, self._tol, self._max_iter, self._rand_seed,
                 _lasso_n_jobs(A),
                 fit_intercept=self._fit_intercept, group_size=self._group_size,
-                unpenalized=free)
+                unpenalized=free, ols_reference=self._ols_limit)
             self._model.fit(A_fit, F64, sample_weight=weights)
             coef = self._model.coef_
         elif method == "ALASSO":
@@ -5322,7 +5855,7 @@ class Optimizer(object):
                 nalpha=self._nalpha,
                 decades=self._decades,
                 alpha_auto=self._alpha_auto and not self._alpha_user_supplied,
-                unpenalized=free)
+                unpenalized=free, ols_reference=self._ols_limit)
             self._model.fit(A_fit, F64, sample_weight=weights)
             coef = self._model.coef_
         elif method == "ARDR":
@@ -5417,7 +5950,7 @@ class Optimizer(object):
             self._model.fit(A, F64, sample_weight=weights)
             coef = self._model.coef_
         elif method == "RIDGE":
-            alphas = np.sort(np.asarray(self._alpha, dtype=np.float64))[::-1]
+            alphas = self._ridge_alpha_grid(A_fit)
             if _is_linear_operator(A_fit):
                 # [FIX P26/P45] ridge CV over the alpha grid on the two-level
                 # operator via _ridge_solve (LSMR on the augmented system).
@@ -5592,17 +6125,18 @@ class Optimizer(object):
                 # RidgeCV(cv=None) / GpuRidgeCV ran LOO GCV, which ignored --cv
                 # and PHEASY_CV_GROUP_SIZE and leaked the other 3N-1 rows of the
                 # same configuration into training (biasing alpha* toward 0).
-                if sp.issparse(A_fit):
-                    A_dense = _to_dense_f64(A_fit)
-                else:
-                    A_dense = np.ascontiguousarray(A_fit, dtype=np.float64)
+                # [FIX HOST-MEM] native precision here; the CPU branches widen
+                # below, the GPU branch widens on the device.
+                A_dense = np.ascontiguousarray(_dense_for_gpu(A_fit))
+                if self._fit_intercept or not _gpu_dense(A_fit):
+                    A_dense = np.ascontiguousarray(A_dense, dtype=np.float64)
                 splits = _make_cv_splits(A_dense.shape[0], self._cv,
                                          self._rand_seed, self._group_size)
                 if self._fit_intercept:
                     # grouped CV still fixes the leak; sklearn RidgeCV handles
                     # the intercept the closed form below does not (the CLI
                     # leaves fit_intercept=False).
-                    self._model = RidgeCV(alphas=self._alpha, fit_intercept=True,
+                    self._model = RidgeCV(alphas=alphas, fit_intercept=True,
                                           cv=splits)
                     self._model.fit(A_dense, F64, sample_weight=weights)
                     coef = self._model.coef_
@@ -5621,7 +6155,7 @@ class Optimizer(object):
                         A_g = A_dense * sw[:, None]
                         y_g = F64 * sw
                     self._model = _gpu().GpuRidgeCV(
-                        alphas=self._alpha, cv=self._cv,
+                        alphas=alphas, cv=self._cv,
                         rand_seed=self._rand_seed, group_size=self._group_size)
                     self._model.fit(A_g, y_g)
                     coef = self._model.coef_
@@ -5654,6 +6188,7 @@ class Optimizer(object):
                     self._model = _OLSModel(coef, alpha=best_alpha)
                     self._results["alpha"] = best_alpha
                     self._results["mse_path"] = mse_path
+            self._ridge_edge_flags(alphas)
         else:
             raise ValueError(
                 "Unknown linear model for fitting force constants: {} ".format(self._method)
@@ -5673,16 +6208,29 @@ class Optimizer(object):
         # (this is how the delivered Mg8C120 v4 fit lost 6x generalization:
         # debias was off AND the 4-decade grid pinned alpha* at its bottom).
         _alpha_at_edge = bool(getattr(self._model, "_alpha_at_min", False))
-        self._results["alpha_at_grid_edge"] = _alpha_at_edge
-        if _alpha_at_edge:
+        for _k in ("cv_selected_ols_limit", "sparsity_supported"):
+            self._results.pop(_k, None)
+        # [FIX CV-RES] the resolved CV chose the exact alpha -> 0 end: the model
+        # already IS the least-squares fit, so there is no shrinkage to debias.
+        # That is a certified optimum at the boundary of the alpha DOMAIN, not a
+        # grid edge the CV curve was still falling through, so it does not set
+        # alpha_at_grid_edge (sparsity_supported=False carries the conclusion).
+        _alpha_zero = (method in ("LASSO", "ALASSO")
+                       and bool(getattr(self._model, "_alpha_is_zero", False)))
+        self._results["alpha_at_grid_edge"] = _alpha_at_edge and not _alpha_zero
+        if _alpha_zero:
+            self._results["cv_selected_ols_limit"] = True
+        if _alpha_at_edge and method in ("LASSO", "ALASSO"):
             self._results["sparsity_supported"] = False
-        _edge_relaxed = _alpha_at_edge and self._alpha_edge_relaxed_enabled()
+        _edge_relaxed = (_alpha_at_edge and not _alpha_zero
+                         and self._alpha_edge_relaxed_enabled())
         if _edge_relaxed and not self._debias_enabled():
             self._results["debias_forced_reason"] = (
                 "alpha* sits at the grid bottom (CV curve still falling): no "
                 "sparsity is supported, so the L1 shrinkage bias is removed by "
                 "the relaxed refit even though PHEASY_LASSO_DEBIAS=0.")
-        if method in ("LASSO", "ALASSO") and (self._debias_enabled() or _edge_relaxed):
+        if (method in ("LASSO", "ALASSO") and not _alpha_zero
+                and (self._debias_enabled() or _edge_relaxed)):
             # Preserve physical-coordinate coefficients for paired evaluation.
             self._results["pre_debias_coef"] = (
                 coef / col_scale if col_scale is not None else coef.copy())
@@ -5690,6 +6238,16 @@ class Optimizer(object):
             # can solve G[sup,sup] x = b[sup] instead of re-solving the OLS.
             self._gram = getattr(self._model, "_gram", None)
             coef = self._debias(A_fit, F64, coef)
+        # The resident LASSO keeps its operator (VRAM) alive for the GPU debias,
+        # which closes it -- but only when that debias actually runs.  An empty
+        # support, PHEASY_GPU_DEBIAS=0 or an OLS-limit selection left the factors
+        # resident for the lifetime of the Optimizer.  Release them here.
+        _retained = getattr(getattr(self, "_model", None), "_operator", None)
+        if _retained is not None:
+            try:
+                _retained.close()
+            finally:
+                self._model._operator = None
 
         # un-scale standardized coefficients back to the original column scale
         if col_scale is not None:
@@ -5734,6 +6292,9 @@ class Optimizer(object):
         if method in ("LASSO", "ALASSO"):
             self._results["alpha"] = float(self._model.alpha_)
             self._results["n_iter"] = int(self._model.n_iter_)
+            _sel = getattr(self._model, "cv_selection_", None)
+            if isinstance(_sel, dict):
+                self._results["cv_selection"] = dict(_sel)
             info = getattr(self._model, "regularized_solver_info_", None)
             if not info:
                 # Every LASSO/ALASSO backend is supposed to certify its own
@@ -5747,7 +6308,10 @@ class Optimizer(object):
                 backend = str(info.get("backend", ""))
                 if backend:
                     self._results["execution_backend"] = backend
-                    if self._debias_enabled() or _edge_relaxed:
+                    if _alpha_zero:
+                        self._results["debias_backend"] = "not_needed_ols_limit"
+                        self._results["postfit_backend"] = "cpu_metrics"
+                    elif self._debias_enabled() or _edge_relaxed:
                         db = getattr(self, "_debias_backend", "unknown")
                         self._results["debias_backend"] = db
                         self._results["postfit_backend"] = db + "_and_cpu_metrics"
@@ -5774,7 +6338,12 @@ class Optimizer(object):
                         self._results["debias_backend"] = "disabled"
                         self._results["postfit_backend"] = "cpu_metrics"
             alpha_idx = int(np.argmin(np.abs(self._model.alphas_ - self._model.alpha_)))
-            self._metrics["mse_path"] = np.asarray(self._model.mse_path_[alpha_idx])
+            _ols_cv = getattr(self._model, "ols_cv_mse_", None)
+            if _alpha_zero and _ols_cv is not None:
+                # [FIX CV-RES] alpha* = 0 is the OLS limit, not a grid row
+                self._metrics["mse_path"] = np.asarray(_ols_cv, dtype=np.float64)
+            else:
+                self._metrics["mse_path"] = np.asarray(self._model.mse_path_[alpha_idx])
             self._metrics["mse_path_mean"] = float(np.mean(self._metrics["mse_path"]))
             self._metrics["rmse_path"] = np.sqrt(self._metrics["mse_path"])
             self._metrics["rmse_path_mean"] = float(np.mean(self._metrics["rmse_path"]))
@@ -5906,7 +6475,16 @@ class Optimizer(object):
         self._results["status"] = ("fit_returned" if not _nonconverged
                                      else "fit_returned_not_accepted")
 
+        self._pred_cache = None
         F_pred = np.asarray(self.predict(A)).ravel()
+        # [FIX GPU-PRED] run_pheasy's alignment gate predicts on the SAME
+        # operator right after the fit; remember this prediction so that is not
+        # a second full host SpMV (nnz(SM_prime) on the CPU) for the same vector.
+        try:
+            import weakref as _weakref
+            self._pred_cache = (_weakref.ref(A), self._model.coef_, F_pred)
+        except TypeError:
+            self._pred_cache = None
         eps = np.finfo(F64.dtype).eps
         F_err = np.abs(F_pred - F64)
         F_re = F_err / np.maximum(np.abs(F64), eps)
@@ -5920,6 +6498,79 @@ class Optimizer(object):
         self._metrics["mspe"] = float(np.average(np.square(F_re), weights=weights, axis=0))
         self._metrics["rmspe"] = float(np.sqrt(self._metrics["mspe"]))
         return self
+
+    def _ridge_alpha_grid(self, A):
+        """[FIX RIDGE-GRID] RIDGE alpha grid, descending.
+
+        RIDGE minimises ||A x - y||^2 + alpha ||x||^2, so alpha only matters
+        relative to the eigenvalues of A^T A -- which grow with the number of
+        rows.  The fixed --mu_min/--mu_max grid (1e-6..1e-2) therefore sits
+        below the whole spectrum of a large fit and every alpha returns OLS
+        ("RIDGE does nothing on big systems").  With --alpha_auto (default) the
+        grid is widened to cover [lambda_max * 10^-PHEASY_RIDGE_DECADES,
+        lambda_max] as well as the manual range.  PHEASY_RIDGE_ALPHA_AUTO=0
+        keeps the manual grid exactly.
+        """
+        grid = np.sort(np.asarray(self._alpha, dtype=np.float64))
+        if (not self._alpha_auto or self._alpha_user_supplied
+                or not _env_on("PHEASY_RIDGE_ALPHA_AUTO", "1") or grid.size < 2):
+            return grid[::-1]
+        lam = None
+        if _is_linear_operator(A) and (_resident_default() or _env_on(
+                "PHEASY_GPU_RIDGE_RESIDENT", "0")):
+            try:
+                from . import gpu_backend as _gb_l
+                if _gb_l.enabled() and _gb_l.available():
+                    lam = float(_resident_ridge_op(A).lipschitz().item()) / 1.05
+            except Exception:
+                lam = None
+        if lam is None:
+            try:
+                safety = float(os.environ.get("PHEASY_FISTA_LIPSCHITZ_SAFETY", "1.02"))
+                lam = _estimate_lipschitz(A, power_iters=int(os.environ.get(
+                    "PHEASY_RIDGE_POWER_ITERS", "15"))) / max(safety, 1.0)
+            except Exception as _e:
+                print("[RIDGE] spectral scale unavailable (%s); manual grid kept" % _e,
+                      flush=True)
+                return grid[::-1]
+        if not (np.isfinite(lam) and lam > 0):
+            return grid[::-1]
+        dec = float(os.environ.get("PHEASY_RIDGE_DECADES", "8"))
+        lo = min(float(grid[0]), lam * 10.0 ** (-dec))
+        hi = max(float(grid[-1]), lam)
+        span = np.log10(hi / lo)
+        per_dec = float(os.environ.get("PHEASY_RIDGE_PER_DECADE", "2.5"))
+        n = max(grid.size, 1 + int(np.ceil(span * per_dec)))
+        n = min(n, max(grid.size, int(os.environ.get("PHEASY_RIDGE_NMAX", "40"))))
+        new = np.logspace(np.log10(lo), np.log10(hi), n)
+        print("[RIDGE] alpha grid anchored on the spectrum: lambda_max(A^T A) ~ %.3e; "
+              "grid [%.3e .. %.3e] (%d alphas, %.1f decades; manual range %.1e..%.1e "
+              "kept inside).  PHEASY_RIDGE_ALPHA_AUTO=0 restores the manual grid."
+              % (lam, lo, hi, n, span, grid[0], grid[-1]), flush=True)
+        self._results["ridge_lambda_max"] = float(lam)
+        return new[::-1]
+
+    def _ridge_edge_flags(self, alphas):
+        """[FIX RIDGE-GRID] report a RIDGE alpha* pinned to a grid edge."""
+        ga = np.sort(np.asarray(alphas, dtype=np.float64))
+        ba = self._results.get("alpha", getattr(self._model, "alpha_", None))
+        if ga.size < 2 or ba is None or not np.isfinite(float(ba)):
+            return
+        ba = float(ba)
+        at_lo = ba <= ga[0] * (1.0 + 1e-9)
+        at_hi = ba >= ga[-1] * (1.0 - 1e-9)
+        try:
+            self._model._alpha_at_min = bool(at_lo)
+        except Exception:
+            pass
+        self._results["ridge_alpha_at_grid_min"] = bool(at_lo)
+        self._results["ridge_alpha_at_grid_max"] = bool(at_hi)
+        if at_lo:
+            print("[RIDGE] WARNING: alpha* %.3e sits at the grid MINIMUM: the CV prefers "
+                  "(almost) no L2 penalty -- the result is effectively OLS." % ba, flush=True)
+        elif at_hi:
+            print("[RIDGE] WARNING: alpha* %.3e sits at the grid MAXIMUM; extend the grid "
+                  "upward (--mu_max / PHEASY_RIDGE_DECADES)." % ba, flush=True)
 
     def _fit_ols(self, A, F):
         self._ols_lsmr_info = None
@@ -6019,16 +6670,21 @@ class Optimizer(object):
             # [FIX P26] column-slice via a masked operator + LSMR, so the
             # relaxed-LASSO debias is no longer skipped on the two-level
             # operator (the L1 shrinkage bias is removed there too).
+            _res_gpu = None
             if self._resident_debias_available():
-                coef_sub = self._debias_resident_gpu(y, sup)
+                coef_sub, _res_gpu = self._debias_resident_gpu(y, sup, coef)
             else:
                 self._debias_backend = "cpu_lsmr"
                 op = _make_masked_op(A, None, sup)
                 coef_sub = _solve_sparse_lsqr(op, y)
             new = np.zeros_like(coef)
             new[sup] = coef_sub
-            r_new = float(np.linalg.norm(np.asarray(A @ new).ravel() - y))
-            r_old = float(np.linalg.norm(np.asarray(A @ coef).ravel() - y))
+            if _res_gpu is not None:
+                # [FIX GPU-PRED] both residuals came from the resident factors
+                r_new, r_old = _res_gpu
+            else:
+                r_new = float(np.linalg.norm(np.asarray(A @ new).ravel() - y))
+                r_old = float(np.linalg.norm(np.asarray(A @ coef).ravel() - y))
             self._record_debias(r_new, r_old, "operator")
             if r_new <= r_old:
                 return new
@@ -6078,15 +6734,21 @@ class Optimizer(object):
             return False
         return True
 
-    def _debias_resident_gpu(self, y, sup):
+    def _debias_resident_gpu(self, y, sup, coef_old=None):
         """Support OLS refit on the retained resident operator (GPU CGLS).
 
         solve_resident_subset solves against the normalized resident operator, so
         its coefficients carry the column scale; divide by column_scale_ to return
         the physical-coordinate support coefficients that match the CPU LSQR path.
+
+        Returns (coef_sub, (r_new, r_old)): [FIX GPU-PRED] the residual norms of
+        the refit and of the L1 coefficients are evaluated on the resident
+        factors before they are released -- two full HOST SpMVs otherwise.
+        (None instead of the pair if that evaluation fails.)
         """
         from . import gpu_backend as gb
         res_op = self._model._operator
+        residuals = None
         try:
             coef_sub, _info = gb.solve_resident_subset(res_op, y, sup,
                                                         raise_on_nonconvergence=False)
@@ -6099,11 +6761,30 @@ class Optimizer(object):
             scale = getattr(self._model, "column_scale_", None)
             if scale is not None:
                 coef_sub = coef_sub / np.asarray(scale, dtype=np.float64)[sup]
+            if coef_old is not None:
+                try:
+                    torch = res_op.torch
+                    s = (np.ones(res_op.shape[1]) if scale is None
+                         else np.asarray(scale, dtype=np.float64))
+                    yt = torch.as_tensor(np.asarray(y, dtype=np.float64),
+                                         dtype=res_op._value_dtype, device=res_op.device)
+
+                    def _rnorm(c):
+                        z = torch.as_tensor(np.asarray(c, dtype=np.float64) * s,
+                                            dtype=res_op._value_dtype, device=res_op.device)
+                        r = (res_op.matvec(z) - yt).to(torch.float64)
+                        return float(torch.linalg.vector_norm(r).item())
+
+                    new = np.zeros(res_op.shape[1], dtype=np.float64)
+                    new[sup] = coef_sub
+                    residuals = (_rnorm(new), _rnorm(coef_old))
+                except Exception:
+                    residuals = None
         finally:
             res_op.close()
             self._model._operator = None
         self._debias_backend = "gpu_cgls"
-        return coef_sub
+        return coef_sub, residuals
 
     @staticmethod
     def _detect_group_size(n_samples):
@@ -6113,6 +6794,11 @@ class Optimizer(object):
         return None
 
     def predict(self, A):
+        cache = getattr(self, "_pred_cache", None)
+        if cache is not None:
+            ref, coef, pred = cache
+            if ref() is A and getattr(self._model, "coef_", None) is coef:
+                return pred.copy()
         return self._model.predict(A)
 
     @property

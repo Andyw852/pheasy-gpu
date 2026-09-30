@@ -960,6 +960,45 @@ def enabled():
     return bool(want) and available()
 
 
+_auto_device_cache = None
+
+
+def _auto_device():
+    """Visible CUDA device with the most free VRAM (auto mode).
+
+    PHEASY_GPU_DEVICE unset used to mean "cuda:0" unconditionally, so a fit
+    launched while card 0 was full (shared box) died with a CUDA OOM even
+    though other cards were idle.  PHEASY_GPU_AUTO_DEVICE=0 restores cuda:0.
+    The choice is cached so every tensor in one process lands on one card.
+    """
+    global _auto_device_cache
+    import torch
+    if os.environ.get("PHEASY_GPU_AUTO_DEVICE", "1").strip().lower() not in (
+            "1", "true", "yes", "on"):
+        return torch.device("cuda:0")
+    if _auto_device_cache is not None:
+        return _auto_device_cache
+    if not torch.cuda.is_available():
+        return torch.device("cuda:0")
+    n = torch.cuda.device_count()
+    if n <= 1:
+        _auto_device_cache = torch.device("cuda:0")
+        return _auto_device_cache
+    best_idx, best_free = 0, None
+    for d in range(n):
+        fr = _device_free_bytes(d)
+        if fr is None:
+            continue
+        if best_free is None or fr > best_free:
+            best_idx, best_free = d, fr
+    _auto_device_cache = torch.device("cuda:%d" % best_idx)
+    if best_idx != 0:
+        print("[GPU] PHEASY_GPU_DEVICE unset: auto-selected cuda:%d "
+              "(most free VRAM: %.2f GiB of %d visible)"
+              % (best_idx, (best_free or 0) / 2.0 ** 30, n), flush=True)
+    return _auto_device_cache
+
+
 def device():
     """CUDA device, read fresh from PHEASY_GPU_DEVICE each call (no caching).
 
@@ -971,7 +1010,7 @@ def device():
     import torch
     dev = os.environ.get("PHEASY_GPU_DEVICE", None)
     if dev is None:
-        return torch.device("cuda:0")
+        return _auto_device()
     try:
         idx = int(dev)
     except ValueError:
@@ -1007,7 +1046,11 @@ def _to_torch(A, dtype=None):
     arr = np.ascontiguousarray(A)
     if arr.dtype.kind not in "fc":
         arr = arr.astype(np.float64)
-    return torch.as_tensor(arr, dtype=dtype, device=device())
+    # [FIX HOST-MEM] upload in the array's own precision and widen ON THE DEVICE:
+    # a float32 sensing matrix used to be converted to a float64 HOST copy first
+    # (2x its size in RAM, and twice the PCIe traffic).  The widening is exact
+    # either way.
+    return torch.as_tensor(arr, device=device()).to(dtype)
 
 
 def _to_numpy(t, dtype=np.float64):
@@ -1039,42 +1082,13 @@ def _is_dense(A):
 # CV splits (identical to optimizer._make_cv_splits so GPU and CPU agree)
 # ---------------------------------------------------------------------------
 def _make_cv_splits(n_samples, cv, random_state=None, group_size=None):
-    """Identical to optimizer._make_cv_splits (GPU and CPU CV must agree)."""
-    import warnings
-    from sklearn.model_selection import GroupKFold, KFold
-    global _WARNED_UNGROUPED_CV, _WARNED_NO_SEED
-    if cv is None or cv <= 1:
-        cv = min(3, n_samples)
-    cv = int(cv)
-    if group_size and group_size > 1:
-        if n_samples % group_size == 0:
-            groups = np.arange(n_samples) // group_size
-            n_groups = int(groups[-1]) + 1
-            if n_groups >= 2:
-                eff_cv = int(min(cv, n_groups))
-                gkf = GroupKFold(n_splits=eff_cv)
-                return list(gkf.split(np.zeros(n_samples, dtype=np.int8),
-                                      np.zeros(n_samples, dtype=np.int8), groups))
-        elif not _WARNED_UNGROUPED_CV:
-            _WARNED_UNGROUPED_CV = True
-            warnings.warn(
-                "PHEASY_CV_GROUP_SIZE=%s does not divide n_samples=%d: grouped "
-                "cross-validation is impossible, so this fit falls back to "
-                "shuffled ROW-based KFold.  Rows of one configuration then appear "
-                "in both folds, which leaks information and biases alpha*/ridge "
-                "toward 0.  Fix PHEASY_CV_GROUP_SIZE (it must be 3*natom and must "
-                "divide the row count)." % (group_size, n_samples),
-                RuntimeWarning, stacklevel=2)
-    cv = max(2, min(cv, n_samples))
-    if random_state is None and not _WARNED_NO_SEED:
-        _WARNED_NO_SEED = True
-        warnings.warn(
-            "CV splits use KFold(shuffle=True, random_state=None): the fold "
-            "assignment (and therefore alpha*, the CV curve and every reported "
-            "score) changes from run to run.  Pass --seed / PHEASY_SEED to make "
-            "the fit reproducible.", RuntimeWarning, stacklevel=2)
-    kf = KFold(n_splits=cv, shuffle=True, random_state=random_state)
-    return list(kf.split(np.arange(n_samples)))
+    """optimizer._make_cv_splits -- ONE implementation, so GPU and CPU CV agree.
+
+    [FIX CV-FOLD] this used to be a copy; the contiguous-fold fix (and any later
+    change) would otherwise silently diverge between the GPU and CPU backends.
+    """
+    from .optimizer import _make_cv_splits as _splits
+    return _splits(n_samples, cv, random_state, group_size)
 
 
 # ---------------------------------------------------------------------------
@@ -1087,7 +1101,7 @@ def lstsq(A, y):
     scipy.linalg.lstsq(cond=None). Inputs/outputs are float64 NumPy.
     """
     import torch
-    A = np.asarray(A, dtype=np.float64)
+    A = np.asarray(A)                  # [FIX HOST-MEM] widened on the device
     y = np.asarray(y, dtype=np.float64).ravel()
     m, n = A.shape
     At = _to_torch(A, torch.float64)
@@ -1215,7 +1229,7 @@ def qr_solve(A, y):
     the same threshold _solve_qr uses, then run the fast gels solve.
     """
     import torch
-    A = np.asarray(A, dtype=np.float64)
+    A = np.asarray(A)                  # [FIX HOST-MEM] widened on the device
     y = np.asarray(y, dtype=np.float64).ravel()
     At = _to_torch(A, torch.float64)
     yt = _to_torch(y, torch.float64).reshape(-1)
@@ -1265,7 +1279,7 @@ def ridge_solve(A, y, alpha):
     import torch
     if float(alpha) <= 0:
         return lstsq(A, y)
-    A = np.asarray(A, dtype=np.float64)
+    A = np.asarray(A)                  # [FIX HOST-MEM] widened on the device
     y = np.asarray(y, dtype=np.float64).ravel()
     At = _to_torch(A, torch.float64)
     yt = _to_torch(y, torch.float64).reshape(-1)
@@ -1314,8 +1328,9 @@ def top_eigval(G):
 
 def predict(A, coef):
     """A @ coef on the GPU (returns float64 NumPy)."""
-    At = _to_torch(np.asarray(A, dtype=np.float64))
-    ct = _to_torch(np.asarray(coef, dtype=np.float64).ravel()).reshape(-1)
+    import torch
+    At = _to_torch(np.asarray(A), torch.float64)   # [FIX HOST-MEM]
+    ct = _to_torch(np.asarray(coef, dtype=np.float64).ravel(), torch.float64).reshape(-1)
     return _to_numpy(At @ ct, np.float64)
 
 
@@ -1349,7 +1364,14 @@ def _power_lipschitz(Gt, power_iters=15):
         return 0.0
     threshold = int(os.environ.get("PHEASY_LIPSCHITZ_POWER_P", "8192"))
     if p <= threshold:
-        return float(torch.linalg.eigvalsh(Gt)[-1].item())
+        try:
+            return float(torch.linalg.eigvalsh(Gt)[-1].item())
+        except (RuntimeError, MemoryError) as exc:
+            if "out of memory" not in str(exc).lower():
+                raise
+            print("[GPU] eigvalsh OOM on %s (p=%d); falling back to the power "
+                  "iteration for the Lipschitz bound" % (Gt.device, p),
+                  flush=True)
     safety = float(os.environ.get("PHEASY_FISTA_LIPSCHITZ_SAFETY", "1.05"))
     if not safety >= 1.0:
         raise ValueError("PHEASY_FISTA_LIPSCHITZ_SAFETY must be >= 1")
@@ -1361,6 +1383,51 @@ def _power_lipschitz(Gt, power_iters=15):
         v = w / torch.clamp(w.norm(), min=torch.finfo(Gt.dtype).tiny)
     rayleigh = float(torch.dot(v, Gt @ v).item())
     return max(rayleigh * safety, 1e-12)
+
+
+def lasso_gram_footprint_bytes(n, m, reduce=False):
+    """[FIX GPU-MEM] peak device bytes of GpuLassoCV (fold-outer layout).
+
+    A (n x m) + the largest validation slice (<= n/2 x m) + G_full, the fold's
+    G_va temporary, G_tr and one Cholesky / eigvalsh workspace (4 m^2), plus
+    the Schur reduction (S, C) when an unpenalized block is eliminated.
+    """
+    n, m = int(n), int(m)
+    return int(8 * (1.5 * n * m + (6.0 if reduce else 4.0) * m * m)) + 64 * 1024 ** 2
+
+
+def _gram_ols_t(Gt, bt):
+    """[FIX CV-RES] least squares from the normal equations on the device.
+
+    Cholesky when G is positive definite, otherwise the eigen-decomposition
+    pseudo-inverse (min-norm solution of an underdetermined training fold).
+    """
+    torch = _torch()
+    try:
+        L = torch.linalg.cholesky(Gt)
+        x = torch.cholesky_solve(bt.unsqueeze(1), L).squeeze(1)
+        if bool(torch.isfinite(x).all().item()):
+            return x
+    except RuntimeError:
+        pass
+    w, V = torch.linalg.eigh(0.5 * (Gt + Gt.T))
+    cut = torch.clamp(w.max(), min=0.0) * Gt.shape[0] * torch.finfo(Gt.dtype).eps
+    winv = torch.where(w > cut, 1.0 / torch.where(w > cut, w, torch.ones_like(w)),
+                       torch.zeros_like(w))
+    return V @ (winv * (V.T @ bt))
+
+
+def _penalty_ref_t(penalty_weights):
+    """optimizer._penalty_ref for a torch tensor, ndarray or None."""
+    if penalty_weights is None:
+        return 1.0
+    torch = _torch()
+    if torch is not None and isinstance(penalty_weights, torch.Tensor):
+        w = penalty_weights.detach()
+        w = w[torch.isfinite(w) & (w > 0)]
+        return float(w.median().item()) if w.numel() else 1.0
+    from .optimizer import _penalty_ref
+    return _penalty_ref(penalty_weights)
 
 
 def _soft_threshold_t(x, thr):
@@ -1430,7 +1497,8 @@ class _FreeBlockReductionT(object):
 
 
 def _fista_gram(Gt, bt, alpha, x0=None, max_iter=3000, tol=1e-7,
-                lipschitz=None, penalty_weights=None, n_samples=None, _info=None):
+                lipschitz=None, penalty_weights=None, n_samples=None, _info=None,
+                alpha_tol_ratio=None, quiet=False):
     """FISTA LASSO on the precomputed Gram: min 0.5||Ax-y||^2 + alpha sum w|x|.
 
     Mirrors optimizer._fista_lasso (Gram path) on GPU tensors (same fixed point).
@@ -1489,6 +1557,11 @@ def _fista_gram(Gt, bt, alpha, x0=None, max_iter=3000, tol=1e-7,
             dtype=Gt.dtype, device=Gt.device)
     thr_vec = penalty * step
     kkt_scale = torch.clamp(bt.abs().max(), min=torch.finfo(bt.dtype).tiny)
+    # [FIX CV-RES] resolve the L1 term of THIS alpha (see optimizer._alpha_tolerance)
+    from .optimizer import _alpha_tolerance
+    _aware = alpha_tol_ratio is not None
+    tol, _pen_rel = _alpha_tolerance(tol, alpha, n_samples, _penalty_ref_t(penalty_weights),
+                                     float(kkt_scale.item()), alpha_tol_ratio)
 
     def kkt_relative(coef):
         gradient = Gt @ coef - bt
@@ -1580,7 +1653,7 @@ def _fista_gram(Gt, bt, alpha, x0=None, max_iter=3000, tol=1e-7,
                 prev_f = f_new
             dx = (x - x_prev).norm()
             xn = torch.clamp(x.norm(), min=1.0)
-            if bool((dx <= tol * xn).item()):
+            if _aware or bool((dx <= tol * xn).item()):
                 kkt = kkt_relative(x)
                 if np.isfinite(kkt) and kkt <= tol:
                     converged = True
@@ -1591,8 +1664,10 @@ def _fista_gram(Gt, bt, alpha, x0=None, max_iter=3000, tol=1e-7,
         converged = bool(np.isfinite(kkt) and kkt <= tol)
     if _info is not None:
         _info.update(n_iter=n_iter, converged=converged, kkt_relative=kkt,
-                     lipschitz=lipschitz, lipschitz_inflations=n_inflate)
-    if not converged:
+                     lipschitz=lipschitz, lipschitz_inflations=n_inflate,
+                     penalty_relative=_pen_rel, tol_effective=float(tol),
+                     resolved=bool(np.isfinite(kkt) and kkt <= _pen_rel))
+    if not converged and not quiet:
         import warnings
         warnings.warn("FISTA did not converge: iterations=%d, relative KKT=%g, tol=%g"
                       % (n_iter, kkt, tol), RuntimeWarning, stacklevel=2)
@@ -1612,7 +1687,10 @@ class GpuLassoCV(object):
 
     def __init__(self, alphas, cv, tol, max_iter, rand_seed, n_jobs=1,
                  fit_intercept=False, group_size=None, selection="cyclic",
-                 penalty_weights=None, grid_diag=None):
+                 penalty_weights=None, grid_diag=None, ols_reference=False):
+        # [FIX CV-RES] compare the path with its exact alpha -> 0 end.  Off for
+        # direct use; Optimizer switches it on for AUTO grids (ols_limit).
+        self.ols_reference = bool(ols_reference)
         self.alphas = np.sort(np.asarray(alphas, dtype=np.float64))
         self.cv = cv
         self.tol = tol
@@ -1662,31 +1740,23 @@ class GpuLassoCV(object):
 
         G_full = At.T @ At
         b_full = At.T @ yt
-        lip_full = None if _reduce else _power_lipschitz(G_full)
-
-        gram_folds = []
-        lip_folds = []
-        A_va_list = []
-        for tr, va in splits:
-            va_t = torch.as_tensor(np.asarray(va), dtype=torch.long, device=At.device)
-            A_va = At[va_t]
-            G_va = A_va.T @ A_va
-            b_va = A_va.T @ yt[va_t]
-            gram_folds.append((G_full - G_va, b_full - b_va))
-            lip_folds.append(None if _reduce else _power_lipschitz(G_full - G_va))
-            A_va_list.append(A_va)
 
         cv_tol = float(os.environ.get(
             "PHEASY_CV_TOL", str(max(float(self.tol), 1e-3))))
         cv_max_iter = int(os.environ.get(
             "PHEASY_CV_MAX_ITER", str(min(self.max_iter, 800))))
 
-        mse_path = np.zeros((n_alphas, len(splits)))
-        x_folds = [None] * len(splits)
-        x_full = None
-        best_i = 0
-        best_mean = float("inf")
-        best_x = None
+        # [FIX CV-RES] alpha-resolved CV (see optimizer._cv_alpha_aware_cfg)
+        from .optimizer import (_cv_alpha_aware_cfg, _select_cv_alpha,
+                                _cv_plateau_rtol, _plateau_step)
+        _aware, _rho, _stop_after, _ols_on = _cv_alpha_aware_cfg()
+        _ols_on = _ols_on and self.ols_reference
+        _ratio = _rho if _aware else None
+        _prtol = _cv_plateau_rtol() if (_aware and _ols_on) else 0.0
+        n_folds = len(splits)
+        mse_path = np.full((n_alphas, n_folds), np.nan)
+        resolved = np.zeros((n_alphas, n_folds), dtype=bool)
+        ols_mse = np.full(n_folds, np.nan) if _ols_on else None
         _cv_max_n_iter = 0
         # [D1] "hit the cap" must mean "hit the cap WITHOUT converging": the
         # periodic check runs at it % 20 == 19, so a fully converged fit can
@@ -1694,152 +1764,183 @@ class GpuLassoCV(object):
         # problem on a perfectly converged path.
         _cv_hit_cap = False
 
-        red_full = red_folds = None
+        # [FIX GPU-MEM] FOLD-outer loop: each fold's training Gram, its
+        # validation rows and (HARM_DENSE) its Schur reduction live only while
+        # that fold's alpha path runs.  The alpha-outer loop kept K training
+        # Grams, K reductions and a second full copy of A (the K validation
+        # slices) resident at once -- (K+1) p^2 + 2 n p floats, which the
+        # 4 n p pre-flight in _gpu_dense never counted.  The per-fold warm-start
+        # chain is independent of the other folds, so the order is free.
+        # [HARM_DENSE] zero weight == unpenalized column: every solve then runs
+        # on the reduced Gram (_FreeBlockReductionT), which carries its own
+        # Lipschitz constant, so lambda_max of the unreduced Grams is skipped.
         if _reduce:
-            # [HARM_DENSE] eliminate the unpenalized block exactly from every
-            # Gram (each fold from ITS OWN training Gram, so nothing leaks from
-            # the validation rows) and Jacobi-scale the rest: FISTA then iterates
-            # on the penalized block only, starting from z = 0, which is the
-            # exact top-of-grid solution.  See optimizer._FreeBlockReduction for
-            # why iterating the free block inside FISTA is too slow on raw
-            # FC2/FC3 column scales.
-            red_folds = [_FreeBlockReductionT(G_tr, b_tr, _free_t, pw)
-                         for G_tr, b_tr in gram_folds]
-            red_full = _FreeBlockReductionT(G_full, b_full, _free_t, pw)
             print("[HARM_DENSE] GPU Gram FISTA on the penalized block only: %d "
                   "free columns eliminated exactly (Schur complement), %d "
                   "penalized columns Jacobi-scaled"
                   % (int(_free_t.sum().item()), int((~_free_t).sum().item())),
                   flush=True)
+        # per-fold warm-start chain state, kept so the chain can be CONTINUED
+        # below the grid ([FIX CV-EXT]) instead of restarted
+        fold_x = [None] * n_folds
+        fold_state = [{"unres": 0, "plateau": [None, 0], "stopped": False}
+                      for _ in range(n_folds)]
 
-        for a_i in range(n_alphas - 1, -1, -1):
-            alpha = float(self.alphas[a_i])
-            fold_mse = np.zeros(len(splits))
-            for k, (tr, va) in enumerate(splits):
+        def fold_pass(k, alphas_desc, need_ols):
+            """Fold k's chain over alphas_desc (descending); rows aligned with it."""
+            nonlocal _cv_max_n_iter, _cv_hit_cap
+            tr, va = splits[k]
+            va_t = torch.as_tensor(np.asarray(va), dtype=torch.long, device=At.device)
+            A_va = At[va_t]
+            y_va = yt[va_t]
+            G_tr = G_full - A_va.T @ A_va
+            b_tr = b_full - A_va.T @ y_va
+            red = lip = None
+            if _reduce:
+                # [HARM_DENSE] each fold from ITS OWN training Gram (no leak)
+                red = _FreeBlockReductionT(G_tr, b_tr, _free_t, pw)
+            else:
+                lip = _power_lipschitz(G_tr)
+            st = fold_state[k]
+            x_k = fold_x[k]
+            m_k = np.full(len(alphas_desc), np.nan)
+            r_k = np.zeros(len(alphas_desc), dtype=bool)
+            for j, alpha in enumerate(alphas_desc):
+                if st["stopped"]:
+                    break
                 _fold_info = {}
-                if red_folds is not None:
-                    _r = red_folds[k]
-                    coef, nit = _fista_gram(_r.S, _r.s, alpha, x0=x_folds[k],
+                if red is not None:
+                    coef, nit = _fista_gram(red.S, red.s, float(alpha), x0=x_k,
                                             max_iter=cv_max_iter, tol=cv_tol,
-                                            lipschitz=_r.lip, penalty_weights=_r.w,
-                                            n_samples=len(tr), _info=_fold_info)
-                    coef_full = _r.to_full(coef)
+                                            lipschitz=red.lip, penalty_weights=red.w,
+                                            n_samples=len(tr), _info=_fold_info,
+                                            alpha_tol_ratio=_ratio, quiet=True)
+                    coef_full = red.to_full(coef)
                 else:
-                    coef, nit = _fista_gram(gram_folds[k][0], gram_folds[k][1], alpha,
-                                            x0=x_folds[k], max_iter=cv_max_iter, tol=cv_tol,
-                                            lipschitz=lip_folds[k], penalty_weights=pw,
-                                            n_samples=len(tr), _info=_fold_info)
+                    coef, nit = _fista_gram(G_tr, b_tr, float(alpha), x0=x_k,
+                                            max_iter=cv_max_iter, tol=cv_tol,
+                                            lipschitz=lip, penalty_weights=pw,
+                                            n_samples=len(tr), _info=_fold_info,
+                                            alpha_tol_ratio=_ratio, quiet=True)
                     coef_full = coef
-                va_t = torch.as_tensor(np.asarray(va), dtype=torch.long, device=At.device)
-                pred = A_va_list[k] @ coef_full
-                x_folds[k] = coef
+                x_k = coef
                 _cv_max_n_iter = max(_cv_max_n_iter, nit)
                 if nit >= cv_max_iter and not _fold_info.get("converged", False):
                     _cv_hit_cap = True
-                err = pred - yt[va_t]
-                fold_mse[k] = float((err * err).mean().item())
-            mse_path[a_i] = fold_mse
-            mean = float(fold_mse.mean())
+                err = A_va @ coef_full - y_va
+                m_k[j] = float((err * err).mean().item())
+                _res = bool(_fold_info.get("resolved", True)) if _aware else True
+                r_k[j] = _res
+                if _aware:
+                    st["unres"] = 0 if _res else st["unres"] + 1
+                    if st["unres"] >= _stop_after or _plateau_step(
+                            st["plateau"], m_k[j], _res, _prtol):
+                        st["stopped"] = True
+            fold_x[k] = x_k
+            o_k = float("nan")
+            if need_ols:
+                # [FIX CV-RES] the alpha -> 0 end: exact least squares on THIS
+                # fold's training Gram
+                _e = A_va @ _gram_ols_t(G_tr, b_tr) - y_va
+                o_k = float((_e * _e).mean().item())
+            return m_k, r_k, o_k
 
-            _full_info = {}
-            if red_full is not None:
-                x_full, nit = _fista_gram(red_full.S, red_full.s, alpha, x0=x_full,
-                                          max_iter=cv_max_iter, tol=cv_tol,
-                                          lipschitz=red_full.lip,
-                                          penalty_weights=red_full.w,
-                                          n_samples=n_samples, _info=_full_info)
-            else:
-                x_full, nit = _fista_gram(G_full, b_full, alpha, x0=x_full,
-                                          max_iter=cv_max_iter, tol=cv_tol,
-                                          lipschitz=lip_full, penalty_weights=pw,
-                                          n_samples=n_samples, _info=_full_info)
-            # Full-data warm-start solve: feeds the "max iterations" message but
-            # must not set the hit-cap flag (that is a CV-convergence diagnosis).
-            _cv_max_n_iter = max(_cv_max_n_iter, nit)
-            if mean <= best_mean:
-                best_mean = mean
-                best_i = a_i
-                best_x = x_full.clone()
+        _desc = self.alphas[::-1]
+        for k in range(n_folds):
+            m_k, r_k, o_k = fold_pass(k, _desc, _ols_on)
+            mse_path[:, k] = m_k[::-1]
+            resolved[:, k] = r_k[::-1]
+            if _ols_on:
+                ols_mse[k] = o_k
 
-        # tie / edge diagnostics (mirror _LassoCVIterative so holdout flags work)
-        mean_path = mse_path.mean(axis=1)
-        rtol = float(os.environ.get("PHEASY_LASSO_TIE_RTOL", "1e-9"))
-        tied = np.flatnonzero(mean_path <= best_mean * (1.0 + rtol) + 1e-300)
-        if tied.size > 1:
-            if _cv_hit_cap:
-                print("[CV] WARNING: %d alphas tie at CV MSE %.6e (%.3e ... %.3e). "
-                      "The CV solver (FISTA, tol=%.0e) hit cv_max_iter (%d) and is "
-                      "too loose to separate them -- lower PHEASY_CV_TOL / raise "
-                      "PHEASY_CV_MAX_ITER."
-                      % (tied.size, best_mean, float(self.alphas[tied].min()),
-                         float(self.alphas[tied].max()), cv_tol, cv_max_iter),
-                      flush=True)
-            else:
-                print("[CV] WARNING: %d alphas tie at CV MSE %.6e (%.3e ... %.3e); "
-                      "FISTA already converged (max %d iters < %d), so the CV tail "
-                      "is genuinely flat."
-                      % (tied.size, best_mean, float(self.alphas[tied].min()),
-                         float(self.alphas[tied].max()), _cv_max_n_iter,
-                         cv_max_iter), flush=True)
-        # PHEASY_LASSO_1SE: one-standard-error rule (largest alpha within 1 SE
-        # of the CV minimum) -- matches _reselect_alpha on the dense path.
-        if os.environ.get("PHEASY_LASSO_1SE", "0").lower() in ("1", "true", "yes"):
-            se = float(mse_path[best_i].std(ddof=1) / np.sqrt(mse_path.shape[1])) \
-                if mse_path.shape[1] > 1 else 0.0
-            cand = np.flatnonzero(mean_path <= best_mean + se)
-            best_i = int(cand[np.argmax(self.alphas[cand])])
-        self._alpha_at_min = (best_i == 0)
-        self._alpha_at_min_flat = (
-            self._alpha_at_min and tied.size > 1
-            and float(self.alphas[tied].min()) <= float(self.alphas.min()) * (1.0 + 1e-12))
-        self._alpha_at_min_hitcap = self._alpha_at_min_flat and _cv_hit_cap
-        if self._alpha_at_min:
-            if self.grid_diag:
-                print("[CV] WARNING: alpha* %.3e sits at the grid MINIMUM; %s"
-                      % (float(self.alphas[0]), self.grid_diag), flush=True)
-            elif self._alpha_at_min_hitcap:
-                print("[CV] WARNING: alpha* %.3e sits at the grid MINIMUM via the "
-                      "tie-break on a FLAT CV tail AND FISTA hit cv_max_iter; this "
-                      "is a CONVERGENCE problem (lower PHEASY_CV_TOL / raise "
-                      "PHEASY_CV_MAX_ITER), not a model-density conclusion."
-                      % float(self.alphas[0]), flush=True)
-            elif self._alpha_at_min_flat:
-                print("[CV] WARNING: alpha* %.3e sits at the grid MINIMUM on a flat "
-                      "CV tail, but FISTA already converged (max %d iters): alpha* "
-                      "is not well-determined by CV (not a convergence problem)."
-                      % (float(self.alphas[0]), _cv_max_n_iter), flush=True)
-            else:
-                print("[CV] WARNING: alpha* %.3e sits at the grid MINIMUM; the CV "
-                      "curve is still falling at the low end, so widening the grid "
-                      "only pushes alpha* toward OLS. Treat this fit as effectively "
-                      "unregularized (compare with OLS/RFE)."
-                      % float(self.alphas[0]), flush=True)
+        # [FIX CV-EXT] optimum at the grid bottom and better than the OLS limit:
+        # continue every fold's chain further down
+        from .optimizer import _cv_extend_cfg, _extension_grid
+        _max_ext, _ext_step = _cv_extend_cfg()
+        extended = 0.0
+        while True:
+            _pre = _select_cv_alpha(self.alphas, mse_path, resolved, ols_mse, quiet=True)
+            if not (_pre.get("extend") and extended < _max_ext - 1e-9):
+                break
+            _step = min(_ext_step, _max_ext - extended)
+            new = _extension_grid(self.alphas, _step)
+            print("[CV] the CV curve is still falling at the grid bottom (alpha %.3e): "
+                  "extending the grid %.1f decades down to %.3e (%d more alphas, "
+                  "warm-started)"
+                  % (float(self.alphas[0]), _step, float(new.min()), new.size), flush=True)
+            new_mse = np.full((new.size, n_folds), np.nan)
+            new_res = np.zeros((new.size, n_folds), dtype=bool)
+            for k in range(n_folds):
+                m_k, r_k, _ = fold_pass(k, new[::-1], False)
+                new_mse[:, k] = m_k[::-1]
+                new_res[:, k] = r_k[::-1]
+            self.alphas = np.concatenate([new, self.alphas])
+            mse_path = np.vstack([new_mse, mse_path])
+            resolved = np.vstack([new_res, resolved])
+            extended += _step
+        n_alphas = len(self.alphas)
+        fold_x[:] = [None] * n_folds        # free the per-fold iterates
 
-        self.alpha_ = float(self.alphas[best_i])
+        sel = _select_cv_alpha(self.alphas, mse_path, resolved, ols_mse)
+        best_i = sel["best"]
+        self.cv_resolved_ = resolved
+        self.ols_cv_mse_ = ols_mse
+        self.cv_selection_ = {"n_resolved": sel["n_valid"], "ols_mean": sel["ols_mean"],
+                              "fallback": sel["fallback"], "extended_decades": extended,
+                              "bracketed": sel.get("bracketed", False)}
+        self._alpha_is_zero = best_i == -1
+        self._alpha_at_min = bool(sel["at_min"])
+        self._alpha_at_min_flat = bool(sel["at_min"] and sel["flat"])
+        self._alpha_at_min_hitcap = bool(sel["fallback"] and _cv_hit_cap)
+        if self.grid_diag and sel["at_min"] and best_i != -1:
+            print("[CV] WARNING: alpha* sits at the grid MINIMUM; %s" % self.grid_diag,
+                  flush=True)
+
         final_info = {}
-        if red_full is not None:
-            z_t, nfin = _fista_gram(red_full.S, red_full.s, self.alpha_, x0=best_x,
-                                    max_iter=self.max_iter,
-                                    tol=float(self.tol),
-                                    lipschitz=red_full.lip,
-                                    penalty_weights=red_full.w,
-                                    n_samples=n_samples, _info=final_info)
-            coef_t = red_full.to_full(z_t)
-            # certificate of the reduced problem: relative to the penalized
-            # block's own gradient, not the FC2-dominated max|A^T y|
-            final_info["harm_dense_reduction"] = "schur_complement+jacobi"
+        if best_i == -1:
+            self.alpha_ = 0.0
+            coef_t = _gram_ols_t(G_full, b_full)
+            nfin = 0
+            final_info.update(converged=bool(torch.isfinite(coef_t).all().item()),
+                              stop_reason="exact_normal_equations", n_iter=0)
+            _solver = "OLS (alpha->0 limit selected by CV)"
         else:
-            coef_t, nfin = _fista_gram(G_full, b_full, self.alpha_, x0=best_x,
-                                       max_iter=self.max_iter,
-                                       tol=float(self.tol),
-                                       lipschitz=lip_full, penalty_weights=pw,
-                                       n_samples=n_samples, _info=final_info)
+            self.alpha_ = float(self.alphas[best_i])
+            if _reduce:
+                red_full = _FreeBlockReductionT(G_full, b_full, _free_t, pw)
+                S_f, s_f, lip_f, pw_f = red_full.S, red_full.s, red_full.lip, red_full.w
+            else:
+                red_full = None
+                S_f, s_f, lip_f, pw_f = G_full, b_full, _power_lipschitz(G_full), pw
+            # full-data descending warm-start path down to alpha* only (the
+            # path below alpha* is never used)
+            x_full = None
+            for a_i in range(n_alphas - 1, best_i, -1):
+                x_full, nit = _fista_gram(S_f, s_f, float(self.alphas[a_i]), x0=x_full,
+                                          max_iter=cv_max_iter, tol=cv_tol,
+                                          lipschitz=lip_f, penalty_weights=pw_f,
+                                          n_samples=n_samples, _info={},
+                                          alpha_tol_ratio=_ratio, quiet=True)
+                _cv_max_n_iter = max(_cv_max_n_iter, nit)
+            z_t, nfin = _fista_gram(S_f, s_f, self.alpha_, x0=x_full,
+                                    max_iter=self.max_iter, tol=float(self.tol),
+                                    lipschitz=lip_f, penalty_weights=pw_f,
+                                    n_samples=n_samples, _info=final_info,
+                                    alpha_tol_ratio=_ratio)
+            if red_full is not None:
+                coef_t = red_full.to_full(z_t)
+                # certificate of the reduced problem: relative to the penalized
+                # block's own gradient, not the FC2-dominated max|A^T y|
+                final_info["harm_dense_reduction"] = "schur_complement+jacobi"
+            else:
+                coef_t = z_t
+            _solver = "GPU FISTA"
         self.coef_ = _to_numpy(coef_t, np.float64)
         self.intercept_ = 0.0
         self.alphas_ = self.alphas
         self.mse_path_ = mse_path
         self.n_iter_ = int(nfin)
-        self.regularized_solver_info_ = dict(final_info, solver="GPU FISTA",
+        self.regularized_solver_info_ = dict(final_info, solver=_solver,
                                             backend="gpu_dense_fista",
                                             stage="regularized_refit_before_debias", tol=float(self.tol))
         self.n_features_in_ = m
@@ -1877,7 +1978,11 @@ class GpuRidgeCV(object):
             raise NotImplementedError(
                 "GpuRidgeCV: pre-scale A,y by sqrt(weights) before calling")
         y64 = np.asarray(y, dtype=np.float64).ravel()
-        A64 = np.ascontiguousarray(A, dtype=np.float64)
+        # [FIX HOST-MEM] keep the caller's precision on the host (float32 stays
+        # float32); every device widens its own copy.
+        A64 = np.ascontiguousarray(A)
+        if A64.dtype.kind != "f":
+            A64 = A64.astype(np.float64)
         n, m = A64.shape
         splits = _make_cv_splits(n, self.cv, self.rand_seed, self.group_size)
         alphas = self.alphas  # sorted ascending (see __init__)
@@ -1906,29 +2011,27 @@ class GpuRidgeCV(object):
             print("[GPU] RIDGE CV fold-parallel on %d device(s); fold footprint "
                   "~%.2f GB" % (len(devs), footprint / 1e9), flush=True)
 
-        # [M2] pre-slice fold arrays in the PARENT: numpy fancy indexing
-        # (A64[tr]) holds the GIL, so doing it per-thread serialized the
-        # parallel SVD work. Cost: all folds' slices resident in host RAM
-        # (~cv x n_train x m x 8; c7 5-fold ~3 GB -- acceptable).
-        pre_sliced = [
-            (np.ascontiguousarray(A64[tr]), np.ascontiguousarray(y64[tr]),
-             np.ascontiguousarray(A64[va]), np.ascontiguousarray(y64[va]))
-            for tr, va in splits
-        ]
+        # [FIX HOST-MEM] slice ONE fold at a time, in the matrix's own
+        # precision, and widen it on the device.  All folds used to be
+        # pre-sliced up front as float64 host copies (~cv x A of RAM held for the
+        # whole CV, plus the float64 copy of A itself).  The per-fold slice is a
+        # short GIL-held memcpy next to a multi-second SVD, and the device
+        # footprint is unchanged (one fold at a time, as before).
 
         def _fold_cpu(k):
-            Atr, ytr, Ava, yva = pre_sliced[k]
-            U, S, Vh = np.linalg.svd(Atr, full_matrices=False)
-            Uty = U.T @ ytr
-            AvV = Ava @ Vh.T                  # A_va @ V  (Vh = V^H; real -> V^T)
+            tr, va = splits[k]
+            U, S, Vh = np.linalg.svd(np.asarray(A64[tr], dtype=np.float64),
+                                     full_matrices=False)
+            Uty = U.T @ y64[tr]
+            AvV = np.asarray(A64[va], dtype=np.float64) @ Vh.T
             col = np.empty(len(alphas), dtype=np.float64)
             for j, a in enumerate(alphas):
                 pred = AvV @ ((S / (S * S + float(a))) * Uty)
-                col[j] = float(((pred - yva) ** 2).mean())
+                col[j] = float(((pred - y64[va]) ** 2).mean())
             return col
 
         def _fold(k, dev):
-            Atr, ytr, Ava, yva = pre_sliced[k]
+            tr, va = splits[k]
             # [M1] torch's CURRENT device is thread-local and inherits cuda:0;
             # cuSOLVER handles/workspace follow the current device, so pin the
             # thread to the fold's device (avoids wrong-device workspace).
@@ -1938,12 +2041,14 @@ class GpuRidgeCV(object):
             try:
                 with torch.cuda.device(dev):
                     d = torch.device("cuda:%d" % dev)
-                    At = torch.as_tensor(Atr, dtype=torch.float64, device=d)
-                    yt = torch.as_tensor(ytr, dtype=torch.float64, device=d)
-                    Avat = torch.as_tensor(Ava, dtype=torch.float64, device=d)
-                    yvat = torch.as_tensor(yva, dtype=torch.float64, device=d)
+                    At = torch.as_tensor(A64[tr], device=d).to(torch.float64)
+                    yt = torch.as_tensor(y64[tr], device=d)
+                    Avat = torch.as_tensor(A64[va], device=d).to(torch.float64)
+                    yvat = torch.as_tensor(y64[va], device=d)
                     U, S, Vh = torch.linalg.svd(At, full_matrices=False)
+                    del At
                     Uty = U.T @ yt
+                    del U
                     AvV = Avat @ Vh.T         # A_va @ V  (Vh = V^H; real -> V^T)
                     col = np.empty(len(alphas), dtype=np.float64)
                     for j, a in enumerate(alphas):
@@ -3542,7 +3647,7 @@ def _fista_floor_cfg(auto_floor=None, max_iter=None):
 
 
 def _fista_twolevel(A, y, alpha, x0, max_iter, tol, lipschitz, rows=None, penalty_weights=None, n_samples=None,
-                    auto_floor=None):
+                    auto_floor=None, alpha_tol_ratio=None, quiet=False):
     """Device FISTA, adaptive restart and exact L1 KKT certificate.
 
     No NumPy or vector host transfers in the iteration loop. Scalar syncs are
@@ -3572,6 +3677,12 @@ def _fista_twolevel(A, y, alpha, x0, max_iter, tol, lipschitz, rows=None, penalt
             penalty_vec = penalty * torch.as_tensor(np.asarray(penalty_weights), dtype=y.dtype, device=y.device)
         if penalty_vec.numel() != A.shape[1] or not bool(torch.isfinite(penalty_vec).all().item()) or bool((penalty_vec < 0).any().item()):
             raise ValueError("penalty_weights must be finite and nonnegative with one value per feature")
+    # [FIX CV-RES] the stopping tolerance must resolve the L1 term of THIS alpha:
+    # min(tol, ratio * alpha*n*q / max|A^T y|), q = median penalty weight.
+    from .optimizer import _alpha_tolerance
+    tol, _pen_rel = _alpha_tolerance(
+        tol, alpha, (n if n_samples is None else n_samples),
+        _penalty_ref_t(penalty_weights), float(scale.item()), alpha_tol_ratio)
     x = torch.zeros(A.shape[1], dtype=y.dtype, device=y.device) if x0 is None else x0.clone()
     z = x.clone()
     momentum = torch.ones((), dtype=y.dtype, device=y.device)
@@ -3734,13 +3845,82 @@ def _fista_twolevel(A, y, alpha, x0, max_iter, tol, lipschitz, rows=None, penalt
                 lipschitz=float(L), lipschitz_inflations=n_inflate,
                 stop_reason=stop_reason, tol_requested=tol_requested,
                 tol_effective=tol_eff, measured_floor=measured_floor,
-                stall_points=int(_stall_limit))
-    if not converged:
+                stall_points=int(_stall_limit), penalty_relative=_pen_rel,
+                resolved=bool(np.isfinite(value) and value <= _pen_rel))
+    if not converged and not quiet:
         import warnings
         warnings.warn("Resident FISTA did not converge: iterations=%d, relative KKT=%g, tol=%g"
                       " (stop_reason=%s)" %
                       (n_iter, value, tol, stop_reason), RuntimeWarning, stacklevel=2)
     return x, info
+
+
+def _masked_cgls(A, y, rows=None, x0=None, tol=1e-6, maxiter=2000, refresh=50):
+    """[FIX CV-RES] CGLS for min ||M (A x - y)||, M the 0/1 mask of ``rows``.
+
+    The alpha -> 0 (OLS) reference of a resident CV fold.  It stops on the same
+    relative KKT measure FISTA uses at alpha = 0,
+        max|A^T M (A x - y)| / max|A^T M y| <= tol,
+    so the reference and the path are certified in the same units.  The
+    recurrence residual is recomputed every ``refresh`` iterations (float32
+    drift) and the best certified iterate is returned.  Device agnostic.
+    """
+    torch = A.torch
+    mask = torch.ones_like(y) if rows is None else torch.zeros_like(y)
+    if rows is not None:
+        mask[rows] = 1
+    ym = y * mask
+    tiny = torch.finfo(y.dtype).tiny
+    scale = float(torch.clamp(A.rmatvec(ym).abs().max(), min=tiny).item())
+    if x0 is None:
+        x = torch.zeros(A.shape[1], dtype=y.dtype, device=y.device)
+        r = ym.clone()
+    else:
+        x = x0.to(device=y.device, dtype=y.dtype).clone()
+        r = ym - A.matvec(x) * mask
+    s = A.rmatvec(r)
+    p = s.clone()
+    gamma = torch.dot(s, s)
+    kkt = float(s.abs().max().item()) / scale
+    best_kkt, best_x = kkt, x.clone()
+    n_iter = 0
+    stop = "converged" if kkt <= tol else "iteration_limit"
+    while kkt > tol and n_iter < int(maxiter):
+        q = A.matvec(p) * mask
+        denom = torch.dot(q, q)
+        if not bool(torch.isfinite(denom).item()) or float(denom.item()) <= 0.0:
+            stop = "invalid_search_direction"
+            break
+        step = gamma / denom
+        x = x + step * p
+        r = r - step * q
+        n_iter += 1
+        honest = n_iter % int(refresh) == 0
+        if honest:
+            r = ym - A.matvec(x) * mask
+        s = A.rmatvec(r)
+        if honest or n_iter % 10 == 0:
+            kkt = float(s.abs().max().item()) / scale
+            if kkt < best_kkt:
+                best_kkt, best_x = kkt, x.clone()
+            if kkt <= tol:
+                stop = "converged"
+                break
+        gamma_new = torch.dot(s, s)
+        if not bool(torch.isfinite(gamma_new).item()):
+            stop = "invalid_gradient_recurrence"
+            break
+        p = s.clone() if honest else s + (gamma_new / gamma) * p
+        gamma = gamma_new
+    # certify the delivered vector on the recomputed residual
+    r = ym - A.matvec(x) * mask
+    kkt = float(A.rmatvec(r).abs().max().item()) / scale
+    if best_kkt < kkt:
+        x, kkt = best_x, best_kkt
+    return x, {"solver": "masked CGLS", "n_iter": n_iter, "kkt_relative": kkt,
+               "converged": bool(np.isfinite(kkt) and kkt <= tol), "tol": float(tol),
+               "stop_reason": ("converged" if kkt <= tol else
+                               ("iteration_limit" if stop == "converged" else stop))}
 
 
 def _resident_cv_devices():
@@ -3837,7 +4017,10 @@ class GpuTwoLevelLassoCV(GpuLassoCV):
     """
     def __init__(self, *args, standardize=False, adaptive=False, gamma=1.0,
                  init_alpha=1e-3, eps=1e-8, nalpha=None, decades=4.0,
-                 alpha_auto=True, unpenalized=None, **kwargs):
+                 alpha_auto=True, unpenalized=None, ols_reference=False, **kwargs):
+        # [FIX CV-RES] exact alpha -> 0 end of the CV path; Optimizer turns it on
+        # for AUTO grids (ols_limit), direct callers opt in.
+        kwargs.setdefault("ols_reference", ols_reference)
         super().__init__(*args, **kwargs)
         self.standardize = standardize
         self.adaptive = bool(adaptive)
@@ -3943,15 +4126,23 @@ class GpuTwoLevelLassoCV(GpuLassoCV):
         # FISTA has to crawl through.  Iterate in z = s*x (s = column norms) and
         # carry the model in the weights, w_z = w_x / s: an exact
         # reparametrization, so the unstandardized objective is unchanged.
+        # [FIX RES-JACOBI] ... and for EVERY unstandardized fit, not only with an
+        # unpenalized block: raw FC2/FC3 columns differ ~40x in norm, i.e. ~1600x
+        # in curvature, which is what makes the capped CV solves stall long
+        # before they resolve small alphas.  The model (unstandardized L1
+        # penalty) is unchanged -- only the iteration coordinates are scaled.
+        # PHEASY_RESIDENT_JACOBI=0 (or the older PHEASY_HARM_DENSE_JACOBI=0)
+        # restores the raw iteration.
         jac = None
-        if (not self.standardize and self.unpenalized is not None
-                and bool(np.asarray(self.unpenalized, dtype=bool).any())
+        if (not self.standardize
+                and os.environ.get("PHEASY_RESIDENT_JACOBI", "1").strip().lower()
+                not in ("0", "false", "no", "off")
                 and os.environ.get("PHEASY_HARM_DENSE_JACOBI", "1").strip().lower()
                 not in ("0", "false", "no", "off")):
             op.normalize()
             jac = op.scale.clone()
-            print("[HARM_DENSE] resident: internal Jacobi scaling (unstandardized "
-                  "model kept through the L1 weights)", flush=True)
+            print("[gpu_resident] internal Jacobi scaling (unstandardized model kept "
+                  "through the L1 weights)", flush=True)
         print("[gpu_resident] Lipschitz estimate started", flush=True)
         L = op.lipschitz()
         print("[gpu_resident] Lipschitz estimate ready elapsed=%.2fs" % (time.monotonic() - started), flush=True)
@@ -4070,6 +4261,10 @@ class GpuTwoLevelLassoCV(GpuLassoCV):
         if free_t is not None and penalty_weights is None:
             # [HARM_DENSE] plain LASSO: unit weight on the penalized block only
             penalty_weights = pen_mask_t
+        elif jac is not None and penalty_weights is None:
+            # [FIX RES-JACOBI] plain LASSO in z = s*x: weight 1/s keeps the
+            # unstandardized penalty alpha*|x_j| exactly
+            penalty_weights = 1.0 / jac
         cv_tol = float(os.environ.get("PHEASY_CV_TOL", str(max(self.tol, 1e-3))))
         # CV only needs the MSE *ranking* across alphas, not a tight solution per
         # alpha. The mid-grid alphas (the sparse->dense transition) converge
@@ -4079,6 +4274,18 @@ class GpuTwoLevelLassoCV(GpuLassoCV):
         cv_cap = int(os.environ.get("PHEASY_CV_MAX_ITER", str(min(self.max_iter, 400))))
         if cv_cap < 1 or cv_tol <= 0:
             raise ValueError("CV max_iter and tol must be positive")
+        # [FIX CV-RES] alpha-resolved CV: every (alpha, fold) solve must push its
+        # KKT residual below the L1 penalty of THAT alpha, a fold stops descending
+        # once alphas become unresolvable, and each fold's exact least-squares
+        # fit supplies the alpha -> 0 end of the path (see optimizer).
+        from .optimizer import (_cv_alpha_aware_cfg, _select_cv_alpha,
+                                _cv_plateau_rtol, _plateau_step)
+        _aware, _rho, _stop_after, _ols_on = _cv_alpha_aware_cfg()
+        _ols_on = _ols_on and self.ols_reference
+        _ratio = _rho if _aware else None
+        _prtol = _cv_plateau_rtol() if (_aware and _ols_on) else 0.0
+        ols_cap = int(os.environ.get("PHEASY_CV_OLS_MAX_ITER", str(max(5 * cv_cap, 2000))))
+        _prec_floor = 20.0 * float(torch.finfo(yt.dtype).eps)
         # Factors were replicated once per card at upload time, never once per
         # fold. Copy primary normalization and power estimate to keep numerical
         # setup identical. Every selected card fit the FULL factors (preflighted
@@ -4089,54 +4296,150 @@ class GpuTwoLevelLassoCV(GpuLassoCV):
             replica._norma = None
             resources.append((replica, yt.to(dev), L.to(dev)))
         self.cv_devices_ = [str(dev) for dev in devices]
-        print("[gpu_resident] dynamic CV devices=%s folds=%d primary=%s" %
-              (self.cv_devices_, len(splits), op.device), flush=True)
+        print("[gpu_resident] dynamic CV devices=%s folds=%d primary=%s alpha_resolved=%s"
+              % (self.cv_devices_, len(splits), op.device, _aware), flush=True)
         # Complete caller-stream setup before handing tensors to dispatchers.
         for dev in devices:
             if torch.device(dev).type == "cuda":
                 torch.cuda.synchronize(dev)
 
-        def solve_fold(resource, k, fold):
-            worker, target, estimate = resource
-            with _resident_device_context(worker.device):
-                tr, va = fold
-                trt = torch.as_tensor(tr, dtype=torch.int64, device=worker.device)
-                vat = torch.as_tensor(va, dtype=torch.int64, device=worker.device)
-                values = torch.empty(len(self.alphas), dtype=target.dtype, device=worker.device)
-                x = None
-                if free_idx_np is not None:
-                    # [HARM_DENSE] top-of-grid solution on THIS fold's rows
-                    _xk, _ = solve_resident_subset(worker, target, free_idx_np, rows=tr,
-                                                   raise_on_nonconvergence=False)
-                    x = torch.zeros(A.shape[1], dtype=target.dtype, device=worker.device)
-                    x[torch.as_tensor(free_idx_np, dtype=torch.long,
-                                      device=worker.device)] = _xk.to(target.dtype)
-                infos = []
-                for i in range(len(self.alphas) - 1, -1, -1):
-                    # CV folds are a capped, ranking-only approximation by design:
-                    # hitting the cap is information (see _cv_hit_cap), not waste.
-                    x, info = _fista_twolevel(worker, target, float(self.alphas[i]), x,
-                                             cv_cap, cv_tol, estimate, trt,
-                                             penalty_weights=penalty_weights, n_samples=int(trt.numel()),
-                                             auto_floor=False)
-                    err = worker.matvec(x)[vat] - target[vat]
-                    values[i] = err.square().mean()
-                    infos.append(dict(info, alpha=float(self.alphas[i])))
-                    print("[gpu_resident] device=%s fold=%d/%d alpha=%.6e n_iter=%d kkt=%.3e converged=%s elapsed=%.2fs" %
-                          (worker.device, k + 1, len(splits), self.alphas[i], info["n_iter"],
-                           info["kkt_relative"], info["converged"], time.monotonic() - started), flush=True)
-                # Complete the fold on its own card, not on another busy GPU.
-                if torch.device(worker.device).type == "cuda":
-                    torch.cuda.synchronize(worker.device)
-                return values, infos, str(worker.device)
+        # Per-fold chain state survives the pass, so a [FIX CV-EXT] extension
+        # CONTINUES each fold's warm start below the grid (on whichever device
+        # the dynamic map hands the fold to) instead of restarting it.
+        fold_state = [{"x": None, "unres": 0, "plateau": [None, 0], "on_plateau": False,
+                       "pen_rel_min": None, "started": False} for _ in splits]
 
-        results = _dynamic_fold_map(resources, splits, solve_fold)
+        def make_solver(alphas_desc, do_ols):
+            def solve_fold(resource, k, fold):
+                worker, target, estimate = resource
+                st = fold_state[k]
+                with _resident_device_context(worker.device):
+                    tr, va = fold
+                    trt = torch.as_tensor(tr, dtype=torch.int64, device=worker.device)
+                    vat = torch.as_tensor(va, dtype=torch.int64, device=worker.device)
+                    values = np.full(len(alphas_desc), np.nan)
+                    res_flags = np.zeros(len(alphas_desc), dtype=bool)
+                    pw_dev = (None if penalty_weights is None
+                              else penalty_weights.to(worker.device))
+                    x = None if st["x"] is None else st["x"].to(worker.device)
+                    if not st["started"] and free_idx_np is not None:
+                        # [HARM_DENSE] top-of-grid solution on THIS fold's rows
+                        _xk, _ = solve_resident_subset(worker, target, free_idx_np, rows=tr,
+                                                       raise_on_nonconvergence=False)
+                        x = torch.zeros(A.shape[1], dtype=target.dtype, device=worker.device)
+                        x[torch.as_tensor(free_idx_np, dtype=torch.long,
+                                          device=worker.device)] = _xk.to(target.dtype)
+                    st["started"] = True
+                    infos = []
+                    for j, alpha in enumerate(alphas_desc):
+                        alpha = float(alpha)
+                        if _aware and (st["unres"] >= _stop_after or st["on_plateau"]):
+                            infos.append(dict(alpha=alpha, skipped=True,
+                                              reason=("alpha -> 0 plateau (OLS limit)"
+                                                      if st["on_plateau"] else
+                                                      "below the solver's resolution")))
+                            continue
+                        # CV folds are a capped, ranking-only approximation by design:
+                        # hitting the cap is information (see _cv_hit_cap), not waste.
+                        x, info = _fista_twolevel(worker, target, alpha, x,
+                                                 cv_cap, cv_tol, estimate, trt,
+                                                 penalty_weights=pw_dev, n_samples=int(trt.numel()),
+                                                 auto_floor=False, alpha_tol_ratio=_ratio,
+                                                 quiet=True)
+                        err = worker.matvec(x)[vat] - target[vat]
+                        values[j] = float(err.square().mean().item())
+                        res_i = bool(info.get("resolved", True)) if _aware else True
+                        res_flags[j] = res_i
+                        if res_i:
+                            st["unres"] = 0
+                            st["pen_rel_min"] = float(info.get("penalty_relative", 0.0))
+                        else:
+                            st["unres"] += 1
+                        if _aware:
+                            st["on_plateau"] = _plateau_step(st["plateau"], values[j],
+                                                             res_i, _prtol)
+                        infos.append(dict(info, alpha=alpha))
+                        print("[gpu_resident] device=%s fold=%d/%d alpha=%.6e n_iter=%d kkt=%.3e "
+                              "pen=%.3e resolved=%s elapsed=%.2fs" %
+                              (worker.device, k + 1, len(splits), alpha, info["n_iter"],
+                               info["kkt_relative"], info.get("penalty_relative", float("nan")),
+                               res_i, time.monotonic() - started), flush=True)
+                    st["x"] = x
+                    ols_val = float("nan")
+                    ols_info = None
+                    if do_ols:
+                        # alpha -> 0 end of THIS fold's path: exact least squares on
+                        # the training rows, warm-started from the smallest-alpha
+                        # iterate.  It must be at least as accurate as the smallest
+                        # penalty it is compared with.
+                        _pm = st["pen_rel_min"]
+                        _need = cv_tol if _pm is None else min(cv_tol, _pm)
+                        _tol_o = max(_rho * _need, _prec_floor)
+                        x_o, ols_info = _masked_cgls(worker, target, trt, x0=x, tol=_tol_o,
+                                                     maxiter=ols_cap)
+                        ols_ok = bool(np.isfinite(ols_info["kkt_relative"])
+                                      and ols_info["kkt_relative"] <= max(_need, _prec_floor))
+                        ols_info["resolved"] = ols_ok
+                        if ols_ok:
+                            e_o = worker.matvec(x_o)[vat] - target[vat]
+                            ols_val = float(e_o.square().mean().item())
+                        del x_o
+                        print("[gpu_resident] device=%s fold=%d/%d OLS limit n_iter=%d kkt=%.3e "
+                              "(need <= %.3e) resolved=%s mse=%.6e elapsed=%.2fs" %
+                              (worker.device, k + 1, len(splits), ols_info["n_iter"],
+                               ols_info["kkt_relative"], max(_need, _prec_floor), ols_ok,
+                               ols_val, time.monotonic() - started), flush=True)
+                    # Complete the fold on its own card, not on another busy GPU.
+                    if torch.device(worker.device).type == "cuda":
+                        torch.cuda.synchronize(worker.device)
+                    return values, infos, str(worker.device), res_flags, ols_val, ols_info
+            return solve_fold
+
+        _desc = self.alphas[::-1]
+        results = _dynamic_fold_map(resources, splits, make_solver(_desc, _ols_on))
         # Only tiny MSE paths cross devices, after all dispatchers have joined.
         # Iterative vectors and factors never round-trip through host memory.
-        mse = torch.stack([result[0].to(op.device) for result in results], dim=1)
+        mse_np = np.stack([result[0][::-1] for result in results], axis=1)
+        resolved_np = np.stack([result[3][::-1] for result in results], axis=1)
+        ols_np = (np.asarray([result[4] for result in results], dtype=np.float64)
+                  if _ols_on else None)
         self.cv_solver_info_ = [result[1] for result in results]
         self.cv_fold_devices_ = [result[2] for result in results]
-        _cv_infos = [info for infos in self.cv_solver_info_ for info in infos]
+        self.ols_fold_info_ = [result[5] for result in results]
+        if _ols_on and ols_np is not None and not np.isfinite(ols_np).all():
+            print("[gpu_resident] OLS-limit reference not resolved in every fold within "
+                  "PHEASY_CV_OLS_MAX_ITER=%d; it is left out of the selection" % ols_cap,
+                  flush=True)
+
+        # [FIX CV-EXT] optimum at the grid bottom and better than the OLS limit:
+        # continue every fold's chain further down
+        from .optimizer import _cv_extend_cfg, _extension_grid
+        _max_ext, _ext_step = _cv_extend_cfg()
+        extended = 0.0
+        while True:
+            _pre = _select_cv_alpha(self.alphas, mse_np, resolved_np, ols_np, quiet=True)
+            if not (_pre.get("extend") and extended < _max_ext - 1e-9):
+                break
+            _step = min(_ext_step, _max_ext - extended)
+            _new = _extension_grid(self.alphas, _step)
+            print("[gpu_resident CV] the CV curve is still falling at the grid bottom "
+                  "(alpha %.3e): extending the grid %.1f decades down to %.3e (%d more "
+                  "alphas, warm-started)"
+                  % (float(self.alphas[0]), _step, float(_new.min()), _new.size),
+                  flush=True)
+            _res = _dynamic_fold_map(resources, splits, make_solver(_new[::-1], False))
+            mse_np = np.vstack([np.stack([r[0][::-1] for r in _res], axis=1), mse_np])
+            resolved_np = np.vstack([np.stack([r[3][::-1] for r in _res], axis=1),
+                                     resolved_np])
+            for _k, r in enumerate(_res):
+                self.cv_solver_info_[_k].extend(r[1])
+            self.alphas = np.concatenate([_new, self.alphas])
+            extended += _step
+        for _st in fold_state:
+            _st["x"] = None                 # free the per-fold iterates
+
+        _cv_infos = [info for infos in self.cv_solver_info_ for info in infos
+                     if not info.get("skipped")]
         max_cv_iterations = max((info["n_iter"] for info in _cv_infos), default=0)
         # [D1] "hit the cap" means "hit the cap without converging": a fold that
         # converges exactly at the cap used to be reported as a convergence
@@ -4146,86 +4449,82 @@ class GpuTwoLevelLassoCV(GpuLassoCV):
         for replica in owned[1:]:
             replica.close()
         resources.clear()
-        means = mse.mean(dim=1)
-        if not bool(torch.isfinite(means).all().item()):
-            raise RuntimeError("Resident CV produced nonfinite MSE")
-        # Match iterative selection: ascending argmin chooses the smallest
-        # alpha on exact ties. Near-tie tolerance is diagnostic only.
-        best_i = int(torch.argmin(means).item())
-        # PHEASY_LASSO_1SE: one-standard-error rule, mirroring GpuLassoCV and
-        # _reselect_alpha. It used to be ignored here, so the knob silently did
-        # nothing on the path the shipped GPU runner actually uses.
-        if os.environ.get("PHEASY_LASSO_1SE", "0").lower() in ("1", "true", "yes"):
-            means_cpu = _to_numpy(means, np.float64)
-            mse_cpu = _to_numpy(mse, np.float64)
-            se = float(mse_cpu[best_i].std(ddof=1) / np.sqrt(mse_cpu.shape[1])) \
-                if mse_cpu.shape[1] > 1 else 0.0
-            cand = np.flatnonzero(means_cpu <= means_cpu[best_i] + se)
-            best_i = int(cand[np.argmax(self.alphas[cand])])
-            print("[gpu_resident] PHEASY_LASSO_1SE: alpha* moved to %.6e "
-                  "(1 SE = %.3e above the CV minimum)" %
-                  (float(self.alphas[best_i]), se), flush=True)
-        rtol = float(os.environ.get("PHEASY_LASSO_TIE_RTOL", "1e-9"))
-        tied = means <= means[best_i] * (1 + rtol) + 1e-300
-        self.alpha_ = float(self.alphas[best_i])
-        # Preserve independent full-data descending warm-start path.
-        x = None if x_top is None else x_top.clone()   # [HARM_DENSE] exact at the top
-        for i in range(len(self.alphas) - 1, best_i - 1, -1):
-            # The alpha-path walk is warm-started and capped on purpose (each
-            # alpha only needs to be roughly right to rank the grid).
-            x, path_info = _fista_twolevel(op, yt, float(self.alphas[i]), x, cv_cap, cv_tol, L,
-                                         penalty_weights=penalty_weights, n_samples=A.shape[0],
-                                         auto_floor=False)
-            print("[gpu_resident] full-path alpha=%.6e n_iter=%d kkt=%.3e converged=%s elapsed=%.2fs" %
-                  (self.alphas[i], path_info["n_iter"], path_info["kkt_relative"],
-                   path_info["converged"], time.monotonic() - started), flush=True)
-        x, info = _fista_twolevel(op, yt, self.alpha_, x, self.max_iter, self.tol, L,
-                                  penalty_weights=penalty_weights, n_samples=A.shape[0])
-        print("[gpu_resident] final alpha=%.6e n_iter=%d kkt=%.3e converged=%s elapsed=%.2fs" %
-              (self.alpha_, info["n_iter"], info["kkt_relative"], info["converged"],
-               time.monotonic() - started), flush=True)
+        sel = _select_cv_alpha(self.alphas, mse_np, resolved_np, ols_np,
+                               label="[gpu_resident CV]")
+        best_i = sel["best"]
+        self.cv_resolved_ = resolved_np
+        self.ols_cv_mse_ = ols_np
+        self.cv_selection_ = {"n_resolved": sel["n_valid"], "ols_mean": sel["ols_mean"],
+                              "fallback": sel["fallback"], "max_cv_iterations": max_cv_iterations,
+                              "extended_decades": extended,
+                              "bracketed": sel.get("bracketed", False)}
+        self._alpha_is_zero = best_i == -1
+        if best_i == -1:
+            self.alpha_ = 0.0
+            # The exact least-squares fit IS the selected model (alpha* = 0).
+            _ols_tol = float(os.environ.get("PHEASY_OLS_ATOL", "1e-8"))
+            if torch.device(op.device).type == "cuda":
+                x, info = _iterative_lstsq_tensor(op, yt, _ols_tol, _ols_tol,
+                                                  max(int(self.max_iter), 5000))
+                info = dict(info)
+            else:
+                x, info = _masked_cgls(op, yt, None, x0=None,
+                                       tol=max(float(self.tol), _prec_floor),
+                                       maxiter=max(int(self.max_iter), 5000))
+            info.setdefault("n_iter", info.get("itn", 0))
+            print("[gpu_resident] final: OLS limit (alpha* = 0) n_iter=%d converged=%s "
+                  "elapsed=%.2fs" % (info["n_iter"], info.get("converged"),
+                                     time.monotonic() - started), flush=True)
+            _solver = "CGLS (OLS limit selected by the resolved CV)"
+        else:
+            self.alpha_ = float(self.alphas[best_i])
+            # Preserve independent full-data descending warm-start path.
+            x = None if x_top is None else x_top.clone()   # [HARM_DENSE] exact at the top
+            for i in range(len(self.alphas) - 1, best_i - 1, -1):
+                # The alpha-path walk is warm-started and capped on purpose (each
+                # alpha only needs to be roughly right to rank the grid).
+                x, path_info = _fista_twolevel(op, yt, float(self.alphas[i]), x, cv_cap, cv_tol, L,
+                                             penalty_weights=penalty_weights, n_samples=A.shape[0],
+                                             auto_floor=False, alpha_tol_ratio=_ratio,
+                                             quiet=True)
+                print("[gpu_resident] full-path alpha=%.6e n_iter=%d kkt=%.3e converged=%s elapsed=%.2fs" %
+                      (self.alphas[i], path_info["n_iter"], path_info["kkt_relative"],
+                       path_info["converged"], time.monotonic() - started), flush=True)
+            x, info = _fista_twolevel(op, yt, self.alpha_, x, self.max_iter, self.tol, L,
+                                      penalty_weights=penalty_weights, n_samples=A.shape[0],
+                                      alpha_tol_ratio=_ratio)
+            print("[gpu_resident] final alpha=%.6e n_iter=%d kkt=%.3e converged=%s elapsed=%.2fs" %
+                  (self.alpha_, info["n_iter"], info["kkt_relative"], info["converged"],
+                   time.monotonic() - started), flush=True)
+            _solver = "FISTA"
         self.coef_ = _to_numpy(x / op.scale, np.float64)
         self.column_scale_ = _to_numpy(op.scale, np.float64)
-        self.mse_path_ = _to_numpy(mse, np.float64)
+        self.mse_path_ = mse_np
         self.alphas_ = self.alphas
         self.intercept_ = 0.0
-        self.n_iter_ = info["n_iter"]
+        self.n_iter_ = int(info.get("n_iter", 0))
         self.n_features_in_ = A.shape[1]
-        self.regularized_solver_info_ = dict(info, solver="FISTA", backend="gpu_twolevel_resident",
-            device=str(op.device), dtype="float64", stage="regularized_refit_before_debias", tol=float(self.tol))
-        self._alpha_at_min = best_i == 0
-        self._alpha_at_min_flat = self._alpha_at_min and int(tied.sum().item()) > 1
-        self._alpha_at_min_hitcap = self._alpha_at_min_flat and _cv_hit_cap
+        # dtype is the dtype the solve actually ran in (it used to be hard-coded
+        # "float64" while float32 factors did the work)
+        self.regularized_solver_info_ = dict(info, solver=_solver, backend="gpu_twolevel_resident",
+            device=str(op.device), dtype=str(op._value_dtype).replace("torch.", ""),
+            stage="regularized_refit_before_debias", tol=float(self.tol),
+            jacobi_scaled=bool(jac is not None or self.standardize))
+        self._alpha_at_min = bool(sel["at_min"])
+        self._alpha_at_min_flat = bool(sel["at_min"] and sel["flat"])
+        self._alpha_at_min_hitcap = bool(sel["fallback"] and _cv_hit_cap)
         if retain_operator:
             # Keep the primary operator resident so the post-fit OLS debias can reuse
             # its factors (solve_resident_subset) instead of re-uploading the support.
             self._operator = op
             owned.clear()
-        if self._alpha_at_min:
-            # Same four-way diagnosis as the dense path (it used to collapse
-            # into one generic sentence, losing the "lower PHEASY_CV_TOL / raise
-            # PHEASY_CV_MAX_ITER" guidance on the path the shipped runner uses).
+        if sel["fallback"]:
             import warnings
-            if self._alpha_at_min_hitcap:
-                warnings.warn(
-                    "Resident LASSO alpha* %.3e sits at the grid MINIMUM via a tie "
-                    "on a FLAT CV tail AND FISTA hit cv_max_iter (%d): this is a "
-                    "CONVERGENCE problem (lower PHEASY_CV_TOL / raise "
-                    "PHEASY_CV_MAX_ITER), not a model-density conclusion."
-                    % (self.alpha_, cv_cap), RuntimeWarning, stacklevel=2)
-            elif self._alpha_at_min_flat:
-                warnings.warn(
-                    "Resident LASSO alpha* %.3e sits at the grid MINIMUM on a flat "
-                    "CV tail, but FISTA already converged (max %d iters < %d): "
-                    "alpha* is not well-determined by CV (not a convergence problem)."
-                    % (self.alpha_, max_cv_iterations, cv_cap), RuntimeWarning, stacklevel=2)
-            else:
-                warnings.warn(
-                    "Resident LASSO alpha* %.3e sits at the grid MINIMUM; the CV "
-                    "curve is still falling at the low end, so widening the grid "
-                    "only pushes alpha* toward OLS. Treat this fit as effectively "
-                    "unregularized (compare with OLS/RFE)."
-                    % self.alpha_, RuntimeWarning, stacklevel=2)
+            warnings.warn(
+                "Resident LASSO: no alpha was resolved in every CV fold within "
+                "PHEASY_CV_MAX_ITER=%d; alpha* %.3e is a plain argmin, not a CV "
+                "conclusion (raise PHEASY_CV_MAX_ITER)." % (cv_cap, self.alpha_),
+                RuntimeWarning, stacklevel=2)
         # Do not retain VRAM after the fit. Predict and optional debias use the
         # ordinary public host interface, explicitly outside the resident stage.
         return self

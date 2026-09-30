@@ -1557,6 +1557,10 @@ class WorkFlow(object):
                 decades=float(os.environ.get("PHEASY_ALPHA_DECADES",
                                              str(settings.ALPHA_DECADES))),
                 unpenalized=_unpenalized,
+                # [FIX CV-RES] the derived grid above arrives as alpha=, so say
+                # explicitly that it is an AUTO grid: its CV path is extended by
+                # the exact alpha -> 0 (OLS) end.
+                ols_limit=settings.ALPHA_AUTO,
                 **alpha_kwargs,
             )
             if settings.MODEL.upper() == "LASSO":
@@ -1697,7 +1701,12 @@ class WorkFlow(object):
                     # NEAR-edge case (within the 5% band but not pinned), and do not
                     # assert a cause there.
                     _at_min = bool(getattr(optimizer._model, "_alpha_at_min", False))
-                    if _lg_a <= _lg_lo + 0.05 * _span and not _at_min:
+                    # [FIX CV-RES] with the exact OLS limit in the comparison the
+                    # low end is bracketed (alpha -> 0 was measured), so a low
+                    # alpha* is a CV result, not a truncated grid.
+                    _bracketed = (fit_results.get("cv_selection") or {}).get(
+                        "ols_mean") is not None
+                    if _lg_a <= _lg_lo + 0.05 * _span and not _at_min and not _bracketed:
                         logger.warning(
                             "alpha_opt %.3e is NEAR the LOW edge of the grid (not "
                             "pinned at the minimum); see the [CV] WARNING above "
@@ -1721,6 +1730,17 @@ class WorkFlow(object):
                     logger.info("- alpha_min: {:.3e}".format(float(_used_alpha[0])))
                     logger.info("- alpha_max: {:.3e}".format(float(_used_alpha[-1])))
                 logger.info("- alpha_opt: {}".format(fit_results["alpha"]))
+                if fit_results.get("cv_selected_ols_limit"):
+                    # [FIX CV-RES] a certified conclusion, not a pinned grid edge
+                    logger.info("- alpha_opt = 0: the exact OLS limit cross-validates "
+                                "at least as well as every RESOLVED alpha -- the data "
+                                "support no L1 penalty; the delivered fit is OLS "
+                                "(PHEASY_LASSO_1SE=1 for the sparsest model within "
+                                "one standard error).")
+                _sel = fit_results.get("cv_selection") or {}
+                if _sel:
+                    logger.info("- CV alphas resolved by the solver: {} of {}".format(
+                        _sel.get("n_resolved"), len(_used_alpha)))
                 logger.info("- RMSE_CV: {} eV/A".format(fit_metrics["rmse_path_mean"]))
             elif settings.MODEL.upper() in ("RFE", "RFE-OLS", "RFE-OLS-TSQR", "RFE_TSQR", "RFE-TSQR"):
                 # [FIX P05] TSQR 原来没有汇总分支, 明明算了 CV 却不打印。
