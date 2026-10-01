@@ -4392,6 +4392,62 @@ def _ardr_evidence_gram(G, b, yty, n_samples, y_var, threshold_lambda=1e4,
             _reason(converged, exhausted, bool(keep.any())), float(sse))
 
 
+# [FIX ARD-CV] default pruning-threshold grid searched by grouped CV for ARDR /
+# RVM when no threshold is given (in --std units: unit-variance columns, F/std(F)).
+# Measured on the 45-configuration / 1303-feature test set (grouped 5-fold CV):
+# 1e4 keeps 75 features at CV 8.1e-3, 1e5 166 at 2.9e-3, 3e5 247 at 1.6e-3,
+# >= 5e5 keeps all at 1.022e-3 (= OLS, 1.0215e-3); the unscaled default (raw
+# units, 1e4) kept 586 at 1.39e-3.  RVM (threshold = post-step after its own
+# evidence pruning): 1e4 7.5e-3 ... 1e7 1.07e-3, 1e8 1.022e-3 with 733 features.
+# Half decades (the optimum can sit between); 1e12 = alpha_ceiling = no
+# threshold pruning, the natural end of the grid.
+_ARD_LAMBDA_GRID = (1e4, 3e4, 1e5, 3e5, 1e6, 3e6, 1e7, 1e8, 1e12)
+
+
+def _ard_lambda_grid(prefix):
+    """Thresholds for ARDR (prefix "ARDR") / RVM ("RVM") and whether to CV them.
+
+    PHEASY_<prefix>_THRESHOLDS="a,b,..." is searched by grouped CV;
+    an explicit PHEASY_<prefix>_THRESHOLD (or PHEASY_<prefix>_CV=0) fixes one
+    value; otherwise the default grid _ARD_LAMBDA_GRID is searched.
+    Returns (thresholds, fallback) -- fallback is used when the CV cannot run.
+    """
+    fallback = float(os.environ.get("PHEASY_%s_THRESHOLD" % prefix, "1e4"))
+    raw = os.environ.get("PHEASY_%s_THRESHOLDS" % prefix, "").strip()
+    if raw:
+        return [float(t) for t in raw.split(",") if t.strip()], fallback
+    if (os.environ.get("PHEASY_%s_THRESHOLD" % prefix, "").strip()
+            or os.environ.get("PHEASY_%s_CV" % prefix, "1").strip().lower()
+            in ("0", "false", "no", "off")):
+        return [fallback], fallback
+    return list(_ARD_LAMBDA_GRID), fallback
+
+
+def _gram_cv_folds(A, y, cv, rand_seed, group_size, label):
+    """[FIX ARD-CV] per-validation-fold float64 Grams for a Gram-mode CV.
+
+    Returns (Gs, bs, yys, nks, splits) or (None, reason).  One streaming pass
+    (_accumulate_fold_grams); the full Gram is their sum.  Needs (K+3) p^2
+    doubles within PHEASY_EXACT_GRAM_GB.
+    """
+    n, p = int(A.shape[0]), int(A.shape[1])
+    splits = _make_cv_splits(n, cv, rand_seed, group_size)
+    if len(splits) < 2 or not _splits_partition(splits, n):
+        return None, "the CV splits do not partition the rows"
+    need = (len(splits) + 3) * 8.0 * p * p
+    budget = _exact_gram_budget_bytes()
+    if need > budget:
+        return None, ("per-fold Grams need %.1f GB > %.1f GB (PHEASY_EXACT_GRAM_GB)"
+                      % (need / 1e9, budget / 1e9))
+    import time as _t
+    t0 = _t.time()
+    Gs, bs, yys, nks = _accumulate_fold_grams(A, y, np.arange(p), splits)
+    print("[%s] per-fold Grams: %d folds x %dx%d (%.2f GB) in %.1fs"
+          % (label, len(splits), p, p, len(splits) * 8.0 * p * p / 1e9, _t.time() - t0),
+          flush=True)
+    return (Gs, bs, yys, nks, splits), None
+
+
 class _ARDRModel:
     """Automatic Relevance Determination Regression (ARDR).
 
@@ -4425,6 +4481,7 @@ class _ARDRModel:
                  lambda_1=1e-6, lambda_2=1e-6, n_jobs=None, unpenalized=None):
         # [HARM_DENSE] columns with a flat prior (never pruned)
         self.unpenalized = unpenalized
+        self.fallback_threshold = float(threshold_lambda)
         if thresholds is None:
             self.thresholds = np.asarray([float(threshold_lambda)], dtype=np.float64)
         else:
@@ -4474,7 +4531,9 @@ class _ARDRModel:
         # materializing the n_samples x n_features design matrix.
         _gram_env = os.environ.get("PHEASY_ARDR_GRAM")
         if _gram_env is None:
-            gram_mode = _is_linear_operator(A)
+            # [FIX ARD-CV] a threshold grid is cross-validated from per-fold Grams
+            # (the sklearn path would refit the dense X thresholds x folds times)
+            gram_mode = _is_linear_operator(A) or self.thresholds.size > 1
         else:
             gram_mode = _gram_env.lower() in ("1", "true", "yes", "on")
         if _is_linear_operator(A) and not gram_mode:
@@ -4569,25 +4628,37 @@ class _ARDRModel:
         The remaining cost is the p x p Gram (O(p^2) memory) and the O(p^3)
         per-iteration solve; a GPU backend moves that solve to torch Cholesky.
         """
-        if self.thresholds.size != 1:
-            warnings.warn(
-                "ARDR Gram mode fits one pruning threshold (the paper's "
-                "lambda_t = 1e4); ignoring PHEASY_ARDR_THRESHOLDS and using "
-                "%.4g." % float(self.thresholds[0]), RuntimeWarning, stacklevel=3)
-        thr = float(self.thresholds[0])
-        base = getattr(A, "_twolevel_base", None)
-        scale = getattr(A, "_twolevel_scale", None)
-        _gram_gb = float(os.environ.get(
-            "PHEASY_ARDR_GRAM_MAX_GB", os.environ.get("PHEASY_GRAM_MAX_GB", "4")))
-        print("[ARDR] building the design Gram (matrix-free; "
-              "PHEASY_ARDR_GRAM_MAX_GB=%.1f)..." % _gram_gb, flush=True)
+        thresholds = np.asarray(self.thresholds, dtype=np.float64)
+        thr = float(thresholds[0])
+        folds = None
+        if thresholds.size > 1:
+            # [FIX ARD-CV] lambda_t is a hyperparameter (hiphive tunes it too):
+            # choose it by grouped CV from per-fold Grams instead of fixing 1e4
+            folds, _why = _gram_cv_folds(A, y64, self.cv, self.rand_seed,
+                                         self.group_size, "ARDR")
+            if folds is None:
+                thr = self.fallback_threshold
+                warnings.warn("ARDR lambda_t CV unavailable (%s); using lambda_t = %.4g"
+                              % (_why, thr), RuntimeWarning, stacklevel=3)
         import time as _t
-        _t_gram0 = _t.time()
-        G, b, _gram_how = _build_gram_matrix(A, y64, budget_gb=_gram_gb)
-        G = np.asarray(G, dtype=np.float64)
-        print("[ARDR] design Gram ready: %dx%d (%.2f GB) in %.1fs"
-              % (G.shape[0], G.shape[1], G.nbytes / 1e9, _t.time() - _t_gram0),
-              flush=True)
+        if folds is not None:
+            Gs, bs, yys, nks, splits = folds
+            G = Gs[0].copy()
+            for _Gk in Gs[1:]:
+                G += _Gk
+            b = bs.sum(axis=0)
+            _gram_how = "per-fold dsyrk"
+        else:
+            _gram_gb = float(os.environ.get(
+                "PHEASY_ARDR_GRAM_MAX_GB", os.environ.get("PHEASY_GRAM_MAX_GB", "4")))
+            print("[ARDR] building the design Gram (matrix-free; "
+                  "PHEASY_ARDR_GRAM_MAX_GB=%.1f)..." % _gram_gb, flush=True)
+            _t_gram0 = _t.time()
+            G, b, _gram_how = _build_gram_matrix(A, y64, budget_gb=_gram_gb)
+            G = np.asarray(G, dtype=np.float64)
+            print("[ARDR] design Gram ready: %dx%d (%.2f GB) in %.1fs"
+                  % (G.shape[0], G.shape[1], G.nbytes / 1e9, _t.time() - _t_gram0),
+                  flush=True)
         n_samples = int(y64.shape[0])
         yty = float(y64 @ y64)
         y_var = float(np.var(y64))
@@ -4618,6 +4689,34 @@ class _ARDRModel:
         _gram_max_iter = int(os.environ.get(
             "PHEASY_ARDR_GRAM_MAX_ITER", str(max(self.max_iter, 1000))))
         _gram_tol = float(os.environ.get("PHEASY_ARDR_GRAM_TOL", str(self.tol)))
+        _free = _as_free_mask(self.unpenalized, p)
+        mse_cv = None
+        if folds is not None:
+            mse_cv = np.full((thresholds.size, len(splits)), np.nan, dtype=np.float64)
+            _t_cv0 = _t.time()
+            for k, (tr, _va) in enumerate(splits):
+                Gtr = G - Gs[k]
+                btr = b - bs[k]
+                for j, t in enumerate(thresholds):
+                    c = _ardr_evidence_gram(
+                        Gtr, btr, yty - yys[k], n_samples - int(nks[k]),
+                        float(np.var(y64[tr])), threshold_lambda=float(t),
+                        max_iter=_gram_max_iter, tol=_gram_tol, alpha_1=self.alpha_1,
+                        alpha_2=self.alpha_2, lambda_1=self.lambda_1,
+                        lambda_2=self.lambda_2, gpu=gb, verbose=False, free=_free)[0]
+                    mse_cv[j, k] = max(float(yys[k]) - 2.0 * float(c @ bs[k])
+                                       + float(c @ (Gs[k] @ c)), 0.0) / max(int(nks[k]), 1)
+                del Gtr
+            best_j = int(np.argmin(mse_cv.mean(axis=1)))
+            thr = float(thresholds[best_j])
+            _rep = float(getattr(self, "report_scale", 1.0))   # F units in the log
+            for j, t in enumerate(thresholds):
+                print("[ARDR] lambda_t=%-8.3g CV_RMSE=%.6e%s"
+                      % (t, np.sqrt(mse_cv[j].mean()) * _rep,
+                         "  <- selected" if j == best_j else ""), flush=True)
+            print("[ARDR] lambda_t CV: %d thresholds x %d folds in %.1fs"
+                  % (thresholds.size, len(splits), _t.time() - _t_cv0), flush=True)
+            del Gs
         coef, alpha_, lam, n_iter, stop_reason, sse = _ardr_evidence_gram(
             G, b, yty, n_samples, y_var, threshold_lambda=thr,
             max_iter=_gram_max_iter, tol=_gram_tol, alpha_1=self.alpha_1,
@@ -4625,7 +4724,7 @@ class _ARDRModel:
             gpu=gb,
             verbose=os.environ.get("PHEASY_ARDR_VERBOSE", "1").lower()
             in ("1", "true", "yes", "on"),
-            free=_as_free_mask(self.unpenalized, p))
+            free=_free)
 
         self.model_ = None
         self.coef_ = np.asarray(coef, dtype=np.float64)
@@ -4636,14 +4735,21 @@ class _ARDRModel:
         self.n_iter_ = int(n_iter)
         self.n_features_in_ = p
         self.threshold_ = thr
-        self.mse_path_ = np.array(
-            [[max(sse, 0.0) / max(n_samples, 1)]], dtype=np.float64)
-        self.best_index_ = 0
-        self.best_rmse_cv_ = float(np.sqrt(self.mse_path_[0, 0]))
-        # Gram mode has no hold-out folds: a per-fold Gram costs folds x p^2,
-        # and the reference paper uses one fixed threshold. The reported score
-        # is therefore the in-sample RMSE and cv_evaluated says so.
-        self.cv_evaluated = False
+        if mse_cv is not None:
+            # [FIX ARD-CV] grouped CV over lambda_t
+            self.thresholds = thresholds
+            self.mse_path_ = mse_cv
+            self.best_index_ = best_j
+            self.best_rmse_cv_ = float(np.sqrt(mse_cv[best_j].mean()))
+            self.cv_evaluated = True
+        else:
+            # one fixed threshold: no hold-out folds, the reported score is the
+            # in-sample RMSE and cv_evaluated says so
+            self.mse_path_ = np.array(
+                [[max(sse, 0.0) / max(n_samples, 1)]], dtype=np.float64)
+            self.best_index_ = 0
+            self.best_rmse_cv_ = float(np.sqrt(self.mse_path_[0, 0]))
+            self.cv_evaluated = False
         self.backend_ = "gpu_gram_ardr" if gb is not None else "cpu_gram_ardr"
         self.regularized_solver_info_ = {
             "solver": "ARD evidence maximization on the Gram (matrix-free)",
@@ -4654,11 +4760,16 @@ class _ARDRModel:
             "maxiter": int(_gram_max_iter),
             "tol": float(self.tol),
             "threshold_lambda": thr,
-            "cv_skipped": "gram_mode",
+            "threshold_cv": ({"%.3g" % t: float(np.sqrt(mse_cv[j].mean()))
+                              for j, t in enumerate(thresholds)}
+                             if mse_cv is not None else None),
             "gram_construction": _gram_how,
             "n_features": p,
             "n_samples": n_samples,
         }
+        if mse_cv is None:
+            # one fixed threshold: the reported score is in-sample
+            self.regularized_solver_info_["cv_skipped"] = "gram_mode"
         return self
 
     def predict(self, A):
@@ -4698,6 +4809,52 @@ class _RVMModel:
 
     def predict(self, A):
         return np.asarray(A @ self.coef_).ravel()
+
+
+def _ard_y_scale(F, standardization):
+    """[FIX ARD-YSTD] target scale for ARDR / RVM under unit-variance --std.
+
+    hiphive / trainstation (where lambda_t = 1e4 comes from, Fransson et al.
+    2020) standardize BOTH sides: columns to unit variance AND the target to
+    std(y) = 1, so a coefficient is pruned when its precision exceeds 1e4,
+    i.e. when it moves y by less than ~1 % of std(y).  Scaling only the
+    columns left the threshold in absolute force units: with std(F) ~ 0.1
+    eV/A it pruned anything below ~10 % of std(F) (measured: 18 of 1303
+    features, 17 % relative error, against 0.86 % without --std).
+    PHEASY_ARD_YSTD=0 keeps y unscaled.
+    """
+    if standardization != "unit_variance" or os.environ.get(
+            "PHEASY_ARD_YSTD", "1").strip().lower() in ("0", "false", "no", "off"):
+        return 1.0
+    s = float(np.std(F))
+    return s if np.isfinite(s) and s > 0 else 1.0
+
+
+def _rescale_ard_model(model, s):
+    """Map an ARDR / RVM model fitted on y / s back to the units of y."""
+    if s == 1.0:
+        return
+    s2 = s * s
+    model.coef_ = np.asarray(model.coef_, dtype=np.float64) * s
+    model.intercept_ = float(getattr(model, "intercept_", 0.0)) * s
+    if getattr(model, "mse_path_", None) is not None:
+        model.mse_path_ = np.asarray(model.mse_path_, dtype=np.float64) * s2
+    if np.isfinite(getattr(model, "best_rmse_cv_", float("nan"))):
+        model.best_rmse_cv_ = float(model.best_rmse_cv_) * s
+    # precisions scale as 1/s^2 (ARDR: alpha_ noise, lambda_ per coefficient;
+    # RVM: alpha_ per coefficient, beta_ noise), covariances as s^2
+    for name in ("alpha_", "beta_", "lambda_"):
+        v = getattr(model, name, None)
+        if v is not None:
+            setattr(model, name, float(v) / s2 if np.ndim(v) == 0
+                    else np.asarray(v, dtype=np.float64) / s2)
+    if getattr(model, "sigma_", None) is not None:
+        model.sigma_ = np.asarray(model.sigma_, dtype=np.float64) * s2
+    info = getattr(model, "regularized_solver_info_", None)
+    if isinstance(info, dict) and "beta" in info:
+        info["beta"] = float(info["beta"]) / s2
+    if isinstance(info, dict) and isinstance(info.get("threshold_cv"), dict):
+        info["threshold_cv"] = {t: float(v) * s for t, v in info["threshold_cv"].items()}
 
 
 def _scale_columns(A, w):
@@ -6455,10 +6612,14 @@ class Optimizer(object):
             self._model.fit(A_fit, F64, sample_weight=weights)
             coef = self._model.coef_
         elif method == "ARDR":
-            _thr_env = os.environ.get("PHEASY_ARDR_THRESHOLDS", "")
-            _thresholds = [float(t) for t in _thr_env.split(",") if t.strip()] or None
+            # [FIX ARD-YSTD] standardize the target as well (see _ard_y_scale)
+            _ys = _ard_y_scale(F64, self._results.get("ard_standardization"))
+            if _ys != 1.0:
+                self._results["ard_y_scale"] = _ys
+            # [FIX ARD-CV] lambda_t by grouped CV unless one value is given
+            _thresholds, _thr_fallback = _ard_lambda_grid("ARDR")
             self._model = _ARDRModel(
-                threshold_lambda=float(os.environ.get("PHEASY_ARDR_THRESHOLD", "1e4")),
+                threshold_lambda=_thr_fallback,
                 thresholds=_thresholds,
                 cv=self._cv,
                 # [FIX RVM-BETA] same default as the Gram evidence loop (which
@@ -6472,7 +6633,9 @@ class Optimizer(object):
                 n_jobs=None,
                 unpenalized=free,
             )
-            self._model.fit(A_fit, F64, sample_weight=weights)
+            self._model.report_scale = _ys
+            self._model.fit(A_fit, F64 / _ys, sample_weight=weights)
+            _rescale_ard_model(self._model, _ys)
             coef = self._model.coef_
         elif method == "RVM":
             from .fast_rvm import fast_rvm as _fast_rvm
@@ -6482,31 +6645,104 @@ class Optimizer(object):
             print("[RVM] building the design Gram (matrix-free; budget %.1f GB)..."
                   % _rvm_budget, flush=True)
             _t0 = _t.time()
-            G_rvm, b_rvm, _rvm_how = _build_gram_matrix(A_fit, F64, budget_gb=_rvm_budget)
+            # [FIX ARD-YSTD] standardize the target as well (see _ard_y_scale)
+            _ys = _ard_y_scale(F64, self._results.get("ard_standardization"))
+            if _ys != 1.0:
+                self._results["ard_y_scale"] = _ys
+            F_rvm = F64 / _ys
+            # [FIX ARD-CV] lambda_t by grouped CV unless one value is given; the
+            # per-fold Grams then also give the full Gram (their sum)
+            _rvm_thr, _rvm_thr_fb = _ard_lambda_grid("RVM")
+            _folds = None
+            if len(_rvm_thr) > 1:
+                _folds, _why = _gram_cv_folds(A_fit, F_rvm, self._cv, self._rand_seed,
+                                              self._group_size, "RVM")
+                if _folds is None:
+                    _rvm_thr = [_rvm_thr_fb]
+                    warnings.warn("RVM lambda_t CV unavailable (%s); using lambda_t = %.4g"
+                                  % (_why, _rvm_thr_fb), RuntimeWarning, stacklevel=2)
+            if _folds is not None:
+                G_rvm = _folds[0][0].copy()
+                for _Gk in _folds[0][1:]:
+                    G_rvm += _Gk
+                b_rvm = _folds[1].sum(axis=0)
+                _rvm_how = "per-fold dsyrk"
+            else:
+                G_rvm, b_rvm, _rvm_how = _build_gram_matrix(A_fit, F_rvm, budget_gb=_rvm_budget)
             print("[RVM] design Gram %dx%d (%.2f GB, %s) in %.1fs"
                   % (G_rvm.shape[0], G_rvm.shape[1], G_rvm.nbytes / 1e9, _rvm_how,
                      _t.time() - _t0), flush=True)
             _rvm_beta_env = os.environ.get("PHEASY_RVM_BETA")
             _rvm_beta = float(_rvm_beta_env) if _rvm_beta_env not in (None, "") else None
             _rvm_max_steps = os.environ.get("PHEASY_RVM_MAX_STEPS")
-            _res = _fast_rvm(
-                G_rvm, b_rvm, float(F64 @ F64), F64.shape[0],
-                y_var=float(np.var(F64)), beta=_rvm_beta,
+            _rvm_kw = dict(
+                beta=None if _rvm_beta is None else _rvm_beta * _ys * _ys,
                 beta_iters=int(os.environ.get("PHEASY_RVM_BETA_ITERS", "10")),
                 tol=float(os.environ.get("PHEASY_RVM_TOL", "1e-6")),
                 max_steps=int(_rvm_max_steps) if _rvm_max_steps else None,
                 add_batch=int(os.environ.get("PHEASY_RVM_ADD_BATCH", "1")),
-                prune_threshold=float(os.environ.get("PHEASY_RVM_THRESHOLD", "1e4")),
-                verbose=os.environ.get("PHEASY_RVM_VERBOSE", "1").lower()
-                in ("1", "true", "yes", "on"),
                 free=free,
                 alpha_free=float(os.environ.get("PHEASY_RVM_FREE_ALPHA", "0")))
+            # [FIX ARD-CV] the pruning threshold is a post-step of the evidence
+            # fit: one fit per fold scores the whole lambda_t grid
+            _rvm_cv = None
+            if _folds is not None:
+                from .fast_rvm import _prune_and_refit as _rvm_prune
+                Gs_r, bs_r, yys_r, nks_r, splits_r = _folds
+                _free_idx = (np.flatnonzero(np.asarray(free, dtype=bool))
+                             if free is not None else None)
+                _rvm_cv = np.full((len(_rvm_thr), len(splits_r)), np.nan)
+                _t_cv0 = _t.time()
+                for k, (tr, _va) in enumerate(splits_r):
+                    Gtr = G_rvm - Gs_r[k]
+                    btr = b_rvm - bs_r[k]
+                    rk = _fast_rvm(Gtr, btr, float(F_rvm @ F_rvm) - float(yys_r[k]),
+                                   F_rvm.shape[0] - int(nks_r[k]),
+                                   y_var=float(np.var(F_rvm[tr])), prune_threshold=0,
+                                   verbose=False, **_rvm_kw)
+                    for j, t in enumerate(_rvm_thr):
+                        c = _rvm_prune(Gtr, btr, rk["active"], rk["alpha"], rk["beta"],
+                                       float(t), free_idx=_free_idx)[0]
+                        _rvm_cv[j, k] = max(float(yys_r[k]) - 2.0 * float(c @ bs_r[k])
+                                            + float(c @ (Gs_r[k] @ c)), 0.0) / max(int(nks_r[k]), 1)
+                    del Gtr
+                _best_r = int(np.argmin(_rvm_cv.mean(axis=1)))
+                for j, t in enumerate(_rvm_thr):
+                    print("[RVM] lambda_t=%-8.3g CV_RMSE=%.6e%s"
+                          % (t, np.sqrt(_rvm_cv[j].mean()) * _ys,
+                             "  <- selected" if j == _best_r else ""), flush=True)
+                print("[RVM] lambda_t CV: %d folds in %.1fs"
+                      % (len(splits_r), _t.time() - _t_cv0), flush=True)
+                _rvm_thr_grid = list(_rvm_thr)
+                _rvm_thr = [float(_rvm_thr[_best_r])]
+                del Gs_r
+            _res = _fast_rvm(
+                G_rvm, b_rvm, float(F_rvm @ F_rvm), F_rvm.shape[0],
+                y_var=float(np.var(F_rvm)),
+                prune_threshold=float(_rvm_thr[0]),
+                verbose=os.environ.get("PHEASY_RVM_VERBOSE", "1").lower()
+                in ("1", "true", "yes", "on"),
+                **_rvm_kw)
             _c_rvm = np.asarray(_res["coef"], dtype=np.float64)
-            _rss_rvm = (float(F64 @ F64) - 2.0 * float(_c_rvm @ b_rvm)
+            _rss_rvm = (float(F_rvm @ F_rvm) - 2.0 * float(_c_rvm @ b_rvm)
                         + float(_c_rvm @ (G_rvm @ _c_rvm)))
             self._model = _RVMModel(_c_rvm, _res["active"], _res["alpha"],
                                     _res["beta"], _res["n_steps"], A.shape[1],
                                     _rss_rvm, F64.shape[0], _res["converged"])
+            self._model.threshold_ = float(_rvm_thr[0])
+            self._model.regularized_solver_info_["threshold_lambda"] = float(_rvm_thr[0])
+            if _rvm_cv is not None:
+                # [FIX ARD-CV] grouped CV over lambda_t (scaled units here;
+                # _rescale_ard_model maps it back to the units of F)
+                self._model.mse_path_ = _rvm_cv
+                self._model.best_index_ = _best_r
+                self._model.best_rmse_cv_ = float(np.sqrt(_rvm_cv[_best_r].mean()))
+                self._model.cv_evaluated = True
+                self._model.regularized_solver_info_.pop("cv_skipped", None)
+                self._model.regularized_solver_info_["threshold_cv"] = {
+                    "%.3g" % t: float(np.sqrt(_rvm_cv[j].mean()))
+                    for j, t in enumerate(_rvm_thr_grid)}
+            _rescale_ard_model(self._model, _ys)
             self._results["rvm_gram"] = _rvm_how
             coef = self._model.coef_
         elif method == "RFE":

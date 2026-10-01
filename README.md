@@ -128,6 +128,10 @@ biases alpha*/ridge toward 0.
 | `PHEASY_RIDGE_ALPHA_AUTO` | `1` | RIDGE grid also spans `[lambda_max*10^-PHEASY_RIDGE_DECADES, lambda_max]` of A^T A |
 | `PHEASY_RIDGE_DECADES` / `_PER_DECADE` / `_NMAX` | `8` / `2.5` / `40` | RIDGE auto-grid span / density / cap |
 | `PHEASY_ARD_STD` | `unit_variance` | ARDR/RVM `--std` convention (`unit_norm` = legacy) |
+| `PHEASY_ARD_YSTD` | `1` | ARDR/RVM `--std` also scales the forces to unit std, as trainstation does (`0` = old, unit-dependent pruning) |
+| `PHEASY_ARDR_THRESHOLDS` / `PHEASY_RVM_THRESHOLDS` | `1e4,3e4,...,1e8,1e12` | pruning thresholds lambda_t searched by grouped CV (per-fold Grams; 1e12 = no threshold pruning) |
+| `PHEASY_ARDR_THRESHOLD` / `PHEASY_RVM_THRESHOLD` | unset | one fixed lambda_t: no CV (the old behaviour with `1e4`) |
+| `PHEASY_ARDR_CV` / `PHEASY_RVM_CV` | `1` | `0` = no lambda_t CV, use `PHEASY_*_THRESHOLD` (default `1e4`) |
 | `PHEASY_RFE_JACOBI` | `1` for operators | Jacobi-preconditioned RFE subset solves |
 | `PHEASY_RFE_GRAM_GB` | `min(16, free/4)` | host budget of the exact per-fold Gram RFE engine (`0` = off) |
 | `PHEASY_EXACT_GRAM_GB` | `min(16, free/4)` | host budget of the exact float64 OLS / RIDGE-CV / LASSO-debias solves on float32 operator input (`0` = off) |
@@ -187,6 +191,31 @@ Other method fixes in the same change:
   `PHEASY_GPU_RFE_RESIDENT=1` with `PHEASY_N_JOBS>1` serializes instead of
   failing, and RFE-OLS-TSQR no longer materializes a dense SM larger than
   `PHEASY_MAX_DENSE_GB`.
+* **ARDR / RVM with `--std` ([FIX ARD-YSTD], [FIX RVM-CYCLE]):** the pruning
+  threshold lambda_t = 1e4 (hiphive / trainstation, Fransson et al. 2020) is
+  defined with the columns AND the forces standardized; `--std` scaled only the
+  columns, so the threshold sat in force units and pruned anything below
+  ~0.01 eV/A per unit-variance column (45-configuration test set: ARDR kept 18
+  of 1303 features at 17% relative error; MoS2: 7-8% against 0.26% for the
+  other methods). The forces are now scaled to unit std for the fit and the
+  coefficients scaled back, so the selection no longer depends on the units of
+  F. The fast RVM also stalled whenever a precision re-estimate (or an
+  addition) landed above `alpha_ceiling`: clamped back onto the ceiling it was
+  a no-op that kept winning the step until `max_steps` (26060 steps in each of
+  10 beta rounds, `converged=False`). Above the ceiling it is now the
+  alpha -> infinity limit, i.e. a deletion / no addition.
+* **ARDR / RVM pruning threshold by CV ([FIX ARD-CV]):** lambda_t is a
+  hyperparameter, not a constant: with both sides standardized, 1e4 prunes
+  every coefficient that moves the forces by less than 1% of std(F), while
+  force-constant fits resolve well below that. Unless one value is given
+  (`PHEASY_ARDR_THRESHOLD` / `PHEASY_RVM_THRESHOLD`), lambda_t is now chosen
+  by grouped CV over a grid, scored exactly from per-fold Grams (one streaming
+  pass; needs (K+3) p^2 doubles within `PHEASY_EXACT_GRAM_GB`, otherwise one
+  threshold with a warning). ARDR runs one evidence fit per (threshold, fold);
+  for RVM the threshold is a post-step, so one fit per fold scores the whole
+  grid. A threshold grid also routes dense ARDR to the Gram evidence loop (the
+  same iteration as sklearn's ARDRegression). The manifest records
+  `threshold_lambda` and the per-threshold CV RMSE (`threshold_cv`).
 * **RFE-OLS / RFE-OLS-TSQR naming and selection ([RFE-OLS]):** `RFE-OLS` is the
   canonical name (`RFE` is accepted everywhere and rewritten to it, so logs and
   `fit_manifest.json` say `RFE-OLS`). The two methods share the elimination and

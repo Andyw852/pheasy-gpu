@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """[RFE-OLS] canonical method name and the RFE-OLS-TSQR feature-count rule.
 
-* "RFE-OLS" is the canonical name; "RFE" stays an alias everywhere (CLI,
-  pheasy_fit.sh, fit_3090.sh, fit_3090_parallel.sh) and is rewritten to it.
+* "RFE-OLS" is the canonical name.  The CLI still maps "RFE" to it; the shell
+  wrappers (pheasy_fit.sh, fit_3090.sh) accept only the full name and also
+  take ARDR / RVM.
 * RFE-OLS-TSQR shares RFE-OLS's elimination and differs in how the feature
   count is chosen: AIC by default (PHEASY_TSQR_CRITERION=aic|bic|cv).
 * The AIC/BIC n is the number of force-component rows: with the
@@ -134,25 +135,25 @@ class NamingTests(unittest.TestCase):
         self.assertEqual(parser.settings.MODEL, "RFE-OLS")
 
     def _fit_sh(self, script, method):
-        # an empty directory: the method check runs before the input-file check
+        # an empty directory: the method check runs before the input-file check,
+        # so an accepted method stops at the missing POSCAR, a rejected one first
         with tempfile.TemporaryDirectory() as d:
-            return subprocess.run(["bash", str(ROOT / script), "FIT_METHOD=" + method],
-                                  cwd=d, capture_output=True, text=True, timeout=60)
+            env = dict(os.environ, PHEASY_EXECUTABLE="true", PYTHON=sys.executable)
+            out = subprocess.run(["bash", str(ROOT / script), "FIT_METHOD=" + method],
+                                 cwd=d, capture_output=True, text=True, timeout=60, env=env)
+        return out.returncode, out.stdout + out.stderr
 
-    def test_pheasy_fit_sh_accepts_rfe_ols_and_maps_rfe(self):
-        for method in ("RFE-OLS", "RFE", "RFE-OLS-TSQR"):
-            with self.subTest(method=method):
-                out = self._fit_sh("pheasy_fit.sh", method)
-                text = out.stdout + out.stderr
-                self.assertNotIn("不是合法方法", text)
-                self.assertIn("POSCAR", text)          # stopped at the input check
-        self.assertIn("RFE-OLS 的别名", self._fit_sh("pheasy_fit.sh", "RFE").stdout)
-        self.assertIn("不是合法方法", self._fit_sh("pheasy_fit.sh", "RFE-TSQR").stderr)
-
-    def test_fit_3090_sh_accepts_rfe_ols(self):
-        src = (ROOT / "fit_scripts" / "fit_3090.sh").read_text()
-        self.assertIn('[[ "$FIT_METHOD" == "RFE" ]] && FIT_METHOD="RFE-OLS"', src)
-        self.assertIn("OLS|LASSO|ALASSO|RFE-OLS|RFE-OLS-TSQR|RIDGE)", src)
+    def test_wrappers_take_the_full_names_and_ardr_rvm(self):
+        for script in ("pheasy_fit.sh", "fit_scripts/fit_3090.sh"):
+            for method in ("RFE-OLS", "RFE-OLS-TSQR", "ARDR", "RVM"):
+                with self.subTest(script=script, method=method):
+                    rc, text = self._fit_sh(script, method)
+                    self.assertIn("POSCAR", text)      # got past the method check
+            for method in ("RFE", "RFE-TSQR"):
+                with self.subTest(script=script, method=method):
+                    rc, text = self._fit_sh(script, method)
+                    self.assertEqual(rc, 2)
+                    self.assertNotIn("POSCAR", text)   # refused before the input check
 
 
 if __name__ == "__main__":

@@ -104,6 +104,13 @@ def _run_faml(G, b, diagG, n, beta, tol=1e-6, max_steps=None, add_batch=1,
             ratio = q2 / Sq
             gain = np.where(q2 > Sq, 0.5 * (ratio - 1.0 - np.log(ratio)), 0.0)
         gain = np.where(np.isfinite(gain), gain, 0.0)
+        # [FIX RVM-CYCLE] an addition whose precision would land on or above
+        # alpha_ceiling is the alpha -> inf limit, i.e. no addition: it must not
+        # win the step (skipping it after it won left the step a no-op, chosen
+        # again forever).  Members are re-scored below.
+        with np.errstate(divide="ignore", invalid="ignore"):
+            a_add = np.where(q2 > Sq, Sq * Sq / (q2 - Sq), np.inf)
+        gain = np.where(a_add >= alpha_ceiling, 0.0, gain)
         act_gain = np.empty(k, dtype=np.float64)
         act_action = []
         for j in range(k):
@@ -124,11 +131,22 @@ def _run_faml(G, b, diagG, n, beta, tol=1e-6, max_steps=None, add_batch=1,
                 q_loo = a * Qq[i] / denom
                 q2_loo = q_loo * q_loo
                 l_old = 0.5 * (np.log(a) - np.log(a + s_loo) + q2_loo / (a + s_loo))
-                if q2_loo <= s_loo:
+                a_new = (s_loo * s_loo / (q2_loo - s_loo) if q2_loo > s_loo
+                         else np.inf)
+                if a_new >= alpha_ceiling:
+                    # [FIX RVM-CYCLE] alpha -> inf is deletion.  A re-estimate
+                    # above the ceiling used to be clamped back onto the ceiling
+                    # the basis already sat on: a no-op scored with the gain of
+                    # the unclamped move, picked again every step until
+                    # max_steps (measured: alpha 1e12 -> 2.4e12 -> 1e12 for
+                    # 26060 steps in each of the 10 beta rounds, converged=False).
                     act_gain[j] = -l_old
                     act_action.append(("delete", None))
+                elif max(a_new, 1e-12) == a:
+                    # pinned at the floor it already sits on: nothing to apply
+                    act_gain[j] = 0.0
+                    act_action.append(("noop", None))
                 else:
-                    a_new = s_loo * s_loo / (q2_loo - s_loo)
                     r_loo = q2_loo / s_loo
                     act_gain[j] = 0.5 * (r_loo - 1.0 - np.log(r_loo)) - l_old
                     act_action.append(("update", a_new))
@@ -142,6 +160,10 @@ def _run_faml(G, b, diagG, n, beta, tol=1e-6, max_steps=None, add_batch=1,
         pos = int(hits[0]) if hits.size else -1
         if pos >= 0:
             action, a_new = act_action[pos]
+            if action in ("noop", "fixed"):
+                # only reachable with tol <= 0: no move left that changes the model
+                converged = True
+                break
             if action == "delete":
                 # Incremental downdate (block-inverse identity), O(k*p):
                 #   Sq_j(S\k) = Sq_j(S) + beta^2 a_j^2 / Sigma_kk
@@ -189,7 +211,10 @@ def _run_faml(G, b, diagG, n, beta, tol=1e-6, max_steps=None, add_batch=1,
                 if q2_i <= Sq[i]:
                     continue
                 a_i = float(Sq[i] * Sq[i] / (q2_i - Sq[i]))
-                a_i = min(max(a_i, 1e-12), alpha_ceiling)
+                if a_i >= alpha_ceiling:
+                    # [FIX RVM-CYCLE] would be deleted again on the next step
+                    continue
+                a_i = max(a_i, 1e-12)
                 sc = a_i + Sq[i]
                 if sc <= _TINY:
                     continue

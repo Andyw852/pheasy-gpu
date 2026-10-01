@@ -1602,13 +1602,15 @@ class WorkFlow(object):
             elif settings.MODEL.upper() == "ARDR":
                 logger.info(
                     "Fitting force constants via Automatic Relevance Determination "
-                    "Regression (ARDR; sklearn ARDRegression, threshold_lambda=%s)."
-                    % os.environ.get("PHEASY_ARDR_THRESHOLD", "1e4"))
+                    "Regression (ARDR; sklearn ARDRegression evidence loop, lambda_t %s)."
+                    % (os.environ.get("PHEASY_ARDR_THRESHOLD")
+                       or "chosen by grouped CV"))
             elif settings.MODEL.upper() == "RVM":
                 logger.info(
                     "Fitting force constants via the fast marginal-likelihood RVM "
                     "(Tipping & Faul 2003; active-set, no p x p factorization, "
-                    "lambda_t=%s)." % os.environ.get("PHEASY_RVM_THRESHOLD", "1e4"))
+                    "lambda_t %s)." % (os.environ.get("PHEASY_RVM_THRESHOLD")
+                                       or "chosen by grouped CV"))
             elif settings.MODEL.upper() in ("RFE-OLS-TSQR", "RFE_TSQR", "RFE-TSQR"):
                 logger.info(
                     "Fitting force constants via strict OLS + RFE "
@@ -1798,6 +1800,8 @@ class WorkFlow(object):
                 logger.info("- noise precision beta: {}".format(
                     fit_results.get("rvm_beta")))
                 _rvm_info = fit_results.get("regularized_solver_info") or {}
+                logger.info("- pruning threshold lambda_t: {}".format(
+                    _rvm_info.get("threshold_lambda")))
                 logger.info("- {} RMSE: {} eV/A".format(
                     "in-sample (Gram mode, no CV)" if _rvm_info.get("cv_skipped") else "best CV",
                     fit_metrics["rmse_path_mean"]))
