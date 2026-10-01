@@ -37,7 +37,9 @@
 #  * `OLS` / `RIDGE`：单卡满尺寸实测约 470 s / 607 s（NDATA=296, cv=5），适合做基准。
 #  * `LASSO` / `ALASSO`：分钟级，且泛化最好（本项目材料分组 holdout 比 OLS/RIDGE 好
 #    约 5 倍）；两者都写进去是最常见的组合，各自独立目录便于对比 fit_manifest.json。
-#  * `RFE-OLS`（别名 `RFE`，会被改写成全称）/ `RFE-OLS-TSQR`：耗时最长（每轮完整
+#  * `ARDR` / `RVM`：稀疏贝叶斯（自动相关确定 / 相关向量机），迭代剪枝；每张小体系
+#    上秒级，可用于和 L1 稀疏化的结果互相对照。默认按单位方差标准化。
+#  * `RFE-OLS` / `RFE-OLS-TSQR`：耗时最长（每轮完整
 #    子集求解），**外层强制串行**。
 #    [FIX RFE-GRAM] 特征数进入 PHEASY_RFE_GRAM_GB 预算（默认 min(16 GB, 空闲/4)，
 #    5 折约 1.5 万特征）后每一轮都是 float64 精确求解；稠密 SM 输入本来就在 GPU 上做
@@ -111,13 +113,6 @@ for kv in "$@"; do
     *)            PASSTHRU+=("$kv") ;;
   esac
 done
-# [RFE-OLS] RFE 是 RFE-OLS 的别名：先改写成全称，输出目录和汇总都用 RFE-OLS
-_fm=""
-for _m in $FIT_METHODS; do
-  [ "$_m" = "RFE" ] && _m="RFE-OLS"
-  _fm="${_fm:+$_fm }$_m"
-done
-FIT_METHODS="$_fm"
 if [ ! -f "$FIT_SCRIPT" ]; then
   echo "找不到 pheasy_fit.sh: $FIT_SCRIPT（用 FIT_SCRIPT=... 指定）" >&2; exit 2
 fi

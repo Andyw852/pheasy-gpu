@@ -13,11 +13,14 @@
 #  │  LASSO          L1 正则 + 交叉验证选 alpha，默认去偏 (relaxed)。    │
 #  │  ALASSO         自适应 LASSO (Zou 2006)：初始岭估计 → 自适应权重 →  │
 #  │                 LASSO。比 LASSO 更少收缩偏差。                     │
-#  │  RFE-OLS        递归特征���除 (OLS 子模型)：scale-invariant 重要性， │
-#  │                 特征数按分组 CV + 1-SE 选。RFE 是它的别名。         │
+#  │  RFE-OLS        递归特征消除 (OLS 子模型)：scale-invariant 重要性， │
+#  │                 特征数按分组 CV + 1-SE 选。                        │
 #  │  RFE-OLS-TSQR   同样的消除 + 高瘦 QR 求解，特征数按 AIC 选          │
 #  │                 (PHEASY_TSQR_CRITERION=aic|bic|cv，默认 aic)。     │
 #  │  RIDGE          L2 岭回归 (CV 选 alpha)。                          │
+#  │  ARDR           自动相关确定回归 (稀疏贝叶斯)：迭代剪枝，按单位方差 │
+#  │                 标准化 (PHEASY_ARD_STD=unit_variance，默认)。       │
+#  │  RVM            相关向量机 (稀疏贝叶斯)，与 ARDR 同族。            │
 #  └─────────────────────────────────────────────────────────────────────┘
 #
 #  ┌─────────────────────────────────────────────────────────────────────┐
@@ -61,6 +64,10 @@
 #    PHEASY_RFE_STEP=0.05    RFE 每轮删除比例
 #    PHEASY_RFE_MIN_FEATURES RFE 最小保留特征数
 #    PHEASY_RFE_1SE=1        RFE-OLS 取 CV 最小值一个标准误以内最稀疏的特征数 (0 = 取 CV 最小)
+#    PHEASY_ARD_STD=          ARDR/RVM 的 --std 约定 (unit_variance 默认 | unit_norm 旧版)
+#    PHEASY_ARDR_MAX_ITER=    ARDR 迭代上限 (默认 1000)
+#    PHEASY_RVM_BETA=         RVM 固定噪声精度 (默认按证据更新)
+#    PHEASY_RVM_ADD_BATCH=    RVM 每轮批量加入的基函数数 (默认 1)
 #    PHEASY_TSQR_CRITERION=aic  RFE-OLS-TSQR 选特征数的判据: aic (默认) | bic | cv
 #                             (cv 就是 RFE-OLS 的 CV+1-SE, 两者结果逐位相同)
 #    PHEASY_BIC_N_EFF=samples  AIC/BIC 的样本数 n: samples = 力分量行数 (默认);
@@ -187,14 +194,9 @@ for kv in "$@"; do
   esac
 done
 
-# [RFE-OLS] RFE 是 RFE-OLS 的别名: 统一成全称, 日志 / fit_manifest.json 里都是 RFE-OLS
-if [ "$FIT_METHOD" = "RFE" ]; then
-  echo "FIT_METHOD=RFE 是 RFE-OLS 的别名, 按 RFE-OLS 运行"
-  FIT_METHOD="RFE-OLS"
-fi
 case "$FIT_METHOD" in
-  OLS|LASSO|ALASSO|RFE-OLS|RFE-OLS-TSQR|RIDGE) ;;
-  *) echo "FIT_METHOD=$FIT_METHOD 不是合法方法; 可选: OLS LASSO ALASSO RFE-OLS (别名 RFE) RFE-OLS-TSQR RIDGE" >&2; exit 2 ;;
+  OLS|LASSO|ALASSO|RFE-OLS|RFE-OLS-TSQR|RIDGE|ARDR|RVM) ;;
+  *) echo "FIT_METHOD=$FIT_METHOD 不是合法方法; 可选: OLS LASSO ALASSO RFE-OLS RFE-OLS-TSQR RIDGE ARDR RVM" >&2; exit 2 ;;
 esac
 if [ "$FIT_ORDER" -ge 4 ] && { [ "$C4_CUTOFF" = "None" ] || [ "$C4_CUTOFF" = "none" ]; }; then
   echo "FIT_ORDER=4 但没有设 C4_CUTOFF；四阶不截断会让轨道数爆炸。" >&2
@@ -339,7 +341,7 @@ echo "[4/4] fit ($FIT_METHOD, ndata=$NDATA)"
 FIT_FLAGS="-l $FIT_METHOD --hdf5"
 # --std 对 LASSO / ALASSO / RIDGE 都生效。RIDGE 尤其需要：列范数跨度可达 1e2，
 # 不标准化等于对不同项施加差百倍的 L2 惩罚。
-if [ "$STANDARDIZE" = "true" ] && [[ "$FIT_METHOD" =~ ^(LASSO|ALASSO|RIDGE)$ ]]; then
+if [ "$STANDARDIZE" = "true" ] && [[ "$FIT_METHOD" =~ ^(LASSO|ALASSO|RIDGE|ARDR|RVM)$ ]]; then
   FIT_FLAGS="$FIT_FLAGS --std"
 fi
 if [[ "$FIT_METHOD" =~ ^(LASSO|ALASSO)$ ]]; then

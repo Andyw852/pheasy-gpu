@@ -53,7 +53,7 @@
 #  |                |                                       | 太紧的 pilot 会让权重退化成"截断 OLS"。
 #  |                |                                       | 通常稀疏性最强、泛化最好。
 #  | RFE-OLS        | 驻留子集求解（GPU subset CGLS）       | 递归特征消除（OLS 子模型）+ 分组 CV，特征数
-#  | （别名 RFE）   |                                       | 按 CV+1-SE 选（PHEASY_RFE_1SE=0 取 CV 最小）。
+#  |                |                                       | 按 CV+1-SE 选（PHEASY_RFE_1SE=0 取 CV 最小）。
 #  |                |                                       | 每轮都要做完整子集求解，轮数多、耗时最长。
 #  |                |                                       | 外层必须串行（PHEASY_N_JOBS!=1 时会自动串行
 #  |                |                                       | 并告警）。先在小构型子集上试，再放大。
@@ -141,8 +141,7 @@ for kv in "$@"; do
     *) echo "Arguments must be KEY=VALUE: $kv" >&2; exit 2 ;;
   esac
 done
-[[ "$FIT_METHOD" == "RFE" ]] && FIT_METHOD="RFE-OLS"   # [RFE-OLS] RFE is an alias
-case "$FIT_METHOD" in OLS|LASSO|ALASSO|RFE-OLS|RFE-OLS-TSQR|RIDGE) ;; *) echo "Unsupported FIT_METHOD=$FIT_METHOD (OLS LASSO ALASSO RFE-OLS RFE-OLS-TSQR RIDGE; RFE = RFE-OLS)" >&2; exit 2 ;; esac
+case "$FIT_METHOD" in OLS|LASSO|ALASSO|RFE-OLS|RFE-OLS-TSQR|RIDGE|ARDR|RVM) ;; *) echo "Unsupported FIT_METHOD=$FIT_METHOD (OLS LASSO ALASSO RFE-OLS RFE-OLS-TSQR RIDGE ARDR RVM)" >&2; exit 2 ;; esac
 command -v "$PYTHON" >/dev/null || { echo "Python not found: $PYTHON" >&2; exit 2; }
 command -v "$PHEASY_EXECUTABLE" >/dev/null || { echo "pheasy-gpu not found; install with pip install -e '.[gpu]'" >&2; exit 2; }
 for f in POSCAR SPOSCAR disp_matrix.pkl force_matrix.pkl; do [[ -f "$f" ]] || { echo "Missing $f in $(pwd)" >&2; exit 2; }; done
