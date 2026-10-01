@@ -129,6 +129,7 @@ biases alpha*/ridge toward 0.
 | `PHEASY_RIDGE_DECADES` / `_PER_DECADE` / `_NMAX` | `8` / `2.5` / `40` | RIDGE auto-grid span / density / cap |
 | `PHEASY_ARD_STD` | `unit_variance` | ARDR/RVM `--std` convention (`unit_norm` = legacy) |
 | `PHEASY_RFE_JACOBI` | `1` for operators | Jacobi-preconditioned RFE subset solves |
+| `PHEASY_RFE_GRAM_GB` | `min(16, free/4)` | host budget of the exact per-fold Gram RFE engine (`0` = off) |
 
 Other method fixes in the same change:
 
@@ -141,6 +142,23 @@ Other method fixes in the same change:
   rows), so large fits pruned almost nothing. They now use unit variance, as
   in hiphive and Fransson et al. (2020).
 * **RFE:** Jacobi scaling is now on by default for matrix-free input.
+* **RFE / RFE-OLS-TSQR, exact CV ([FIX RFE-GRAM]):** on operator or sparse
+  input every round used to rank and score the folds with float32 iterative
+  subset solves that stop at a precision floor, so on a large fit the CV
+  compared solver states, not supports (the same round-0 support scored
+  CV_RMSE 2.505e-01 or 3.401e-01 depending only on the solver tolerance).
+  Supports only shrink, so once the active set fits `PHEASY_RFE_GRAM_GB`
+  (default `min(16 GB, 1/4 of free RAM)`, `(K+4) p^2` float64 words) one
+  streaming pass builds the per-fold Grams and every later round -- ranking,
+  K fold fits, validation MSE and the final refit -- is solved exactly
+  (Jacobi-scaled Cholesky, float64, host). Rounds above the budget keep the
+  iterative / resident GPU solver. Also: the final refit of sparse input is now
+  exact (it was the LSQR iterate), a ridge RFE keeps its penalty in the final
+  refit, sample weights are refused instead of ignored, an explicit
+  `PHEASY_GPU_RFE_RESIDENT=1` with `PHEASY_N_JOBS>1` serializes instead of
+  failing, and RFE-OLS-TSQR no longer materializes a dense SM larger than
+  `PHEASY_MAX_DENSE_GB`. Without `PHEASY_TSQR_CRITERION=bic|aic`, RFE-OLS-TSQR
+  is numerically the same method as RFE (only `min_features` differs).
 
 Memory and GPU placement:
 

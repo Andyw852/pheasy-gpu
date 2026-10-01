@@ -281,8 +281,11 @@ class OptimizerLargeRegressions(unittest.TestCase):
         # solver -- the pattern this test exists to pin.  With 40 features, 12
         # forces real ranking solves through _solve_subset(column_scale=...).
         model = opt.PheasyRFE_OLS_TSQR(min_features=12, cv=3, verbose=False)
+        # PHEASY_RFE_GRAM_GB=0 keeps the rounds on the iterative subset solver
+        # this test pins (the exact Gram engine would answer them otherwise)
         with patch.dict(os.environ, {"PHEASY_RFE_JACOBI": "1",
-                                     "PHEASY_LSQR_MAXITER": "80"}), \
+                                     "PHEASY_LSQR_MAXITER": "80",
+                                     "PHEASY_RFE_GRAM_GB": "0"}), \
                 patch.object(opt, "_iterative_solver_info", wraps=opt._iterative_solver_info) as info:
             model.fit(A, y)
         self.assertGreater(info.call_count, 0)

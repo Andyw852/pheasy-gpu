@@ -12,7 +12,9 @@ from core import optimizer as opt
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA hardware required")
 class TestGpuRfe(unittest.TestCase):
     def setUp(self):
-        self.env = patch.dict(os.environ, {"PHEASY_GPU":"1", "PHEASY_GPU_LASSO":"1", "PHEASY_RFE_JACOBI":"0", "PHEASY_RFE_N_JOBS":"1", "PHEASY_MAX_CORES":"1"})
+        # PHEASY_RFE_GRAM_GB=0: these tests pin the GPU subset/resident machinery;
+        # the exact host Gram engine would otherwise answer the small CSR/TwoLevel cases
+        self.env = patch.dict(os.environ, {"PHEASY_GPU":"1", "PHEASY_GPU_LASSO":"1", "PHEASY_RFE_JACOBI":"0", "PHEASY_RFE_N_JOBS":"1", "PHEASY_MAX_CORES":"1", "PHEASY_RFE_GRAM_GB":"0"})
         self.env.start()
         self.previous_gpu_mode = gb.get_gpu_mode()
         gb.set_gpu_mode(True)

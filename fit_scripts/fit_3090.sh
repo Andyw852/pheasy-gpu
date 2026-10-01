@@ -67,6 +67,10 @@
 #  iteration_limit 才是"预算不够"。
 #
 #
+#  [FIX RFE-GRAM] 下面两种跑法的 CV 差异（同一支撑 2.505e-01 vs 3.401e-01）说明迭代
+#  求解的 CV 比较的是求解器状态而不是特征集。现在活跃特征数进入 PHEASY_RFE_GRAM_GB
+#  预算（默认 min(16 GB, 空闲内存/4)，5 折时约 1.5 万特征）后，该轮及之后每一轮都用
+#  各折 float64 Gram 精确求解；预算以上的轮次仍走下面的驻留 GPU 路径。
 #  ⚠ RFE / RFE-OLS-TSQR 的两种跑法（实测 2026-09-17，Mg8C120，required 模式）：
 #  * 默认（推荐先跑这个）：子集求解是**排序**用途，允许在**实测地板**处停下并记录
 #    （info.floor_accepted / floor_note，随 iterative_diagnostics 进 manifest），

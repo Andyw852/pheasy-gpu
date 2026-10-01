@@ -4683,8 +4683,217 @@ class _RowBlockProduct:
         return self.prime[sl] @ self.ns
 
 
+def _rfe_row_source(A, cols):
+    """[FIX RFE-GRAM] Row blocks of A[:, cols] as dense float64, or None.
+
+    TwoLevelSM blocks are formed as SM_prime[i0:i1] @ NS[:, cols] in float64
+    (upcast before the product, so the block is not rounded to the float32
+    storage precision a second time); sparse and dense inputs are column-sliced
+    once and read block by block.
+    """
+    cols = np.asarray(cols, dtype=np.int64)
+    if isinstance(A, TwoLevelSM):
+        NSs = A.NS[:, cols]
+        NSs = (NSs if sp.issparse(NSs) else sp.csr_matrix(NSs)).astype(np.float64)
+        prime = A.SM_prime
+
+        def rows(i0, i1):
+            B = prime[i0:i1]
+            B = (B.astype(np.float64) if sp.issparse(B)
+                 else np.asarray(B, dtype=np.float64)) @ NSs
+            return np.asarray(B.toarray() if sp.issparse(B) else B, dtype=np.float64)
+        return rows
+    sub = _materialize_columns(A, cols)
+    if sub is None:
+        return None
+
+    def rows(i0, i1):
+        B = sub[i0:i1]
+        return np.ascontiguousarray(B.toarray() if sp.issparse(B) else B, dtype=np.float64)
+    return rows
+
+
+def _mirror_upper(G):
+    """Fill the lower triangle of G from its upper triangle, in bounded blocks
+    (np.tril_indices would allocate n^2/2 index pairs)."""
+    n = G.shape[0]
+    _bs = 2048
+    for _j0 in range(0, n, _bs):
+        _j1 = min(_j0 + _bs, n)
+        G[_j0:_j1, :_j0] = G[:_j0, _j0:_j1].T
+        _d = G[_j0:_j1, _j0:_j1]
+        G[_j0:_j1, _j0:_j1] = np.triu(_d) + np.triu(_d, 1).T
+    return G
+
+
+def _gram_solve(build, rhs):
+    """Solve the normal equations M x = rhs, M = build() symmetric PSD (float64).
+
+    Jacobi-scaled Cholesky in place; if M is not numerically positive definite
+    (rank-deficient support, empty column in a fold), rebuild it and return the
+    minimum-norm solution in the scaled coordinates from an eigendecomposition,
+    which is what the Jacobi-scaled LSMR/CGLS subset solve converges to.
+    Returns (x, method).
+    """
+    rhs = np.asarray(rhs, dtype=np.float64)
+
+    def _scaled():
+        M = build()
+        d = np.sqrt(np.clip(np.diag(M), 0.0, None))
+        d[~(d > 0)] = 1.0
+        inv = 1.0 / d
+        M *= inv[:, None]
+        M *= inv[None, :]
+        return M, inv
+    M, inv = _scaled()
+    try:
+        c = spla.cho_factor(M, lower=False, overwrite_a=True, check_finite=False)
+        z = spla.cho_solve(c, rhs * inv, check_finite=False)
+        if np.all(np.isfinite(z)):
+            return z * inv, "cholesky"
+    except (np.linalg.LinAlgError, ValueError):
+        pass
+    del M
+    M, inv = _scaled()
+    w, V = np.linalg.eigh(M)
+    del M
+    keep = w > (w.max() if w.size else 0.0) * max(1, w.size) * np.finfo(np.float64).eps
+    z = V[:, keep] @ ((V[:, keep].T @ (rhs * inv)) / w[keep])
+    return z * inv, "eigh_min_norm"
+
+
+def _rfe_gram_budget_bytes():
+    """[FIX RFE-GRAM] host bytes the exact per-fold Gram engine may use.
+
+    PHEASY_RFE_GRAM_GB overrides (0 disables); default min(16 GB, 1/4 of the
+    currently available RAM).
+    """
+    raw = os.environ.get("PHEASY_RFE_GRAM_GB")
+    if raw is not None and raw.strip() != "":
+        return max(0.0, float(raw)) * 1e9
+    budget = 16e9
+    avail = _available_memory_bytes()
+    if avail is not None:
+        budget = min(budget, 0.25 * float(avail))
+    return budget
+
+
+class _RFEGramCV(object):
+    """[FIX RFE-GRAM] Exact K-fold least squares for RFE rounds.
+
+    On operator / sparse input every RFE round used to rank the features and
+    score the K folds with iterative subset solves (float32 CGLS/LSMR/LSQR)
+    that stop at a precision floor.  On a large fit that floor is far from the
+    least-squares solution, so the per-round CV compared solver states, not
+    supports: fit_scripts/fit_3090.sh records the SAME round-0 support scoring
+    CV_RMSE 2.505e-01 or 3.401e-01 depending only on the solver tolerance, and
+    the selected feature count moving between 4343 and 8685.
+
+    Supports only shrink, so once the active set fits the memory budget one
+    streaming pass accumulates the per-validation-fold Grams G_k = A_k^T A_k,
+    b_k = A_k^T y_k, ||y_k||^2 in float64, and every later round is answered
+    exactly from sub-blocks: training system (sum_j G_j - G_k)[S, S], validation
+    MSE = (||y_k||^2 - 2 x.b_k + x.G_k.x) / n_k, full-data fit from sum_j G_j.
+    """
+
+    def __init__(self, A, y, cols, splits, ridge_alpha=0.0, block_rows=None):
+        import time as _time
+        from scipy.linalg import blas as _blas
+        t0 = _time.time()
+        y = np.asarray(y, dtype=np.float64).ravel()
+        n = int(A.shape[0])
+        self.K = K = len(splits)
+        fold = np.full(n, -1, dtype=np.int64)
+        for k, (_tr, va) in enumerate(splits):
+            fold[np.asarray(va, dtype=np.int64)] = k
+        self.cols = np.asarray(cols, dtype=np.int64)
+        p = int(self.cols.size)
+        self.ridge = float(ridge_alpha)
+        rows = _rfe_row_source(A, self.cols)
+        if rows is None:
+            raise ValueError("no row source for %s" % type(A).__name__)
+        blk = int(block_rows) if block_rows else max(
+            256, min(int(os.environ.get("PHEASY_RFE_FINAL_BLOCK_ROWS", "20000")),
+                     int(256 * 1024**2 // (8 * max(p, 1)))))
+        G = [np.zeros((p, p), dtype=np.float64, order="F") for _ in range(K)]
+        b = np.zeros((K, p), dtype=np.float64)
+        yy = np.zeros(K, dtype=np.float64)
+        nk = np.zeros(K, dtype=np.int64)
+        for i0 in range(0, n, blk):
+            i1 = min(i0 + blk, n)
+            B = rows(i0, i1)
+            fk = fold[i0:i1]
+            yb = y[i0:i1]
+            for k in np.unique(fk):
+                m = fk == k
+                if m.all():
+                    Bk, yk = B, yb
+                else:
+                    Bk, yk = np.ascontiguousarray(B[m]), yb[m]
+                # Bk.T is Fortran-contiguous: dsyrk accumulates Bk^T Bk into the
+                # upper triangle of G[k] in place
+                G[k] = _blas.dsyrk(1.0, Bk.T, beta=1.0, c=G[k], trans=0, lower=0,
+                                   overwrite_c=1)
+                b[k] += Bk.T @ yk
+                yy[k] += float(yk @ yk)
+                nk[k] += int(yk.size)
+            del B
+        for Gk in G:
+            _mirror_upper(Gk)
+        Gt = G[0].copy(order="F")
+        for Gk in G[1:]:
+            Gt += Gk
+        self.G, self.b, self.yy, self.nk = G, b, yy, nk
+        self.Gt, self.bt, self.yyt = Gt, b.sum(axis=0), float(yy.sum())
+        self.nbytes = 8 * (K + 1) * p * p
+        self.build_seconds = _time.time() - t0
+        self.rounds = 0
+        self.methods = set()
+
+    @staticmethod
+    def fits(p, K, budget):
+        # K fold Grams + their sum + three round-sized temporaries
+        return budget > 0 and 8.0 * (K + 4) * float(p) * float(p) <= budget
+
+    def local(self, idx):
+        """Positions of the global column indices idx in self.cols, or None."""
+        idx = np.asarray(idx, dtype=np.int64)
+        loc = np.searchsorted(self.cols, idx)
+        if loc.size and (loc.max() >= self.cols.size
+                         or not np.array_equal(self.cols[loc], idx)):
+            return None
+        return loc
+
+    def _system(self, M):
+        if self.ridge > 0:
+            M.flat[:: M.shape[0] + 1] += self.ridge
+        return M
+
+    def round(self, loc, want_cv=True):
+        """(coef on the full data, cv_mean, cv_se, rss) for the support loc."""
+        ix = np.ix_(loc, loc)
+        Gs = self.Gt[ix]
+        bs = self.bt[loc]
+        x, how = _gram_solve(lambda: self._system(Gs.copy()), bs)
+        self.methods.add(how)
+        rss = max(self.yyt - 2.0 * float(x @ bs) + float(x @ (Gs @ x)), 0.0)
+        self.rounds += 1
+        if not want_cv:
+            return x, None, None, rss
+        rm = np.empty(self.K, dtype=np.float64)
+        for k in range(self.K):
+            Gk = self.G[k][ix]
+            bk = self.b[k][loc]
+            xk, how = _gram_solve(lambda Gs=Gs, Gk=Gk: self._system(Gs - Gk), bs - bk)
+            self.methods.add(how)
+            mse = (self.yy[k] - 2.0 * float(xk @ bk) + float(xk @ (Gk @ xk))) / max(int(self.nk[k]), 1)
+            rm[k] = np.sqrt(max(mse, 0.0))
+        se = float(rm.std(ddof=1) / np.sqrt(self.K)) if self.K > 1 else 0.0
+        return x, float(rm.mean()), se, rss
+
+
 def _rfe_final_refit_exact(A, y, best_idx, *, block_rows=None, diag_floor=1e-12,
-                           iterative_diagnostics=None, n_samples=None):
+                           iterative_diagnostics=None, n_samples=None, ridge_alpha=0.0):
     """[PATCH rfe-final-tsqr-v3] Exact OLS on the selected support.
 
     Default method "gram" accumulates the normal equations G = A^T A in float64
@@ -4701,30 +4910,23 @@ def _rfe_final_refit_exact(A, y, best_idx, *, block_rows=None, diag_floor=1e-12,
         os.environ.get("PHEASY_RFE_FINAL_BLOCK_ROWS", "20000"))
     method = os.environ.get("PHEASY_RFE_FINAL_METHOD", "gram").lower()
 
-    # --- row-block source: sparse slice getter -------------------------------
-    if isinstance(A, TwoLevelSM):
-        try:
-            NSs = A.NS[:, best_idx]
-            if not sp.issparse(NSs):
-                NSs = sp.csr_matrix(NSs)
-        except Exception as exc:
-            print("[RFE] final exact refit: NS slice failed (%s); LSMR fallback"
-                  % type(exc).__name__, flush=True)
-            return None
-        prime = A.SM_prime
-        def _rows(i0, i1):
-            return prime[i0:i1] @ NSs
-    else:
-        try:
-            A_full = _materialize_columns(A, best_idx)
-        except Exception as exc:
-            print("[RFE] final exact refit: materialization failed (%s); LSMR fallback"
-                  % type(exc).__name__, flush=True)
-            return None
-        if A_full is None:
-            return None
-        def _rows(i0, i1):
-            return A_full[i0:i1]
+    # [FIX RFE-GRAM] refuse a Gram that cannot fit instead of letting the
+    # n x n allocation be OOM-killed half way through the accumulation
+    _avail = _available_memory_bytes()
+    _need = 8.0 * n * n * (1.0 if method != "tsqr" else 2.0) + 8.0 * blk * n
+    if _avail is not None and _need > 0.8 * _avail:
+        print("[RFE] final exact refit: needs ~%.1f GB, only %.1f GB available; "
+              "iterative fallback" % (_need / 1e9, _avail / 1e9), flush=True)
+        return None
+    # --- row-block source (float64 blocks of A[:, best_idx]) -----------------
+    try:
+        _rows = _rfe_row_source(A, best_idx)
+    except Exception as exc:
+        print("[RFE] final exact refit: column slice failed (%s); LSMR fallback"
+              % type(exc).__name__, flush=True)
+        return None
+    if _rows is None:
+        return None
 
     if method == "tsqr":
         print("[RFE] final exact refit: streaming TSQR (%d x %d), blocks of %d"
@@ -4778,15 +4980,11 @@ def _rfe_final_refit_exact(A, y, best_idx, *, block_rows=None, diag_floor=1e-12,
                   flush=True)
             return None
         if _syrk:
-            # dsyrk filled the upper triangle only: mirror it in bounded column
-            # blocks (np.tril_indices would allocate n^2/2 index pairs)
-            _bs = 2048
-            for _j0 in range(0, n, _bs):
-                _j1 = min(_j0 + _bs, n)
-                G[_j0:_j1, :_j0] = G[:_j0, _j0:_j1].T
-                _d = G[_j0:_j1, _j0:_j1]
-                G[_j0:_j1, _j0:_j1] = np.triu(_d) + np.triu(_d, 1).T
-        ridge = float(os.environ.get("PHEASY_RFE_FINAL_RIDGE", "0"))
+            # dsyrk filled the upper triangle only
+            _mirror_upper(G)
+        # [FIX RFE-GRAM] a ridge-RFE (PHEASY_RFE_RIDGE_ALPHA) ranks and scores
+        # every round with the penalty, so the delivered refit keeps it too
+        ridge = float(os.environ.get("PHEASY_RFE_FINAL_RIDGE", str(float(ridge_alpha))))
         if ridge > 0:
             G.flat[:: n + 1] += ridge
         try:
@@ -4880,6 +5078,10 @@ class _RFECVBase:
         return n_samples, gs
 
     def fit(self, A, y, sample_weight=None):
+        if sample_weight is not None:
+            # [FIX RFE-GRAM] every subset solve, CV score and the final refit are
+            # unweighted: refuse rather than silently drop the weights
+            raise NotImplementedError("RFE / RFE-OLS-TSQR do not support sample weights")
         y = np.asarray(y, dtype=np.float64).ravel()
         n_samples, n_features = A.shape
         self.n_features_in_ = n_features
@@ -4916,7 +5118,44 @@ class _RFECVBase:
         _rfe_resident_on = os.environ.get(
             "PHEASY_GPU_RFE_RESIDENT",
             "1" if _resident_default() else "0").lower() in ("1", "true", "yes", "on")
-        if _rfe_resident_on and _gpu_required() and self.n_jobs != 1:
+        # [FIX RFE-GRAM] exact per-fold Gram engine for operator / sparse input
+        # (dense input is already solved exactly by QR / SVD per subset).  When
+        # the whole feature set fits the budget it answers every round, so the
+        # resident iterative operator is not built at all.
+        gram = None
+        gram_budget = _rfe_gram_budget_bytes()
+        _fold_rows = np.concatenate([np.asarray(va, dtype=np.int64) for _tr, va in splits]) \
+            if splits else np.zeros(0, dtype=np.int64)
+        gram_eligible = bool(
+            gram_budget > 0 and (_is_linear_operator(A) or sp.issparse(A))
+            and _fold_rows.size == n_samples
+            and np.array_equal(np.sort(_fold_rows), np.arange(n_samples))
+            and not os.environ.get("PHEASY_RFE_SUPPORT_NPY"))
+        del _fold_rows
+        gram_from_round = None
+        if gram_eligible and _RFEGramCV.fits(n_features, len(splits), gram_budget):
+            # Build it now, BEFORE deciding to skip the resident setup: a build
+            # that fails must leave the GPU path in place, not fall through to
+            # the CPU iterative solver.
+            try:
+                gram = _RFEGramCV(A, y, np.arange(n_features), splits,
+                                  ridge_alpha=self.ridge_alpha)
+                gram_from_round = 0
+                if _rfe_resident_on and self.verbose:
+                    print("[RFE] all %d features fit the exact Gram budget (%.1f GB): "
+                          "the rounds are solved exactly on the host, the resident "
+                          "iterative GPU operator is not needed"
+                          % (n_features, gram_budget / 1e9), flush=True)
+                _rfe_resident_on = False
+            except (MemoryError, ValueError, np.linalg.LinAlgError) as _gexc:
+                gram, gram_eligible = None, False
+                print("[RFE] exact Gram CV unavailable (%s: %s); iterative subset "
+                      "solves" % (type(_gexc).__name__, _gexc), flush=True)
+        # [FIX RFE-GRAM] an EXPLICIT PHEASY_GPU_RFE_RESIDENT=1 needs the same serial
+        # outer loop as required mode: pheasy_fit.sh always exports
+        # PHEASY_N_JOBS=$NCPU, and the request used to die with "resident RFE
+        # requires ... n_jobs=1" in auto GPU mode.
+        if _rfe_resident_on and self.n_jobs != 1:
             # The resident RFE operator is not fork-safe, so the outer loop has to
             # be serial -- but in REQUIRED GPU mode the resident solve is the
             # requirement and outer parallelism is only a CPU-side optimization.
@@ -5195,9 +5434,28 @@ class _RFECVBase:
             if n_elim <= self.min_features and round_num == 0:
                 break
 
-            defer_download = (resident_A is not None
-                              and os.environ.get("PHEASY_GPU_RFE_RANKING", "0").lower() in ("1", "true", "yes", "on"))
-            coef_active = solve(idx, download=not defer_download, scope="ranking")
+            if gram is None and gram_eligible and _RFEGramCV.fits(n_active, len(splits), gram_budget):
+                try:
+                    gram = _RFEGramCV(A, y, idx, splits, ridge_alpha=self.ridge_alpha)
+                    gram_from_round = round_num
+                except (MemoryError, ValueError, np.linalg.LinAlgError) as _gexc:
+                    gram_eligible = False
+                    print("[RFE] exact Gram CV unavailable (%s: %s); iterative subset "
+                          "solves continue" % (type(_gexc).__name__, _gexc), flush=True)
+            if gram is not None and gram.rounds == 0 and self.verbose:
+                print("[RFE] exact Gram CV from round %d (n_active=%d): per-fold float64 "
+                      "Grams (%d folds, %.2f GB) built in %.1fs; this and every later "
+                      "round are solved exactly (no iterative precision floor)"
+                      % (gram_from_round, n_active, len(splits), gram.nbytes / 1e9,
+                         gram.build_seconds), flush=True)
+            _gram_loc = gram.local(idx) if gram is not None else None
+            if _gram_loc is not None:
+                coef_active, _g_cv, _g_se, _g_rss = gram.round(
+                    _gram_loc, want_cv=criterion not in ("bic", "aic"))
+            else:
+                defer_download = (resident_A is not None
+                                  and os.environ.get("PHEASY_GPU_RFE_RANKING", "0").lower() in ("1", "true", "yes", "on"))
+                coef_active = solve(idx, download=not defer_download, scope="ranking")
             if self.verbose:
                 nonzero_count = (int(torch.count_nonzero(full_fit_coef).item()) if coef_active is None
                                  else int(np.count_nonzero(coef_active)))
@@ -5205,7 +5463,9 @@ class _RFECVBase:
                 # [FIX P35] IC mode: no CV needed for stopping (skips the K-fold
                 # sub-solves -> ~5x faster); CV is computed once at the end for
                 # the report only. Loop driven by the criterion's own patience.
-                if resident_A is not None:
+                if _gram_loc is not None:
+                    _rss = _g_rss
+                elif resident_A is not None:
                     _rss = float(residual_squares(idx, None, full_fit_coef).sum().item())
                 else:
                     _pred = predict_subset(idx, None, coef_active)
@@ -5232,9 +5492,12 @@ class _RFECVBase:
                 else:
                     no_improve += 1
             else:
-                cv_mean, cv_se, _ = _cv_rmse(A, y, idx, solve, splits,
-                                                n_jobs=self.n_jobs, predict=predict_subset,
-                                                score=score_subset if resident_A is not None else None)
+                if _gram_loc is not None:
+                    cv_mean, cv_se = _g_cv, _g_se
+                else:
+                    cv_mean, cv_se, _ = _cv_rmse(A, y, idx, solve, splits,
+                                                    n_jobs=self.n_jobs, predict=predict_subset,
+                                                    score=score_subset if resident_A is not None else None)
                 history.append((n_active, cv_mean, cv_se, active.copy()))
                 if self.verbose:
                     print(f"[RFE] Round {round_num:3d}: n_active={n_active:5d}  "
@@ -5258,9 +5521,11 @@ class _RFECVBase:
             n_remove = max(1, int(round(n_elim * self.step)))
             n_remove = min(n_remove, n_elim - self.min_features)
             rank_backend = _gpu() if os.environ.get("PHEASY_GPU_RFE_RANKING", "0").lower() in ("1", "true", "yes", "on") else None
-            if protected is not None:
+            if protected is not None or _gram_loc is not None:
                 # [HARM_DENSE] rank on the host: the order is restricted to the
                 # eliminable subset, and the ranking is O(p) either way.
+                # [FIX RFE-GRAM] a Gram round has host coefficients and no
+                # resident full-fit tensor.
                 rank_backend = None
             if rank_backend is not None:
                 import torch
@@ -5311,9 +5576,13 @@ class _RFECVBase:
             best_support = history_bic[best_round][2]
             # CV once for the selected round (report only)
             _sel = np.where(best_support)[0]
-            best_mean, best_se, _ = _cv_rmse(A, y, _sel, solve, splits,
-                                                n_jobs=self.n_jobs, predict=predict_subset,
-                                                score=score_subset if resident_A is not None else None)
+            _sel_loc = gram.local(_sel) if gram is not None else None
+            if _sel_loc is not None:
+                _, best_mean, best_se, _ = gram.round(_sel_loc)
+            else:
+                best_mean, best_se, _ = _cv_rmse(A, y, _sel, solve, splits,
+                                                    n_jobs=self.n_jobs, predict=predict_subset,
+                                                    score=score_subset if resident_A is not None else None)
             if self.verbose:
                 print("[RFE] %s min: n_active=%d, %s=%.2e" % (criterion.upper(), n_best, criterion.upper(), history_bic[best_round][1]), flush=True)
                 print("[RFE] selected: n_active=%d, CV_RMSE=%.6e (+-%.2e)" % (n_best, best_mean, best_se), flush=True)
@@ -5334,16 +5603,29 @@ class _RFECVBase:
         # so only this final solve vetoes the acceptance gate; solving it exactly
         # with TSQR makes the delivered force constants certifiable.
         coef_final = None
-        if (_is_linear_operator(A)
-                and os.environ.get("PHEASY_RFE_FINAL_TSQR", "1").lower()
-                in ("1", "true", "yes", "on")):
+        _best_loc = gram.local(best_idx) if gram is not None else None
+        _exact_final = (_is_linear_operator(A) or sp.issparse(A)) and os.environ.get(
+            "PHEASY_RFE_FINAL_TSQR", "1").lower() in ("1", "true", "yes", "on")
+        if _exact_final:
             try:
                 np.save(os.path.join(".", "rfe_support.npy"), best_idx)
             except Exception:
                 pass
+        if _best_loc is not None:
+            # [FIX RFE-GRAM] the selected support is inside the exact Gram: its
+            # full-data normal equations are already in memory
+            coef_final = gram.round(_best_loc, want_cv=False)[0]
+            iterative_diagnostics.append(dict(
+                solver="Gram-Cholesky", converged=True, stop_reason="normal_equations",
+                fit_scope="full", n_features=int(best_idx.size), n_samples=int(n_samples)))
+        elif _exact_final:
+            # [FIX RFE-GRAM] sparse input too: its final solve used to be the
+            # float32 LSQR iterate (1.2% coefficient error measured on a small
+            # float32 CSR problem), while TwoLevel input got the exact refit
             coef_final = _rfe_final_refit_exact(
                 A, y, best_idx, block_rows=self.block_rows, diag_floor=self.diag_floor,
-                iterative_diagnostics=iterative_diagnostics, n_samples=n_samples)
+                iterative_diagnostics=iterative_diagnostics, n_samples=n_samples,
+                ridge_alpha=self.ridge_alpha)
         if coef_final is None:
             coef_final = solve(best_idx)
         coef_full = np.zeros(n_features, dtype=np.float64)
@@ -5365,7 +5647,15 @@ class _RFECVBase:
         self.alphas_ = np.array([self.ridge_alpha])
         self.mse_path_ = np.array([[self.best_rmse_cv_ ** 2]])
         self.backend_metadata_ = {
-            "subset_solver": "gpu_resident_iterative" if resident_operator else ("gpu_dense" if gpu_subset_solves else "cpu"),
+            "subset_solver": "gpu_resident_iterative" if resident_operator else (
+                "gpu_dense" if gpu_subset_solves else (
+                    "cpu_gram_exact" if gram is not None else "cpu")),
+            "gram_exact_rounds": int(gram.rounds) if gram is not None else 0,
+            "gram_n_features": int(gram.cols.size) if gram is not None else None,
+            "gram_bytes": int(gram.nbytes) if gram is not None else None,
+            "gram_build_seconds": float(gram.build_seconds) if gram is not None else None,
+            "gram_from_round": gram_from_round,
+            "gram_solvers": sorted(gram.methods) if gram is not None else [],
             "iterative_diagnostics": iterative_diagnostics,
             "resident_input_kind": ("csr" if sp.issparse(A) else "twolevel") if resident_operator else ("dense" if resident_A is not None else None),
             "gpu_subset_solves": int(gpu_subset_solves),
@@ -6366,7 +6656,11 @@ class Optimizer(object):
             self._metrics["n_featrues"] = self._metrics["n_features"]  # [FIX P12] deprecated alias
             rfe_meta = getattr(self._model, "backend_metadata_", None)
             if rfe_meta is not None:
-                self._results["execution_backend"] = "gpu_rfe_resident_iterative" if rfe_meta.get("subset_solver") == "gpu_resident_iterative" else ("gpu_rfe_subsets" if rfe_meta.get("subset_solver") == "gpu_dense" else "cpu_rfe")
+                self._results["execution_backend"] = "gpu_rfe_resident_iterative" if rfe_meta.get("subset_solver") == "gpu_resident_iterative" else ("gpu_rfe_subsets" if rfe_meta.get("subset_solver") == "gpu_dense" else ("cpu_rfe_gram_exact" if rfe_meta.get("subset_solver") == "cpu_gram_exact" else "cpu_rfe"))
+                # [FIX RFE-GRAM] how many rounds were scored exactly
+                self._results["rfe_gram_exact_rounds"] = int(rfe_meta.get("gram_exact_rounds", 0))
+                if rfe_meta.get("gram_n_features") is not None:
+                    self._results["rfe_gram_n_features"] = int(rfe_meta["gram_n_features"])
                 self._results["postfit_backend"] = "cpu_orchestration_and_metrics"
                 self._results["backend_metadata"] = dict(rfe_meta)
         elif method == "ARDR":

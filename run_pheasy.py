@@ -1260,11 +1260,27 @@ class WorkFlow(object):
                                  or ((_is_rfe or _is_rfe_tsqr) and _rfe_twolevel)
                                  or (_is_lasso_family and _lasso_twolevel)
                                  or (_is_gram and _gram_twolevel))
+                    # [FIX RFE-GRAM] RFE-OLS-TSQR used to materialize the dense SM
+                    # (sm_dense.npy) whenever the two-level auto switch stayed off,
+                    # i.e. up to nnz 5e8 -- 454656 x 69487 float32 is 126 GB dense.
+                    # Its subset solves are the same as RFE's (and exact through the
+                    # per-fold Gram engine on sparse input), so keep it sparse unless
+                    # the dense matrix fits PHEASY_MAX_DENSE_GB.
+                    _tsqr_dense_gb = (float(SM_prime.shape[0]) * float(self.NS_full.shape[1])
+                                      * _np_p.dtype(_sm_dtype()).itemsize / 1e9)
+                    _tsqr_sparse = _is_rfe_tsqr and (
+                        _rfe_twolevel
+                        or (_rfe_sparse and _tsqr_dense_gb > float(
+                            _os_p.environ.get('PHEASY_MAX_DENSE_GB', '16'))))
+                    if _tsqr_sparse and not _rfe_twolevel:
+                        print('[SM-sparse] RFE-OLS-TSQR: a dense SM would need %.1f GB '
+                              '(> PHEASY_MAX_DENSE_GB); using the sparse SM like RFE'
+                              % _tsqr_dense_gb, flush=True)
                     _use_sparse = (
-                        (not _is_rfe_tsqr or _rfe_twolevel)
+                        (not _is_rfe_tsqr or _tsqr_sparse)
                         and (
                             (_is_rfe and _rfe_sparse)
-                            or (_is_rfe_tsqr and _rfe_twolevel)
+                            or _tsqr_sparse
                             or (_is_lasso_family and (_lasso_sparse or _lasso_twolevel))
                             or (_is_ols and _ols_twolevel)
                             or (_is_gram and _gram_twolevel)

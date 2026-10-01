@@ -26,7 +26,10 @@ class RfeFailureTest(unittest.TestCase):
         A = TwoLevelSM(sp.eye(6, format="csr"), sp.eye(6, format="csr"))
         y = np.arange(6.)
 
-        with patch.dict(os.environ, {"PHEASY_GPU_MODE": "required", "PHEASY_RFE_N_JOBS": "1"}, clear=True), \
+        # PHEASY_RFE_GRAM_GB=0: a problem too large for the exact Gram engine,
+        # i.e. one that genuinely needs the resident iterative path
+        with patch.dict(os.environ, {"PHEASY_GPU_MODE": "required", "PHEASY_RFE_N_JOBS": "1",
+                                     "PHEASY_RFE_GRAM_GB": "0"}, clear=True), \
                 patch.object(gb, "enabled", return_value=True), \
                 patch.object(gb, "available", return_value=True), \
                 patch.object(gb, "GpuTwoLevelOperator", side_effect=RuntimeError("injected setup failure")):

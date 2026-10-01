@@ -58,6 +58,11 @@
 #    PHEASY_LASSO_DEBIAS=0   关闭 LASSO/ALASSO 去偏
 #    PHEASY_RFE_STEP=0.05    RFE 每轮删除比例
 #    PHEASY_RFE_MIN_FEATURES RFE 最小保留特征数
+#    PHEASY_RFE_GRAM_GB=      [FIX RFE-GRAM] RFE/RFE-OLS-TSQR 精确 CV 引擎的主机内存预算
+#                             (默认 min(16, 空闲内存/4) GB; 0=关闭). 活跃特征数 p 满足
+#                             (K+4)*p^2*8 字节 <= 预算后, 每轮排序/K 折拟合/验证误差/最终
+#                             重拟合都用 float64 精确求解 (各折 Gram + Cholesky), 不再受
+#                             float32 迭代求解的精度地板影响
 #    PHEASY_OLS_TWOLEVEL=0   关闭 OLS 两级 matvec
 #    PHEASY_LASSO_1SE=1      LASSO CV 用 1-SE 规则
 #    PHEASY_TSQR_CRITERION=  TSQR 判停: cv|bic|aic (默认 cv)
