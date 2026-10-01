@@ -52,12 +52,16 @@
 #  |                |                                       | PHEASY_ALASSO_PILOT_TOL（默认 1e-5），
 #  |                |                                       | 太紧的 pilot 会让权重退化成"截断 OLS"。
 #  |                |                                       | 通常稀疏性最强、泛化最好。
-#  | RFE            | 驻留子集求解（GPU subset CGLS）       | 递归特征消除 + 分组 CV：每轮都要做完整子集
-#  |                |                                       | 求解，轮数多、耗时最长。外层必须串行
-#  |                |                                       | （PHEASY_N_JOBS!=1 时会自动串行并告警）。
-#  |                |                                       | 先在小构型子集上试，再放大。
-#  | RFE-OLS-TSQR   | RFE + 高瘦 QR（PHEASY_GPU_TSQR）      | 超大规模专用；TSQR 需要保留 O(p^2) 的 R 因子，
-#  |                |                                       | 内存要先算够；同样要求高矩阵。
+#  | RFE-OLS        | 驻留子集求解（GPU subset CGLS）       | 递归特征消除（OLS 子模型）+ 分组 CV，特征数
+#  | （别名 RFE）   |                                       | 按 CV+1-SE 选（PHEASY_RFE_1SE=0 取 CV 最小）。
+#  |                |                                       | 每轮都要做完整子集求解，轮数多、耗时最长。
+#  |                |                                       | 外层必须串行（PHEASY_N_JOBS!=1 时会自动串行
+#  |                |                                       | 并告警）。先在小构型子集上试，再放大。
+#  | RFE-OLS-TSQR   | RFE + 高瘦 QR（PHEASY_GPU_TSQR）      | 同样的消除，特征数按 AIC 选（默认；
+#  |                |                                       | PHEASY_TSQR_CRITERION=aic|bic|cv，cv 时与
+#  |                |                                       | RFE-OLS 逐位相同）。IC 模式每轮不做 K 折，
+#  |                |                                       | 比 RFE-OLS 快约 K 倍。TSQR 需要保留 O(p^2)
+#  |                |                                       | 的 R 因子，内存要先算够；同样要求高矩阵。
 #
 #  [FIX EXACT-LS] SM_DTYPE=float32（默认）且 Gram 放得进 PHEASY_EXACT_GRAM_GB（默认
 #  min(16 GB, 空闲内存/4)，OLS/去偏约 2.5 万特征、5 折 RIDGE 约 1.5 万特征）时，OLS、
@@ -92,7 +96,7 @@
 #  * 想让 accepted=True：给子集求解一个**够得着**的容差 + 更大预算（实测通过）：
 #        PHEASY_LSQR_MAXITER=20000 PHEASY_LSQR_ATOL=1e-3 PHEASY_LSQR_BTOL=1e-3
 #  例：PHEASY_LSQR_MAXITER=20000 PHEASY_LSQR_ATOL=1e-3 bash fit_3090.sh \
-#          FIT_METHOD=RFE C3_CUTOFF=4.0 NDATA=296
+#          FIT_METHOD=RFE-OLS C3_CUTOFF=4.0 NDATA=296
 #  注意代价：放宽容差换到的迭代并不是更准的解，而且会**改变排序**（实测同一份数据：
 #  放宽路径 round-0 CV_RMSE 2.505e-01、默认地板路径 3.401e-01，最终选中的特征数也不同），
 #  （相对判据在 ||r|| 大时也满足）。若你要的是"排序可用"而不是"系数可信"，这没问题；
@@ -137,7 +141,8 @@ for kv in "$@"; do
     *) echo "Arguments must be KEY=VALUE: $kv" >&2; exit 2 ;;
   esac
 done
-case "$FIT_METHOD" in OLS|LASSO|ALASSO|RFE|RFE-OLS-TSQR|RIDGE) ;; *) echo "Unsupported FIT_METHOD=$FIT_METHOD" >&2; exit 2 ;; esac
+[[ "$FIT_METHOD" == "RFE" ]] && FIT_METHOD="RFE-OLS"   # [RFE-OLS] RFE is an alias
+case "$FIT_METHOD" in OLS|LASSO|ALASSO|RFE-OLS|RFE-OLS-TSQR|RIDGE) ;; *) echo "Unsupported FIT_METHOD=$FIT_METHOD (OLS LASSO ALASSO RFE-OLS RFE-OLS-TSQR RIDGE; RFE = RFE-OLS)" >&2; exit 2 ;; esac
 command -v "$PYTHON" >/dev/null || { echo "Python not found: $PYTHON" >&2; exit 2; }
 command -v "$PHEASY_EXECUTABLE" >/dev/null || { echo "pheasy-gpu not found; install with pip install -e '.[gpu]'" >&2; exit 2; }
 for f in POSCAR SPOSCAR disp_matrix.pkl force_matrix.pkl; do [[ -f "$f" ]] || { echo "Missing $f in $(pwd)" >&2; exit 2; }; done

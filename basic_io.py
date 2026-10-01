@@ -316,11 +316,14 @@ class InputParser(argparse.ArgumentParser):
                      "RFE-OLS-TSQR", "RIDGE"],
             help="Linear model for fitting force constants: "
                  "OLS (ordinary least squares), LASSO (L1 + CV alpha), "
-                 "ALASSO (adaptive LASSO), RFE / RFE-OLS (recursive feature "
-                 "elimination with an OLS base estimator), ARDR (automatic "
+                 "ALASSO (adaptive LASSO), RFE-OLS (recursive feature "
+                 "elimination with an OLS base estimator, feature count by "
+                 "grouped CV + 1-SE; RFE is an alias), ARDR (automatic "
                  "relevance determination regression), RVM (fast "
                  "marginal-likelihood sparse Bayesian regression), "
-                 "RFE-OLS-TSQR (RFE with tall-skinny QR solver), or RIDGE.",
+                 "RFE-OLS-TSQR (the same elimination with a tall-skinny QR "
+                 "solver, feature count by AIC; PHEASY_TSQR_CRITERION=aic|bic|cv), "
+                 "or RIDGE.",
         )
         try:
             self.add_argument(
@@ -793,6 +796,9 @@ class InputParser(argparse.ArgumentParser):
                     raise ValueError("unknown namelist key: %s" % _key)
                 setattr(settings, _key.upper(), nml["input"][_key])
         settings = self.parse_args(namespace=settings)
+        # [RFE-OLS] canonical name; "RFE" (CLI or namelist) is an alias
+        if str(settings.MODEL).upper().replace("_", "-") == "RFE":
+            settings.MODEL = "RFE-OLS"
 
         if settings.NBODY is None:
             settings.NBODY = [_ for _ in range(2, settings.MAX_ORDER + 1)]

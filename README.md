@@ -56,12 +56,12 @@ unless `PHEASY_ALLOW_UNACCEPTED_FIT=1` is set.
 | `OLS` | ordinary least squares (LSMR / SVD) |
 | `LASSO` | L1 with cross-validated alpha, then debias refit |
 | `ALASSO` | adaptive LASSO (Zou 2006) |
-| `RFE` | recursive feature elimination, OLS base, grouped CV |
-| `RFE-OLS-TSQR` | RFE with a Q-less tall-skinny QR base solver |
+| `RFE-OLS` (alias `RFE`) | recursive feature elimination, OLS base; feature count by grouped CV + 1-SE |
+| `RFE-OLS-TSQR` | the same elimination with a Q-less tall-skinny QR base solver; feature count by AIC (`PHEASY_TSQR_CRITERION=aic\|bic\|cv`) |
 | `RIDGE` | L2 with cross-validated alpha |
 
 `PHEASY_HARM_DENSE=1` (or `HARM_DENSE=true` in `pheasy_fit.sh`) makes the
-sparse methods (LASSO, ALASSO, RFE, RFE-OLS-TSQR, ARDR, RVM) act on the
+sparse methods (LASSO, ALASSO, RFE-OLS, RFE-OLS-TSQR, ARDR, RVM) act on the
 anharmonic block only: the harmonic (FC2) columns carry no L1 penalty / a flat
 prior / are never eliminated, and are refitted jointly.  The alpha grid is then
 anchored at the anharmonic KKT threshold on the residual of the FC2-only OLS.
@@ -132,6 +132,9 @@ biases alpha*/ridge toward 0.
 | `PHEASY_RFE_GRAM_GB` | `min(16, free/4)` | host budget of the exact per-fold Gram RFE engine (`0` = off) |
 | `PHEASY_EXACT_GRAM_GB` | `min(16, free/4)` | host budget of the exact float64 OLS / RIDGE-CV / LASSO-debias solves on float32 operator input (`0` = off) |
 | `PHEASY_EXACT_GRAM_ALL` | `0` | `1` = use those exact solves on float64 operator input too |
+| `PHEASY_RFE_1SE` | `1` | RFE-OLS feature count: sparsest within one SE of the CV minimum (`0` = the CV minimum) |
+| `PHEASY_TSQR_CRITERION` | `aic` | RFE-OLS-TSQR feature count: `aic`, `bic` or `cv` (`cv` = RFE-OLS's rule, identical results) |
+| `PHEASY_BIC_N_EFF` | `samples` | n of AIC/BIC: force-component rows (`groups` = configuration count, prunes to `min_features`) |
 
 Other method fixes in the same change:
 
@@ -183,8 +186,18 @@ Other method fixes in the same change:
   keeps its GPU solve), sample weights are refused instead of ignored, an explicit
   `PHEASY_GPU_RFE_RESIDENT=1` with `PHEASY_N_JOBS>1` serializes instead of
   failing, and RFE-OLS-TSQR no longer materializes a dense SM larger than
-  `PHEASY_MAX_DENSE_GB`. Without `PHEASY_TSQR_CRITERION=bic|aic`, RFE-OLS-TSQR
-  is numerically the same method as RFE (only `min_features` differs).
+  `PHEASY_MAX_DENSE_GB`.
+* **RFE-OLS / RFE-OLS-TSQR naming and selection ([RFE-OLS]):** `RFE-OLS` is the
+  canonical name (`RFE` is accepted everywhere and rewritten to it, so logs and
+  `fit_manifest.json` say `RFE-OLS`). The two methods share the elimination and
+  differ in how the feature count is chosen: RFE-OLS by grouped CV + 1-SE,
+  RFE-OLS-TSQR by AIC by default (with `PHEASY_TSQR_CRITERION=cv` the two were
+  numerically identical, which is what the old default made them). The AIC/BIC
+  `n` is now the number of force-component rows: with the configuration count
+  (`PHEASY_BIC_N_EFF=groups`, the old default) n is tens while k is hundreds and
+  both criteria pruned to `min_features` (45-configuration test set: AIC kept
+  100 of 1303 features at 6x the CV error; with rows AIC keeps 864, BIC 604,
+  CV + 1-SE 636). The manifest records `rfe_criterion` / `rfe_ic_n_eff`.
 
 Memory and GPU placement:
 

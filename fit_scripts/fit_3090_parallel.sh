@@ -37,17 +37,18 @@
 #  * `OLS` / `RIDGE`：单卡满尺寸实测约 470 s / 607 s（NDATA=296, cv=5），适合做基准。
 #  * `LASSO` / `ALASSO`：分钟级，且泛化最好（本项目材料分组 holdout 比 OLS/RIDGE 好
 #    约 5 倍）；两者都写进去是最常见的组合，各自独立目录便于对比 fit_manifest.json。
-#  * `RFE` / `RFE-OLS-TSQR`：耗时最长（每轮完整子集求解），**外层强制串行**。
+#  * `RFE-OLS`（别名 `RFE`，会被改写成全称）/ `RFE-OLS-TSQR`：耗时最长（每轮完整
+#    子集求解），**外层强制串行**。
 #    [FIX RFE-GRAM] 特征数进入 PHEASY_RFE_GRAM_GB 预算（默认 min(16 GB, 空闲/4)，
 #    5 折约 1.5 万特征）后每一轮都是 float64 精确求解；稠密 SM 输入本来就在 GPU 上做
 #    float64 QR。只有超出预算的大问题（如 Mg8C120）还走迭代子集求解：默认允许停在
 #    实测地板（floor_accepted/floor_note），全量那步可能 accepted=False；要
 #    accepted=True 就加 PHEASY_LSQR_MAXITER=20000 PHEASY_LSQR_ATOL=1e-3
 #    PHEASY_LSQR_BTOL=1e-3。
-#    ⚠ 不设 PHEASY_TSQR_CRITERION=bic|aic 时，RFE-OLS-TSQR 与 RFE 是**同一个估计**
-#    （每个子集都是精确 OLS、同样的排序、同样的 CV+1-SE 选特征数），结果逐位相同，
-#    两个一起跑只是重复。特征数默认按 1-SE 规则取（CV 最小值一个标准误以内最稀疏的
-#    那个，PHEASY_RFE_1SE=1）；PHEASY_RFE_1SE=0 改为取 CV 最小。
+#    两者的消除过程相同（每个子集都是精确 OLS、同样的排序），区别只在**怎么选特征数**：
+#    RFE-OLS 用分组 CV + 1-SE（CV 最小值一个标准误以内最稀疏的那个，PHEASY_RFE_1SE=1；
+#    =0 取 CV 最小）；RFE-OLS-TSQR 默认用 AIC（PHEASY_TSQR_CRITERION=aic|bic|cv，n 取
+#    力分量行数）。设成 cv 时两者结果逐位相同，一起跑只是重复。
 #  * 小 NDATA 时 SM 是**宽**的（实测 NDATA=24 为 36864x69487），所以不要开
 #    PHEASY_GPU_TSQR（要求高矩阵，会正确拒绝）；本脚本刻意不设它。
 #  * 每个方法的产物（fc2/fc3/fit_manifest.json/fit.log）在各自目录里，脚本结束后
@@ -110,6 +111,13 @@ for kv in "$@"; do
     *)            PASSTHRU+=("$kv") ;;
   esac
 done
+# [RFE-OLS] RFE 是 RFE-OLS 的别名：先改写成全称，输出目录和汇总都用 RFE-OLS
+_fm=""
+for _m in $FIT_METHODS; do
+  [ "$_m" = "RFE" ] && _m="RFE-OLS"
+  _fm="${_fm:+$_fm }$_m"
+done
+FIT_METHODS="$_fm"
 if [ ! -f "$FIT_SCRIPT" ]; then
   echo "找不到 pheasy_fit.sh: $FIT_SCRIPT（用 FIT_SCRIPT=... 指定）" >&2; exit 2
 fi

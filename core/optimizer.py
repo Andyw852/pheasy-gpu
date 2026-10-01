@@ -1,8 +1,9 @@
 """Classes and functions for force constant regression.
 
 Implements the force-constant fitting methods exposed by pheasy:
-OLS, RFE / RFE-OLS (recursive feature elimination with an OLS base
-estimator; "RFE" and "RFE-OLS" are aliases), RFE-OLS-TSQR (RFE_TSQR),
+OLS, RFE-OLS (recursive feature elimination with an OLS base estimator,
+feature count by grouped CV + 1-SE; "RFE" is an alias), RFE-OLS-TSQR (the
+same elimination with a QR base solver, feature count by AIC by default),
 LASSO, ALASSO (adaptive LASSO), ARDR (automatic relevance determination
 regression) and the legacy RIDGE method.  The public entry point is the
 Optimizer class.
@@ -5313,9 +5314,9 @@ class _RFECVBase:
         self.block_rows = None if block_rows is None else int(block_rows)
         self.diag_floor = float(diag_floor)
         # [FIX P35] feature-count selection criterion. Default "cv" (CV + 1-SE).
-        # RFE-OLS-TSQR overrides this from PHEASY_TSQR_CRITERION=bic|cv so it
-        # becomes a genuinely independent method (BIC) instead of a numerically
-        # identical twin of RFE.
+        # [RFE-OLS] RFE-OLS-TSQR overrides it from PHEASY_TSQR_CRITERION
+        # (default aic) so it is a genuinely different selection rule, not a
+        # numerically identical twin of RFE-OLS.
         self._criterion = "cv"
 
     def _cv_group_size(self, n_samples):
@@ -5338,16 +5339,23 @@ class _RFECVBase:
         return None
 
     def _bic_n_eff(self, n_samples):
-        """[FIX P35] effective independent observations for BIC.
+        """Number of observations n in the AIC/BIC of RFE-OLS-TSQR.
 
-        Force components in one configuration are highly correlated (3*natoms
-        rows per config) -- the same reason the CV is grouped.  BIC's n should
-        therefore be the CONFIGURATION count, not the raw row count, or the
-        k*ln(n) penalty is off by ln(3*natoms) and the fit term is inflated by
-        3*natoms. PHEASY_BIC_N_EFF=samples falls back to raw rows.
+        [RFE-OLS] Default: the force-component ROWS (PHEASY_BIC_N_EFF=samples).
+        [FIX P35] used the configuration count (PHEASY_BIC_N_EFF=groups) on the
+        argument that the 3*natoms rows of one configuration are correlated.
+        That makes n tens while k is hundreds to thousands, so the 2k / k*ln(n)
+        penalty swamps the n*ln(RSS/n) fit term and both criteria prune to the
+        floor.  Measured on the 45-configuration, 1303-feature test set
+        (25515 rows; CV+1-SE keeps 636, CV minimum at 821):
+          AIC n=45: 100 features (= min_features), CV_RMSE 6.03e-3, 6x worse;
+          AIC n=25515: 864 features, CV_RMSE 1.006e-3 (near the CV minimum);
+          BIC n=25515: 604 features, CV_RMSE 1.016e-3 (near CV+1-SE).
+        The rows are not independent, so these penalties are if anything mild;
+        PHEASY_BIC_N_EFF=groups keeps the configuration count.
         """
         gs = self._cv_group_size(n_samples)
-        if (os.environ.get("PHEASY_BIC_N_EFF", "groups").lower() != "samples"
+        if (os.environ.get("PHEASY_BIC_N_EFF", "samples").lower() == "groups"
                 and gs and gs > 1 and n_samples % gs == 0):
             return n_samples // gs, gs
         return n_samples, gs
@@ -5936,6 +5944,10 @@ class _RFECVBase:
         self.alphas_ = np.array([self.ridge_alpha])
         self.mse_path_ = np.array([[self.best_rmse_cv_ ** 2]])
         self.backend_metadata_ = {
+            # [RFE-OLS] how the feature count was chosen (cv = CV + 1-SE rule)
+            "criterion": criterion,
+            "ic_n_eff": (int(self._bic_n_eff(n_samples)[0])
+                         if criterion in ("bic", "aic") else None),
             "subset_solver": "gpu_resident_iterative" if resident_operator else (
                 "gpu_dense" if gpu_subset_solves else (
                     "cpu_gram_exact" if gram is not None else "cpu")),
@@ -5987,6 +5999,10 @@ class PheasyRFECV(_RFECVBase):
 class PheasyRFE_OLS_TSQR(_RFECVBase):
     """RFE with a strict OLS base estimator solved by Q-less tall-skinny QR.
 
+    [RFE-OLS] The elimination is RFE-OLS's; what differs is how the feature
+    count is chosen: AIC by default (PHEASY_TSQR_CRITERION=aic|bic|cv; cv is
+    RFE-OLS's grouped CV + 1-SE rule and makes the two methods identical).
+
     [FIX P09] ``patience``, ``block_rows`` and ``diag_floor`` are now honoured:
     the base solve streams the factorization block by block (see
     ``_tsqr_qless``) instead of running a plain dense QR on the whole matrix.
@@ -6003,15 +6019,14 @@ class PheasyRFE_OLS_TSQR(_RFECVBase):
                          solver="qr", ridge_alpha=0.0, patience=patience,
                          block_rows=block_rows, diag_floor=diag_floor,
                          protected=protected)
-        # [FIX P35] BIC/AIC are genuinely independent stopping rules (the
-        # CV+1-SE path makes RFE and RFE-OLS-TSQR numerically identical).
-        # NOTE: with the grouped-CV n_eff (configuration count, often tens),
-        # BIC's k*ln(n_eff) penalty is heavy and picks over-sparse models
-        # (e.g. MnIn2Se4 n_eff=45 -> 21 features, CV_RMSE 78x worse than CV's
-        # 1238). CV remains the recommended default; BIC/AIC are sensible only
-        # when n_eff is large (hundreds+).
-        _crit = os.environ.get("PHEASY_TSQR_CRITERION", "cv").lower()
-        self._criterion = _crit if _crit in ("bic", "aic") else "cv"
+        # [RFE-OLS] AIC by default: an independent stopping rule (the CV+1-SE
+        # path makes RFE-OLS and RFE-OLS-TSQR numerically identical).  The
+        # information criteria count the force-component rows as n (see
+        # _bic_n_eff: with the configuration count both prune to the floor).
+        _crit = os.environ.get("PHEASY_TSQR_CRITERION", "aic").strip().lower()
+        if _crit not in ("aic", "bic", "cv"):
+            raise ValueError("PHEASY_TSQR_CRITERION must be aic, bic or cv, got %r" % _crit)
+        self._criterion = _crit
 
 
 # backward-compatible aliases
@@ -6023,8 +6038,10 @@ _LsmrOLSResult = _OLSModel
 class Optimizer(object):
     """Interatomic force constant optimizer.
 
-    Supported methods: ols, lasso, alasso, rfe / rfe-ols (aliases: RFE with an
-    OLS base estimator), rfe-ols-tsqr (rfe_tsqr), ardr (automatic relevance
+    Supported methods: ols, lasso, alasso, rfe-ols (alias rfe: RFE with an
+    OLS base estimator, feature count by grouped CV + 1-SE), rfe-ols-tsqr
+    (rfe_tsqr: same elimination, feature count by AIC unless
+    PHEASY_TSQR_CRITERION says otherwise), ardr (automatic relevance
     determination regression) and the legacy ridge.
     """
 
@@ -6994,6 +7011,10 @@ class Optimizer(object):
                 self._results["execution_backend"] = "gpu_rfe_resident_iterative" if rfe_meta.get("subset_solver") == "gpu_resident_iterative" else ("gpu_rfe_subsets" if rfe_meta.get("subset_solver") == "gpu_dense" else ("cpu_rfe_gram_exact" if rfe_meta.get("subset_solver") == "cpu_gram_exact" else "cpu_rfe"))
                 # [FIX RFE-GRAM] how many rounds were scored exactly
                 self._results["rfe_gram_exact_rounds"] = int(rfe_meta.get("gram_exact_rounds", 0))
+                # [RFE-OLS] feature-count rule: cv (CV + 1-SE), aic or bic
+                self._results["rfe_criterion"] = rfe_meta.get("criterion", "cv")
+                if rfe_meta.get("ic_n_eff") is not None:
+                    self._results["rfe_ic_n_eff"] = int(rfe_meta["ic_n_eff"])
                 if rfe_meta.get("gram_n_features") is not None:
                     self._results["rfe_gram_n_features"] = int(rfe_meta["gram_n_features"])
                 self._results["postfit_backend"] = "cpu_orchestration_and_metrics"

@@ -13,8 +13,10 @@
 #  │  LASSO          L1 正则 + 交叉验证选 alpha，默认去偏 (relaxed)。    │
 #  │  ALASSO         自适应 LASSO (Zou 2006)：初始岭估计 → 自适应权重 →  │
 #  │                 LASSO。比 LASSO 更少收缩偏差。                     │
-#  │  RFE            递归特征消除：scale-invariant 重要性 + 分组 CV。    │
-#  │  RFE-OLS-TSQR   RFE + 高瘦 QR (Q-less tree TSQR)，超大规模专用。   │
+#  │  RFE-OLS        递归特征���除 (OLS 子模型)：scale-invariant 重要性， │
+#  │                 特征数按分组 CV + 1-SE 选。RFE 是它的别名。         │
+#  │  RFE-OLS-TSQR   同样的消除 + 高瘦 QR 求解，特征数按 AIC 选          │
+#  │                 (PHEASY_TSQR_CRITERION=aic|bic|cv，默认 aic)。     │
 #  │  RIDGE          L2 岭回归 (CV 选 alpha)。                          │
 #  └─────────────────────────────────────────────────────────────────────┘
 #
@@ -49,7 +51,7 @@
 #  │                  物化，仅当稀疏乘积也放不下内存时才划算)            │
 #  │ 【稀疏化范围】                                                       │
 #  │   HARM_DENSE     true = 二阶块不惩罚/不剪 (PHEASY_HARM_DENSE=1)，   │
-#  │                  LASSO/ALASSO/RFE/RFE-OLS-TSQR(及 ARDR/RVM) 只稀疏  │
+#  │                  LASSO/ALASSO/RFE-OLS/RFE-OLS-TSQR(及 ARDR/RVM) 只稀疏│
 #  │                  化三阶；二阶随三阶联合重拟合 (默认 false)           │
 #  └─────────────────────────────────────────────────────────────────────┘
 #
@@ -58,6 +60,11 @@
 #    PHEASY_LASSO_DEBIAS=0   关闭 LASSO/ALASSO 去偏
 #    PHEASY_RFE_STEP=0.05    RFE 每轮删除比例
 #    PHEASY_RFE_MIN_FEATURES RFE 最小保留特征数
+#    PHEASY_RFE_1SE=1        RFE-OLS 取 CV 最小值一个标准误以内最稀疏的特征数 (0 = 取 CV 最小)
+#    PHEASY_TSQR_CRITERION=aic  RFE-OLS-TSQR 选特征数的判据: aic (默认) | bic | cv
+#                             (cv 就是 RFE-OLS 的 CV+1-SE, 两者结果逐位相同)
+#    PHEASY_BIC_N_EFF=samples  AIC/BIC 的样本数 n: samples = 力分量行数 (默认);
+#                             groups = 构型数 (n 只有几十, 惩罚压倒拟合项, 会剪到 min_features)
 #    PHEASY_EXACT_GRAM_GB=    [FIX EXACT-LS] float32 算子输入时 OLS / RIDGE-CV / LASSO-ALASSO 去偏
 #                             的精确 float64 求解预算 (默认 min(16, 空闲内存/4) GB; 0=回到迭代求解).
 #                             RIDGE 每折一次特征分解算完整个 alpha 网格, 比逐 alpha 迭代快 10-100 倍
@@ -106,7 +113,7 @@
 #    bash pheasy_fit.sh FIT_METHOD=OLS    C3_CUTOFF=5.2
 #    bash pheasy_fit.sh FIT_METHOD=LASSO  C3_CUTOFF=7.0 NDATA=45 NCPU=8
 #    bash pheasy_fit.sh FIT_METHOD=ALASSO C3_CUTOFF=5.2
-#    bash pheasy_fit.sh FIT_METHOD=RFE    C3_CUTOFF=5.2
+#    bash pheasy_fit.sh FIT_METHOD=RFE-OLS C3_CUTOFF=5.2
 #    bash pheasy_fit.sh FIT_METHOD=RIDGE  C3_CUTOFF=5.2 MU_MIN=-6 MU_MAX=-2
 #
 #  ---------------------------------------------------------------------------
@@ -180,9 +187,14 @@ for kv in "$@"; do
   esac
 done
 
+# [RFE-OLS] RFE 是 RFE-OLS 的别名: 统一成全称, 日志 / fit_manifest.json 里都是 RFE-OLS
+if [ "$FIT_METHOD" = "RFE" ]; then
+  echo "FIT_METHOD=RFE 是 RFE-OLS 的别名, 按 RFE-OLS 运行"
+  FIT_METHOD="RFE-OLS"
+fi
 case "$FIT_METHOD" in
-  OLS|LASSO|ALASSO|RFE|RFE-OLS-TSQR|RIDGE) ;;
-  *) echo "FIT_METHOD=$FIT_METHOD 不是合法方法; 可选: OLS LASSO ALASSO RFE RFE-OLS-TSQR RIDGE" >&2; exit 2 ;;
+  OLS|LASSO|ALASSO|RFE-OLS|RFE-OLS-TSQR|RIDGE) ;;
+  *) echo "FIT_METHOD=$FIT_METHOD 不是合法方法; 可选: OLS LASSO ALASSO RFE-OLS (别名 RFE) RFE-OLS-TSQR RIDGE" >&2; exit 2 ;;
 esac
 if [ "$FIT_ORDER" -ge 4 ] && { [ "$C4_CUTOFF" = "None" ] || [ "$C4_CUTOFF" = "none" ]; }; then
   echo "FIT_ORDER=4 但没有设 C4_CUTOFF；四阶不截断会让轨道数爆炸。" >&2

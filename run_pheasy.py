@@ -722,6 +722,10 @@ class WorkFlow(object):
     def run_fit_force_constants(self):
         """Fit interatomic force constants."""
         settings = self.settings
+        # [RFE-OLS] canonical method name; "RFE" stays accepted as an alias
+        # (basic_io already maps it, this covers settings built elsewhere)
+        if str(settings.MODEL).upper().replace('_', '-') == 'RFE':
+            settings.MODEL = 'RFE-OLS'
         natoms = self.scell.get_global_number_of_atoms()
         # AUTO: 供 PheasyRFECV 的 GroupKFold 防泄漏使用 (每配置行数=3×超胞原子数)
         import os as _os_grp
@@ -1301,7 +1305,7 @@ class WorkFlow(object):
                         if _twolevel:
                             # [PATCH ols/rfe-twolevel] 不显式相乘, 包成 TwoLevelSM.
                             # 关键: 不 del SM_prime/_ns_sp, TwoLevelSM 要持有引用.
-                            _tl_who = "OLS" if _is_ols else ("RFE" if _is_rfe else _model_up)
+                            _tl_who = "OLS" if _is_ols else ("RFE-OLS" if _is_rfe else _model_up)
                             if _is_rfe_tsqr:
                                 print('[SM-twolevel] RFE-OLS-TSQR uses iterative '
                                       'LSMR for a matrix-free operator; dense QR '
@@ -1477,9 +1481,9 @@ class WorkFlow(object):
             # PATCH: optionally redirect LASSO -> RFE via env var
             if (settings.MODEL.upper() == "LASSO" and
                 _os_alasso.environ.get('PHEASY_USE_RFE', '').lower() in ('1','true','yes')):
-                settings.MODEL = "RFE"
+                settings.MODEL = "RFE-OLS"
                 print("[run_pheasy] PHEASY_USE_RFE=1 detected, "
-                      "switching LASSO -> RFE", flush=True)
+                      "switching LASSO -> RFE-OLS", flush=True)
             # [HARM_DENSE] PHEASY_HARM_DENSE=1: the sparse methods prune the
             # anharmonic block only.  The reduced parameter vector is ordered
             # [HARM | ANHARM3 | ANHARM4 ...] (NS_full = block_diag(ns_harm, ...),
@@ -1608,7 +1612,9 @@ class WorkFlow(object):
             elif settings.MODEL.upper() in ("RFE-OLS-TSQR", "RFE_TSQR", "RFE-TSQR"):
                 logger.info(
                     "Fitting force constants via strict OLS + RFE "
-                    "(tall-skinny Householder QR solver, scale-invariant importance).")
+                    "(tall-skinny Householder QR solver, scale-invariant importance; "
+                    "feature count by %s, PHEASY_TSQR_CRITERION)."
+                    % os.environ.get("PHEASY_TSQR_CRITERION", "aic").strip().upper())
             elif settings.MODEL.upper() == "RIDGE":
                 # [FIX P03] RIDGE 在 argparse choices 里、Optimizer 也实现了,
                 # 但这里原来没有分支 -> 落到 else 直接 raise ValueError(空消息)。
@@ -1761,6 +1767,11 @@ class WorkFlow(object):
             elif settings.MODEL.upper() in ("RFE", "RFE-OLS", "RFE-OLS-TSQR", "RFE_TSQR", "RFE-TSQR"):
                 # [FIX P05] TSQR 原来没有汇总分支, 明明算了 CV 却不打印。
                 logger.info("- RFE finished after {} rounds.".format(fit_results["n_iter"]))
+                # [RFE-OLS] which rule chose the feature count
+                _crit = str(fit_results.get("rfe_criterion", "cv"))
+                logger.info("- feature-count criterion: {}".format(
+                    "CV + 1-SE" if _crit == "cv" else "%s (n = %s rows)" % (
+                        _crit.upper(), fit_results.get("rfe_ic_n_eff"))))
                 logger.info("- ridge_alpha: {}".format(fit_results["alpha"]))
                 logger.info("- best CV RMSE: {} eV/A".format(fit_metrics["rmse_path_mean"]))
                 logger.info("- selected features: {} of {}".format(
