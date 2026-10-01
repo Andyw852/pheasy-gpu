@@ -40,8 +40,12 @@ class ResidentDispatchTests(unittest.TestCase):
                                      "PHEASY_CV_TOL": "1e-7",
                                      "PHEASY_CV_MAX_ITER": "200"}):
             model.fit(A, np.array([1., 0., 0., 0.]))
+            # [FIX AUTO-DEVICE-TESTS] the primary resident card, not a literal
+            # cuda:0: with PHEASY_GPU_DEVICE unset gb._auto_device() picks the
+            # card with the most free VRAM
+            want = str(gb._resident_cv_devices()[0])
         self.assertEqual(model.results["execution_backend"], "gpu_twolevel_resident")
-        self.assertEqual(model.results["regularized_solver_info"]["device"], "cuda:0")
+        self.assertEqual(model.results["regularized_solver_info"]["device"], want)
         self.assertTrue(model._model.penalty_weights_ is not None)
 
     def test_explicit_resident_request_does_not_fall_back_to_cpu(self):

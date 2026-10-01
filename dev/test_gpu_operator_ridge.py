@@ -183,8 +183,13 @@ class TestOperatorRidgeGPU(unittest.TestCase):
         model=opt.Optimizer("RIDGE",alpha=[.01,.2],cv=2,use_gpu=True)
         with patch.dict(os.environ,{"PHEASY_GPU":"1","PHEASY_GPU_RIDGE_RESIDENT":"1"}):
             model.fit(A,y)
+            # [FIX AUTO-DEVICE-TESTS] the card the resident operator was built on:
+            # cuda:0 only when PHEASY_GPU_DEVICE=0 / PHEASY_GPU_AUTO_DEVICE=0;
+            # unset, gb._auto_device() picks the card with the most free VRAM
+            from core import gpu_backend as gb
+            want=str(torch.device(gb.resident_device_ids()[0]))
         self.assertIn(model.results["execution_backend"],["gpu_twolevel_ridge_resident","gpu_resident_iterative"])
-        self.assertEqual(model.results["regularized_solver_info"]["device"],"cuda:0")
+        self.assertEqual(model.results["regularized_solver_info"]["device"],want)
     def test_flag_off_preserves_cpu_operator_path(self):
         A=opt.TwoLevelSM(sp.eye(6,format="csr"),sp.eye(6,format="csr")); y=np.arange(6.)
         with patch.dict(os.environ,{"PHEASY_GPU_RIDGE_RESIDENT":"0"}):

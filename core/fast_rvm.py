@@ -183,7 +183,12 @@ def _run_faml(G, b, diagG, n, beta, tol=1e-6, max_steps=None, add_batch=1,
                 i = int(i)
                 if i in alpha:
                     continue
-                a_i = float(Sq[i] * Sq[i] / (q2[i] - Sq[i]))
+                # [FIX RVM-BETA] Sq/Qq were updated by the previous addition of
+                # this batch; q2 from the top of the step is stale for i
+                q2_i = float(Qq[i] * Qq[i])
+                if q2_i <= Sq[i]:
+                    continue
+                a_i = float(Sq[i] * Sq[i] / (q2_i - Sq[i]))
                 a_i = min(max(a_i, 1e-12), alpha_ceiling)
                 sc = a_i + Sq[i]
                 if sc <= _TINY:
@@ -223,6 +228,25 @@ def _run_faml(G, b, diagG, n, beta, tol=1e-6, max_steps=None, add_batch=1,
             "alpha": np.array([alpha[int(i)] for i in S], dtype=np.float64),
             "beta": float(beta), "n_steps": int(n_steps),
             "converged": bool(converged)}
+
+
+def _evidence_beta(G, run, n, rss):
+    """(N - sum gamma) / rss for the active set of one fast-RVM run."""
+    S = np.asarray(run["active"], dtype=np.int64)
+    if S.size == 0:
+        return n / rss
+    a = np.asarray(run["alpha"], dtype=np.float64)
+    A = run["beta"] * np.asarray(G[np.ix_(S, S)], dtype=np.float64)
+    A[np.diag_indices(S.size)] += a
+    try:
+        L = np.linalg.cholesky(A)
+        Linv = np.linalg.solve(L, np.eye(S.size))
+        sig_diag = np.einsum("ij,ij->j", Linv, Linv)
+    except np.linalg.LinAlgError:
+        sig_diag = np.diag(np.linalg.pinv(A))
+    gamma = 1.0 - a * sig_diag
+    dof = float(n) - float(np.clip(gamma, 0.0, 1.0).sum())
+    return max(dof, 1.0) / rss
 
 
 def _prune_and_refit(G, b, active, alpha, beta, threshold, free_idx=None):
@@ -279,11 +303,14 @@ def fast_rvm(G, b, yty, n_samples, y_var=None, beta=None, beta_iters=5,
         if _fm.shape != diagG.shape:
             raise ValueError("fast_rvm free mask must have one entry per feature")
         free_idx = np.flatnonzero(_fm) if _fm.any() else None
+    # [FIX RVM-BETA] a supplied beta (PHEASY_RVM_BETA) is FIXED, as documented;
+    # it used to be only the starting value of the re-estimation loop
+    fixed_beta = beta is not None
     if beta is None:
         v0 = y_var if y_var is not None else yty / max(n, 1)
         beta = 1.0 / max(float(v0), _TINY)
     last = None
-    for it in range(max(1, int(beta_iters))):
+    for it in range(1 if fixed_beta else max(1, int(beta_iters))):
         last = _run_faml(G, b, diagG, n, beta, tol=tol, max_steps=max_steps,
                          add_batch=add_batch, alpha_ceiling=alpha_ceiling,
                          refresh_every=refresh_every, verbose=verbose,
@@ -291,7 +318,14 @@ def fast_rvm(G, b, yty, n_samples, y_var=None, beta=None, beta_iters=5,
         coef = last["coef"]
         rss = yty - 2.0 * float(coef @ b) + float(coef @ (G @ coef))
         rss = max(rss, _TINY)
-        beta_new = n / rss
+        # [FIX RVM-BETA] evidence (ML-II) noise update, Tipping 2001 eq. (18) /
+        # Tipping & Faul 2003: beta = (N - sum_i gamma_i) / ||t - Phi mu||^2,
+        # gamma_i = 1 - alpha_i Sigma_ii.  n / rss ignored the well-determined
+        # parameters, overestimating beta by ~N/(N - k) -> too little noise,
+        # too many basis functions kept.
+        if fixed_beta:
+            break
+        beta_new = _evidence_beta(G, last, n, rss)
         if verbose:
             print("[RVM] beta round %d: beta %.6e -> %.6e  active=%d rss=%.4e"
                   % (it, beta, beta_new, len(last["active"]), rss), flush=True)

@@ -130,6 +130,8 @@ biases alpha*/ridge toward 0.
 | `PHEASY_ARD_STD` | `unit_variance` | ARDR/RVM `--std` convention (`unit_norm` = legacy) |
 | `PHEASY_RFE_JACOBI` | `1` for operators | Jacobi-preconditioned RFE subset solves |
 | `PHEASY_RFE_GRAM_GB` | `min(16, free/4)` | host budget of the exact per-fold Gram RFE engine (`0` = off) |
+| `PHEASY_EXACT_GRAM_GB` | `min(16, free/4)` | host budget of the exact float64 OLS / RIDGE-CV / LASSO-debias solves on float32 operator input (`0` = off) |
+| `PHEASY_EXACT_GRAM_ALL` | `0` | `1` = use those exact solves on float64 operator input too |
 
 Other method fixes in the same change:
 
@@ -142,6 +144,27 @@ Other method fixes in the same change:
   rows), so large fits pruned almost nothing. They now use unit variance, as
   in hiphive and Fransson et al. (2020).
 * **RFE:** Jacobi scaling is now on by default for matrix-free input.
+* **float32 operator input, all methods ([FIX GRAM-F64], [FIX EXACT-LS],
+  [FIX RVM-BETA]):** a large fit reaches the fitters as a float32 two-level
+  operator whose matvec/rmatvec run in float32.
+  - The Gram builders (ARDR, RVM, the CPU FISTA LASSO/ALASSO Gram path) took
+    `b = A^T y` -- and on the block route `G` itself -- from those float32
+    products (1.9% coefficient error on a kappa~1e2 test); they are float64 now.
+  - OLS, the RIDGE CV and the LASSO/ALASSO relaxed refit (debias) solved with
+    CGLS/LSMR/LSQR that stop at a float32 precision floor instead of at the
+    solution (RIDGE: CV curve off by 1.3%, coefficients 6.7% off at alpha*).
+    When the Gram fits `PHEASY_EXACT_GRAM_GB` they are now solved exactly in
+    float64 (one streaming Gram pass; RIDGE: one eigendecomposition per fold for
+    the whole alpha grid, 10-100x faster). Float64 operators keep the iterative
+    solvers (they certify their tolerance); an explicit
+    `PHEASY_GPU_RIDGE_RESIDENT=1` / `PHEASY_GPU_OLS_RESIDENT=1` /
+    `PHEASY_GPU_TSQR=1` also keeps the requested solver.
+  - RVM: the noise precision is the evidence update `(N - sum gamma)/RSS`
+    (was `N/RSS`, which ignored the fitted parameters and kept too many basis
+    functions); `PHEASY_RVM_BETA` now really fixes beta; batch additions
+    (`PHEASY_RVM_ADD_BATCH>1`) use fresh statistics.
+  - ARDR on dense input: `PHEASY_ARDR_MAX_ITER` default 300 -> 1000 (300 stopped
+    sklearn's loop unconverged where the Gram loop converged).
 * **RFE / RFE-OLS-TSQR, exact CV ([FIX RFE-GRAM]):** on operator or sparse
   input every round used to rank and score the folds with float32 iterative
   subset solves that stop at a precision floor, so on a large fit the CV
@@ -152,9 +175,12 @@ Other method fixes in the same change:
   streaming pass builds the per-fold Grams and every later round -- ranking,
   K fold fits, validation MSE and the final refit -- is solved exactly
   (Jacobi-scaled Cholesky, float64, host). Rounds above the budget keep the
-  iterative / resident GPU solver. Also: the final refit of sparse input is now
-  exact (it was the LSQR iterate), a ridge RFE keeps its penalty in the final
-  refit, sample weights are refused instead of ignored, an explicit
+  iterative / resident GPU solver. The delivered refit keeps the
+  `[PATCH rfe-final-tsqr]` contract: unregularized OLS on the selected support
+  (`PHEASY_RFE_RIDGE_ALPHA` only regularizes ranking and CV;
+  `PHEASY_RFE_FINAL_RIDGE` opts in). Also: sparse input whose final solve would
+  have been the float32 LSQR iterate gets the exact refit (the resident CSR path
+  keeps its GPU solve), sample weights are refused instead of ignored, an explicit
   `PHEASY_GPU_RFE_RESIDENT=1` with `PHEASY_N_JOBS>1` serializes instead of
   failing, and RFE-OLS-TSQR no longer materializes a dense SM larger than
   `PHEASY_MAX_DENSE_GB`. Without `PHEASY_TSQR_CRITERION=bic|aic`, RFE-OLS-TSQR

@@ -145,6 +145,26 @@ class FistaToleranceTests(unittest.TestCase):
         self.assertLess(aware["kkt_relative"], loose["kkt_relative"])
 
 
+_TORCH_THREADS = None
+
+
+def setUpModule():
+    # The resident / GPU paths are emulated with torch on the CPU: thousands of
+    # tiny sparse ops per test, each an OpenMP region over every core.  On a
+    # loaded many-core box that oversubscribes badly (measured with 6 busy
+    # processes on 4 cores: 1.1 s -> 100 s per resident test; 1 thread: 1.6 s),
+    # which looked like a hang.  One thread for this module, restored after.
+    global _TORCH_THREADS
+    if torch is not None:
+        _TORCH_THREADS = torch.get_num_threads()
+        torch.set_num_threads(1)
+
+
+def tearDownModule():
+    if torch is not None and _TORCH_THREADS:
+        torch.set_num_threads(_TORCH_THREADS)
+
+
 def _emulated(fn):
     return unittest.skipIf(torch is None, "torch not installed")(fn)
 

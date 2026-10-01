@@ -58,6 +58,10 @@
 #    PHEASY_LASSO_DEBIAS=0   关闭 LASSO/ALASSO 去偏
 #    PHEASY_RFE_STEP=0.05    RFE 每轮删除比例
 #    PHEASY_RFE_MIN_FEATURES RFE 最小保留特征数
+#    PHEASY_EXACT_GRAM_GB=    [FIX EXACT-LS] float32 算子输入时 OLS / RIDGE-CV / LASSO-ALASSO 去偏
+#                             的精确 float64 求解预算 (默认 min(16, 空闲内存/4) GB; 0=回到迭代求解).
+#                             RIDGE 每折一次特征分解算完整个 alpha 网格, 比逐 alpha 迭代快 10-100 倍
+#    PHEASY_EXACT_GRAM_ALL=1  float64 算子输入也用上述精确求解 (默认只对 float32)
 #    PHEASY_RFE_GRAM_GB=      [FIX RFE-GRAM] RFE/RFE-OLS-TSQR 精确 CV 引擎的主机内存预算
 #                             (默认 min(16, 空闲内存/4) GB; 0=关闭). 活跃特征数 p 满足
 #                             (K+4)*p^2*8 字节 <= 预算后, 每轮排序/K 折拟合/验证误差/最终

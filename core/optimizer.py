@@ -1638,6 +1638,34 @@ def _gram_budget_ok(A, max_gb=None):
     return peak_dim * peak_dim * 8.0 / 1e9 <= max_gb
 
 
+def _rmatvec_f64(A, u):
+    """A^T u accumulated in float64 ([FIX GRAM-F64]).
+
+    TwoLevelSM (and row slices of it) multiply in the factor dtype, so the
+    factors are applied here directly: scipy upcasts a float32 sparse matrix
+    times a float64 vector to float64.
+    """
+    u = np.asarray(u, dtype=np.float64).ravel()
+    if hasattr(A, "SM_prime") and hasattr(A, "NS"):
+        t = np.asarray(A.SM_prime.T @ u, dtype=np.float64).ravel()
+        return np.asarray(A.NS.T @ t, dtype=np.float64).ravel()
+    return np.asarray(A.T @ u, dtype=np.float64).ravel()
+
+
+def _rmatvec_f64_residual(A, x, y):
+    """A x - y with the two-level factors applied in float64 ([FIX GRAM-F64])."""
+    x = np.asarray(x, dtype=np.float64).ravel()
+    base = A if hasattr(A, "SM_prime") else getattr(A, "_twolevel_base", None)
+    if base is not None and hasattr(base, "SM_prime") and hasattr(base, "NS"):
+        if base is not A:
+            x = x / np.asarray(A._twolevel_scale, dtype=np.float64).ravel()
+        t = np.asarray(base.NS @ x, dtype=np.float64).ravel()
+        pred = np.asarray(base.SM_prime @ t, dtype=np.float64).ravel()
+    else:
+        pred = np.asarray(A @ x, dtype=np.float64).ravel()
+    return pred - np.asarray(y, dtype=np.float64).ravel()
+
+
 def _compute_gram(A, y):
     """Precompute G = A^T A (n_features x n_features) and b = A^T y.
 
@@ -1648,7 +1676,21 @@ def _compute_gram(A, y):
     """
     n, m = A.shape
     y64 = np.asarray(y, dtype=np.float64).ravel()
-    b = np.asarray(A.T @ y64, dtype=np.float64).ravel()
+    _base = getattr(A, "_twolevel_base", None)
+    if _base is not None and hasattr(_base, "SM_prime") and hasattr(A, "_twolevel_scale"):
+        # [FIX GRAM-F64] column-scaled two-level wrapper (--std / Jacobi): build
+        # from the factors, then scale -- the wrapper's own matvecs run in the
+        # factor dtype
+        G, b, P = _compute_gram(_base, y64)
+        d = 1.0 / np.asarray(A._twolevel_scale, dtype=np.float64).ravel()
+        G *= d[:, None]
+        G *= d[None, :]
+        return G, b * d, P
+    # [FIX GRAM-F64] b in float64: TwoLevelSM.rmatvec runs in the factor dtype,
+    # so a float32 sensing matrix rounded every entry of b to ~1e-7 -- G is
+    # exact float64, and the ill-conditioned normal equations amplified the
+    # rounded right-hand side (1.9% coefficient error on a kappa~1e2 test).
+    b = _rmatvec_f64(A, y64)
     P = None
     if hasattr(A, "SM_prime"):  # TwoLevelSM
         P = _gram_smprime(A.SM_prime)
@@ -1667,7 +1709,11 @@ def _compute_gram(A, y):
             _Tblk = np.asarray(P @ _NS[:, _j0:_j1], dtype=np.float64)
             G[:, _j0:_j1] = np.asarray(_NS.T @ _Tblk, dtype=np.float64)
     elif sp.issparse(A):
-        G = np.asarray((A.T @ A).toarray(), dtype=np.float64)
+        # [FIX GRAM-F64] upcast before the product (a float32 SpGEMM
+        # accumulates in float32: ~1e-6 relative error in G)
+        A64 = A.astype(np.float64)
+        G = np.asarray((A64.T @ A64).toarray(), dtype=np.float64)
+        del A64
     elif _is_linear_operator(A):
         # [FIX P34] build G column-block-wise so a bare LinearOperator does NOT
         # materialize the full dense SM (n_rows x n_features).  Peak memory is
@@ -1703,9 +1749,32 @@ def _compute_gram_blockwise(A, y, blk=None):
     """
     n, m = A.shape
     y64 = np.asarray(y, dtype=np.float64).ravel()
-    b = np.asarray(A.T @ y64, dtype=np.float64).ravel()
     blk = int(os.environ.get("PHEASY_GRAM_BLOCK", "64")) if blk is None else int(blk)
     blk = max(1, blk)
+    # [FIX GRAM-F64] two-level input (bare or column-scaled): run the block
+    # products through the float64-upcast factors.  The operator's own
+    # matvec/rmatvec run in the factor dtype, so a float32 SM gave a Gram
+    # rounded to ~1e-6 per entry -- this is the route ARDR / RVM take on
+    # exactly the large systems (P over its budget).
+    base = A if hasattr(A, "SM_prime") else getattr(A, "_twolevel_base", None)
+    if base is not None and hasattr(base, "SM_prime"):
+        SMp = base.SM_prime
+        SMp = SMp.astype(np.float64) if sp.issparse(SMp) else np.asarray(SMp, dtype=np.float64)
+        NS = base.NS if sp.issparse(base.NS) else sp.csr_matrix(base.NS)
+        NS = NS.astype(np.float64).tocsc()
+        G = np.zeros((m, m), dtype=np.float64)
+        for j0 in range(0, m, blk):
+            j1 = min(j0 + blk, m)
+            T = SMp @ NS[:, j0:j1].toarray()                      # n x blk
+            G[:, j0:j1] = np.asarray(NS.T @ np.asarray(SMp.T @ T), dtype=np.float64)
+        b = np.asarray(NS.T @ np.asarray(SMp.T @ y64), dtype=np.float64).ravel()
+        if base is not A:
+            d = 1.0 / np.asarray(getattr(A, "_twolevel_scale"), dtype=np.float64).ravel()
+            G *= d[:, None]
+            G *= d[None, :]
+            b *= d
+        return G, b
+    b = np.asarray(A.T @ y64, dtype=np.float64).ravel()
     G = np.zeros((m, m), dtype=np.float64)
     for j0 in range(0, m, blk):
         j1 = min(j0 + blk, m)
@@ -4692,6 +4761,17 @@ def _rfe_row_source(A, cols):
     once and read block by block.
     """
     cols = np.asarray(cols, dtype=np.int64)
+    _base = getattr(A, "_twolevel_base", None)
+    if _base is not None and hasattr(A, "_twolevel_scale"):
+        # column-scaled two-level wrapper (--std / Jacobi): A = base * diag(1/scale)
+        base_rows = _rfe_row_source(_base, cols)
+        if base_rows is None:
+            return None
+        d = 1.0 / np.asarray(A._twolevel_scale, dtype=np.float64).ravel()[cols]
+
+        def rows(i0, i1):
+            return base_rows(i0, i1) * d[None, :]
+        return rows
     if isinstance(A, TwoLevelSM):
         NSs = A.NS[:, cols]
         NSs = (NSs if sp.issparse(NSs) else sp.csr_matrix(NSs)).astype(np.float64)
@@ -4762,6 +4842,16 @@ def _gram_solve(build, rhs):
     return z * inv, "eigh_min_norm"
 
 
+def _rfe_final_ridge():
+    """Ridge of the exact final refit: 0 unless PHEASY_RFE_FINAL_RIDGE is set.
+
+    [FIX RFE-CONTRACT] [PATCH rfe-final-tsqr] contract: the exact refit delivers UNREGULARIZED OLS
+    on the selected support; PHEASY_RFE_RIDGE_ALPHA only regularizes the
+    ranking / CV subset solves (dev/test_gpu_rfe.py pins this).
+    """
+    return float(os.environ.get("PHEASY_RFE_FINAL_RIDGE", "0"))
+
+
 def _rfe_gram_budget_bytes():
     """[FIX RFE-GRAM] host bytes the exact per-fold Gram engine may use.
 
@@ -4776,6 +4866,220 @@ def _rfe_gram_budget_bytes():
     if avail is not None:
         budget = min(budget, 0.25 * float(avail))
     return budget
+
+
+def _accumulate_fold_grams(A, y, cols, splits, block_rows=None):
+    """[FIX EXACT-LS] one streaming pass: per-validation-fold float64 Grams.
+
+    Returns (G, b, yy, nk): G[k] = A_k^T A_k (p x p, Fortran order, full),
+    b[k] = A_k^T y_k, yy[k] = ||y_k||^2, nk[k] = rows of fold k, where A_k are
+    the rows of A[:, cols] in the k-th validation set.  The splits must
+    partition the rows (K-fold).
+    """
+    from scipy.linalg import blas as _blas
+    y = np.asarray(y, dtype=np.float64).ravel()
+    n = int(A.shape[0])
+    K = len(splits)
+    fold = np.full(n, -1, dtype=np.int64)
+    for k, (_tr, va) in enumerate(splits):
+        fold[np.asarray(va, dtype=np.int64)] = k
+    if (fold < 0).any():
+        raise ValueError("CV splits do not partition the rows")
+    cols = np.asarray(cols, dtype=np.int64)
+    p = int(cols.size)
+    rows = _rfe_row_source(A, cols)
+    if rows is None:
+        raise ValueError("no row source for %s" % type(A).__name__)
+    blk = int(block_rows) if block_rows else max(
+        256, min(int(os.environ.get("PHEASY_RFE_FINAL_BLOCK_ROWS", "20000")),
+                 int(256 * 1024**2 // (8 * max(p, 1)))))
+    G = [np.zeros((p, p), dtype=np.float64, order="F") for _ in range(K)]
+    b = np.zeros((K, p), dtype=np.float64)
+    yy = np.zeros(K, dtype=np.float64)
+    nk = np.zeros(K, dtype=np.int64)
+    for i0 in range(0, n, blk):
+        i1 = min(i0 + blk, n)
+        B = rows(i0, i1)
+        fk = fold[i0:i1]
+        yb = y[i0:i1]
+        for k in np.unique(fk):
+            m = fk == k
+            if m.all():
+                Bk, yk = B, yb
+            else:
+                Bk, yk = np.ascontiguousarray(B[m]), yb[m]
+            # Bk.T is Fortran-contiguous: dsyrk accumulates Bk^T Bk into the
+            # upper triangle of G[k] in place
+            G[k] = _blas.dsyrk(1.0, Bk.T, beta=1.0, c=G[k], trans=0, lower=0,
+                               overwrite_c=1)
+            b[k] += Bk.T @ yk
+            yy[k] += float(yk @ yk)
+            nk[k] += int(yk.size)
+        del B
+    for Gk in G:
+        _mirror_upper(Gk)
+    return G, b, yy, nk
+
+
+def _splits_partition(splits, n_samples):
+    rows = (np.concatenate([np.asarray(va, dtype=np.int64) for _tr, va in splits])
+            if splits else np.zeros(0, dtype=np.int64))
+    return bool(rows.size == n_samples
+                and np.array_equal(np.sort(rows), np.arange(n_samples)))
+
+
+def _exact_gram_budget_bytes():
+    """[FIX EXACT-LS] host budget of the exact float64 Gram solves of OLS, RIDGE
+    and the LASSO/ALASSO debias on operator / sparse input.
+
+    PHEASY_EXACT_GRAM_GB overrides (0 disables and restores the iterative
+    solvers); default min(16 GB, 1/4 of the currently available RAM).
+    """
+    raw = os.environ.get("PHEASY_EXACT_GRAM_GB")
+    if raw is not None and raw.strip() != "":
+        return max(0.0, float(raw)) * 1e9
+    budget = 16e9
+    avail = _available_memory_bytes()
+    if avail is not None:
+        budget = min(budget, 0.25 * float(avail))
+    return budget
+
+
+def _exact_gram_input(A):
+    """Operator / sparse input the exact Gram paths should take over.
+
+    Only float32 storage (the production PHEASY_SM_DTYPE): that is where the
+    iterative solvers stop at a precision floor instead of at the solution.
+    With float64 factors CGLS/LSMR reach their tight tolerance and certify it
+    (or are refused by the acceptance gate), so they are kept;
+    PHEASY_EXACT_GRAM_ALL=1 applies the exact paths to float64 input as well.
+    """
+    if isinstance(A, np.ndarray):
+        return False
+    if not (_is_linear_operator(A) or sp.issparse(A)):
+        return False
+    if not (sp.issparse(A) or isinstance(A, TwoLevelSM)
+            or (hasattr(A, "_twolevel_scale")
+                and isinstance(getattr(A, "_twolevel_base", None), TwoLevelSM))):
+        return False
+    if os.environ.get("PHEASY_EXACT_GRAM_ALL", "0").lower() in ("1", "true", "yes", "on"):
+        return True
+    try:
+        return np.dtype(_array_precision(A)) == np.dtype(np.float32)
+    except Exception:
+        return False
+
+
+def _exact_normal_solve(A, y, cols=None, ridge=0.0, label="exact"):
+    """[FIX EXACT-LS] min ||A[:, cols] x - y||^2 + ridge ||x||^2, exactly.
+
+    Streams the float64 Gram of A[:, cols] from row blocks and solves it with
+    the Jacobi-scaled Cholesky of _gram_solve (min-norm eigh fallback).
+    Returns (x, info), or None when the input kind or the memory budget does
+    not allow it (the caller then keeps its iterative solver).
+    """
+    import time as _time
+    if not _exact_gram_input(A):
+        return None
+    p_all = int(A.shape[1])
+    cols = np.arange(p_all) if cols is None else np.asarray(cols, dtype=np.int64)
+    s = int(cols.size)
+    budget = _exact_gram_budget_bytes()
+    if s == 0 or not (budget > 0 and 3.0 * 8.0 * s * s <= budget):
+        return None
+    t0 = _time.time()
+    n = int(A.shape[0])
+    try:
+        G, b, yy, _nk = _accumulate_fold_grams(A, y, cols, [(None, np.arange(n))])
+    except (MemoryError, ValueError) as exc:
+        print("[%s] exact Gram unavailable (%s: %s); iterative solver"
+              % (label, type(exc).__name__, exc), flush=True)
+        return None
+    G, b = G[0], b[0]
+    t_gram = _time.time() - t0
+    r = float(ridge)
+    x, how = _gram_solve(
+        (lambda: (G.copy() if r <= 0 else _RFEGramCV._system(G.copy(), r))), b)
+    rss = max(float(yy[0]) - 2.0 * float(x @ b) + float(x @ (G @ x)), 0.0)
+    info = {"solver": "Gram-Cholesky (exact float64)" if how == "cholesky"
+            else "Gram-eigh min-norm (exact float64)",
+            "backend": "cpu_gram_exact", "converged": True,
+            "stop_reason": "normal_equations", "n_features": s, "n_samples": n,
+            "ridge": r, "gram_seconds": t_gram,
+            "solve_seconds": _time.time() - t0 - t_gram,
+            "normr": float(np.sqrt(rss)), "gram_bytes": int(8 * s * s)}
+    print("[%s] exact float64 normal equations: %d features, Gram %.2f GB in %.1fs, "
+          "%s solve in %.1fs, ||Ax-y||=%.6e"
+          % (label, s, 8.0 * s * s / 1e9, t_gram, how, info["solve_seconds"],
+             info["normr"]), flush=True)
+    return x, info
+
+
+def _exact_ridge_cv(A, y, alphas, splits):
+    """[FIX EXACT-LS] exact grouped-CV ridge path on operator / sparse input.
+
+    One streaming pass builds the per-fold float64 Grams; each fold's training
+    Gram is diagonalized once, so every alpha of the grid costs O(p^2):
+    x(alpha) = V (V^T b_tr / (w + alpha)), validation MSE from the fold Gram
+    identity.  Returns a dict, or None (input kind / budget / splits) so the
+    caller keeps the iterative solver.
+    """
+    import time as _time
+    if not _exact_gram_input(A):
+        return None
+    n, p = int(A.shape[0]), int(A.shape[1])
+    K = len(splits)
+    budget = _exact_gram_budget_bytes()
+    if not (budget > 0 and 8.0 * (K + 4) * p * p <= budget):
+        return None
+    if not _splits_partition(splits, n):
+        return None
+    t0 = _time.time()
+    try:
+        G, b, yy, nk = _accumulate_fold_grams(A, y, np.arange(p), splits)
+    except (MemoryError, ValueError) as exc:
+        print("[RIDGE-CV] exact Gram unavailable (%s: %s); iterative solver"
+              % (type(exc).__name__, exc), flush=True)
+        return None
+    Gt = G[0].copy(order="F")
+    for Gk in G[1:]:
+        Gt += Gk
+    bt = b.sum(axis=0)
+    t_gram = _time.time() - t0
+    alphas = np.asarray(alphas, dtype=np.float64).ravel()
+    mse = np.zeros((alphas.size, K), dtype=np.float64)
+    for k in range(K):
+        w, V = np.linalg.eigh(Gt - G[k])
+        w = np.clip(w, 0.0, None)
+        z = V.T @ (bt - b[k])
+        for j, a in enumerate(alphas):
+            x = V @ (z / (w + a))
+            mse[j, k] = max(float(yy[k]) - 2.0 * float(x @ b[k])
+                            + float(x @ (G[k] @ x)), 0.0) / max(int(nk[k]), 1)
+        del V
+    best_j = int(np.argmin(mse.mean(axis=1)))
+    best_alpha = float(alphas[best_j])
+    del G
+    coef, how = _gram_solve(lambda: _RFEGramCV._system(Gt.copy(), best_alpha), bt)
+    lcurve = None
+    if os.environ.get("PHEASY_RIDGE_LCURVE", "1").lower() not in ("0", "false", "no", "off"):
+        w, V = np.linalg.eigh(Gt)
+        w = np.clip(w, 0.0, None)
+        z = V.T @ bt
+        yyt = float(yy.sum())
+        lcurve = []
+        for a in alphas:
+            x = V @ (z / (w + a))
+            lcurve.append((float(a), float(np.linalg.norm(x)), float(np.sqrt(max(
+                yyt - 2.0 * float(x @ bt) + float(x @ (Gt @ x)), 0.0)))))
+    info = {"solver": "exact Gram ridge (per-fold eigh, float64)",
+            "backend": "cpu_gram_ridge_exact", "converged": True,
+            "stop_reason": "direct", "alpha": best_alpha, "n_features": p,
+            "n_samples": n, "gram_seconds": t_gram,
+            "total_seconds": _time.time() - t0, "final_solve": how,
+            "gram_bytes": int(8 * (K + 1) * p * p)}
+    return {"mse_path": mse, "alpha": best_alpha, "coef": coef, "info": info,
+            "lcurve": lcurve}
 
 
 class _RFEGramCV(object):
@@ -4798,48 +5102,14 @@ class _RFEGramCV(object):
 
     def __init__(self, A, y, cols, splits, ridge_alpha=0.0, block_rows=None):
         import time as _time
-        from scipy.linalg import blas as _blas
         t0 = _time.time()
-        y = np.asarray(y, dtype=np.float64).ravel()
-        n = int(A.shape[0])
-        self.K = K = len(splits)
-        fold = np.full(n, -1, dtype=np.int64)
-        for k, (_tr, va) in enumerate(splits):
-            fold[np.asarray(va, dtype=np.int64)] = k
+        self.K = len(splits)
         self.cols = np.asarray(cols, dtype=np.int64)
         p = int(self.cols.size)
         self.ridge = float(ridge_alpha)
-        rows = _rfe_row_source(A, self.cols)
-        if rows is None:
-            raise ValueError("no row source for %s" % type(A).__name__)
-        blk = int(block_rows) if block_rows else max(
-            256, min(int(os.environ.get("PHEASY_RFE_FINAL_BLOCK_ROWS", "20000")),
-                     int(256 * 1024**2 // (8 * max(p, 1)))))
-        G = [np.zeros((p, p), dtype=np.float64, order="F") for _ in range(K)]
-        b = np.zeros((K, p), dtype=np.float64)
-        yy = np.zeros(K, dtype=np.float64)
-        nk = np.zeros(K, dtype=np.int64)
-        for i0 in range(0, n, blk):
-            i1 = min(i0 + blk, n)
-            B = rows(i0, i1)
-            fk = fold[i0:i1]
-            yb = y[i0:i1]
-            for k in np.unique(fk):
-                m = fk == k
-                if m.all():
-                    Bk, yk = B, yb
-                else:
-                    Bk, yk = np.ascontiguousarray(B[m]), yb[m]
-                # Bk.T is Fortran-contiguous: dsyrk accumulates Bk^T Bk into the
-                # upper triangle of G[k] in place
-                G[k] = _blas.dsyrk(1.0, Bk.T, beta=1.0, c=G[k], trans=0, lower=0,
-                                   overwrite_c=1)
-                b[k] += Bk.T @ yk
-                yy[k] += float(yk @ yk)
-                nk[k] += int(yk.size)
-            del B
-        for Gk in G:
-            _mirror_upper(Gk)
+        G, b, yy, nk = _accumulate_fold_grams(A, y, self.cols, splits,
+                                              block_rows=block_rows)
+        K = self.K
         Gt = G[0].copy(order="F")
         for Gk in G[1:]:
             Gt += Gk
@@ -4864,17 +5134,24 @@ class _RFEGramCV(object):
             return None
         return loc
 
-    def _system(self, M):
-        if self.ridge > 0:
-            M.flat[:: M.shape[0] + 1] += self.ridge
+    @staticmethod
+    def _system(M, ridge):
+        if ridge > 0:
+            M.flat[:: M.shape[0] + 1] += ridge
         return M
 
-    def round(self, loc, want_cv=True):
-        """(coef on the full data, cv_mean, cv_se, rss) for the support loc."""
+    def round(self, loc, want_cv=True, final=False):
+        """(coef on the full data, cv_mean, cv_se, rss) for the support loc.
+
+        final=True is the delivered refit: unregularized unless
+        PHEASY_RFE_FINAL_RIDGE is set (same contract as _rfe_final_refit_exact);
+        the ranking and fold fits use the estimator's ridge_alpha.
+        """
         ix = np.ix_(loc, loc)
         Gs = self.Gt[ix]
         bs = self.bt[loc]
-        x, how = _gram_solve(lambda: self._system(Gs.copy()), bs)
+        r_full = _rfe_final_ridge() if final else self.ridge
+        x, how = _gram_solve(lambda: self._system(Gs.copy(), r_full), bs)
         self.methods.add(how)
         rss = max(self.yyt - 2.0 * float(x @ bs) + float(x @ (Gs @ x)), 0.0)
         self.rounds += 1
@@ -4884,7 +5161,7 @@ class _RFEGramCV(object):
         for k in range(self.K):
             Gk = self.G[k][ix]
             bk = self.b[k][loc]
-            xk, how = _gram_solve(lambda Gs=Gs, Gk=Gk: self._system(Gs - Gk), bs - bk)
+            xk, how = _gram_solve(lambda Gs=Gs, Gk=Gk: self._system(Gs - Gk, self.ridge), bs - bk)
             self.methods.add(how)
             mse = (self.yy[k] - 2.0 * float(xk @ bk) + float(xk @ (Gk @ xk))) / max(int(self.nk[k]), 1)
             rm[k] = np.sqrt(max(mse, 0.0))
@@ -4893,7 +5170,7 @@ class _RFEGramCV(object):
 
 
 def _rfe_final_refit_exact(A, y, best_idx, *, block_rows=None, diag_floor=1e-12,
-                           iterative_diagnostics=None, n_samples=None, ridge_alpha=0.0):
+                           iterative_diagnostics=None, n_samples=None):
     """[PATCH rfe-final-tsqr-v3] Exact OLS on the selected support.
 
     Default method "gram" accumulates the normal equations G = A^T A in float64
@@ -4982,9 +5259,7 @@ def _rfe_final_refit_exact(A, y, best_idx, *, block_rows=None, diag_floor=1e-12,
         if _syrk:
             # dsyrk filled the upper triangle only
             _mirror_upper(G)
-        # [FIX RFE-GRAM] a ridge-RFE (PHEASY_RFE_RIDGE_ALPHA) ranks and scores
-        # every round with the penalty, so the delivered refit keeps it too
-        ridge = float(os.environ.get("PHEASY_RFE_FINAL_RIDGE", str(float(ridge_alpha))))
+        ridge = _rfe_final_ridge()
         if ridge > 0:
             G.flat[:: n + 1] += ridge
         try:
@@ -5604,7 +5879,15 @@ class _RFECVBase:
         # with TSQR makes the delivered force constants certifiable.
         coef_final = None
         _best_loc = gram.local(best_idx) if gram is not None else None
-        _exact_final = (_is_linear_operator(A) or sp.issparse(A)) and os.environ.get(
+        # [FIX RFE-CONTRACT] sparse input takes the exact refit only where its own
+        # final solve would be the float32 LSQR iterate: not on the resident
+        # CSR path (that one stays on the GPU and never densifies -- pinned by
+        # test_public_csr_resident_parity) and not when the support densifies
+        # to an exact QR/SVD solve anyway.
+        _sparse_lsqr_final = bool(
+            sp.issparse(A) and not resident_operator
+            and not _should_densify_sparse(sp.csr_matrix((n_samples, int(best_idx.size)))))
+        _exact_final = (_is_linear_operator(A) or _sparse_lsqr_final) and os.environ.get(
             "PHEASY_RFE_FINAL_TSQR", "1").lower() in ("1", "true", "yes", "on")
         if _exact_final:
             try:
@@ -5614,18 +5897,17 @@ class _RFECVBase:
         if _best_loc is not None:
             # [FIX RFE-GRAM] the selected support is inside the exact Gram: its
             # full-data normal equations are already in memory
-            coef_final = gram.round(_best_loc, want_cv=False)[0]
+            coef_final = gram.round(_best_loc, want_cv=False, final=True)[0]
             iterative_diagnostics.append(dict(
                 solver="Gram-Cholesky", converged=True, stop_reason="normal_equations",
                 fit_scope="full", n_features=int(best_idx.size), n_samples=int(n_samples)))
         elif _exact_final:
-            # [FIX RFE-GRAM] sparse input too: its final solve used to be the
+            # [FIX RFE-GRAM] also sparse input whose final solve would be the
             # float32 LSQR iterate (1.2% coefficient error measured on a small
             # float32 CSR problem), while TwoLevel input got the exact refit
             coef_final = _rfe_final_refit_exact(
                 A, y, best_idx, block_rows=self.block_rows, diag_floor=self.diag_floor,
-                iterative_diagnostics=iterative_diagnostics, n_samples=n_samples,
-                ridge_alpha=self.ridge_alpha)
+                iterative_diagnostics=iterative_diagnostics, n_samples=n_samples)
         if coef_final is None:
             coef_final = solve(best_idx)
         coef_full = np.zeros(n_features, dtype=np.float64)
@@ -6155,7 +6437,10 @@ class Optimizer(object):
                 threshold_lambda=float(os.environ.get("PHEASY_ARDR_THRESHOLD", "1e4")),
                 thresholds=_thresholds,
                 cv=self._cv,
-                max_iter=int(os.environ.get("PHEASY_ARDR_MAX_ITER", "300")),
+                # [FIX RVM-BETA] same default as the Gram evidence loop (which
+                # used max(300, 1000)): 300 stopped the sklearn path unconverged
+                # (stop_reason=iteration_limit) where the Gram path converged at 589
+                max_iter=int(os.environ.get("PHEASY_ARDR_MAX_ITER", "1000")),
                 tol=self._tol,
                 fit_intercept=self._fit_intercept,
                 rand_seed=self._rand_seed,
@@ -6241,7 +6526,50 @@ class Optimizer(object):
             coef = self._model.coef_
         elif method == "RIDGE":
             alphas = self._ridge_alpha_grid(A_fit)
-            if _is_linear_operator(A_fit):
+            # [FIX EXACT-LS] exact grouped-CV ridge path from per-fold float64
+            # Grams when p fits PHEASY_EXACT_GRAM_GB.  The iterative per-(alpha,
+            # fold) solves below stop at a float32 precision floor: measured on a
+            # kappa~1e2 two-level test, CV MSE off by up to 1.3 percent and the
+            # delivered coefficients 6.7 percent off the ridge solution at alpha*,
+            # 100x slower.  An explicit PHEASY_GPU_RIDGE_RESIDENT=1 keeps the
+            # resident solver.
+            _ridge_exact = None
+            if _is_linear_operator(A_fit) and not os.environ.get("PHEASY_GPU_RIDGE_RESIDENT", "").lower() in ("1", "true", "yes", "on"):
+                _ridge_exact = _exact_ridge_cv(
+                    A_fit, F64, alphas,
+                    _make_cv_splits(A.shape[0], self._cv, self._rand_seed,
+                                    self._group_size))
+            if _ridge_exact is not None:
+                best_alpha = _ridge_exact["alpha"]
+                mse_path = _ridge_exact["mse_path"]
+                _mean = mse_path.mean(axis=1)
+                for j, a in enumerate(alphas):
+                    print("[RIDGE-CV] alpha %d/%d = %.3e | fold_mse %s | mean %.6e (exact Gram)"
+                          % (j + 1, len(alphas), float(a),
+                             " ".join("%.6e" % float(e) for e in mse_path[j]),
+                             float(_mean[j])), flush=True)
+                if _ridge_exact["lcurve"] is not None:
+                    print("[RIDGE-LC] alpha | ||c|| | ||Xc-y|| (exact Gram)", flush=True)
+                    for _a, _cn, _rn in _ridge_exact["lcurve"]:
+                        print("[RIDGE-LC] %.6e | %.6e | %.6e" % (_a, _cn, _rn), flush=True)
+                _info = _ridge_exact["info"]
+                print("[RIDGE-CV] exact Gram ridge CV: alpha* = %.6e, %d alphas x %d folds, "
+                      "per-fold Grams %.2f GB built in %.1fs, total %.1fs"
+                      % (best_alpha, len(alphas), mse_path.shape[1], _info["gram_bytes"] / 1e9,
+                         _info["gram_seconds"], _info["total_seconds"]), flush=True)
+                coef = _ridge_exact["coef"]
+                self._model = _OLSModel(coef, alpha=best_alpha)
+                self._model.regularized_solver_info_ = dict(_info)
+                try:
+                    A_fit._ridge_solver_info = dict(_info)
+                except Exception:
+                    pass
+                self._results["alpha"] = best_alpha
+                self._results["mse_path"] = mse_path
+                self._results["execution_backend"] = "cpu_gram_ridge_exact"
+                self._results["regularized_solver_info"] = dict(_info)
+                self._results["postfit_backend"] = "cpu_metrics"
+            elif _is_linear_operator(A_fit):
                 # [FIX P26/P45] ridge CV over the alpha grid on the two-level
                 # operator via _ridge_solve (LSMR on the augmented system).
                 # (1) row slices are hoisted out of the alpha loop; (2) the
@@ -6869,6 +7197,21 @@ class Optimizer(object):
     def _fit_ols(self, A, F):
         self._ols_lsmr_info = None
         self._ols_gpu_fallback_reason = None
+        # [FIX EXACT-LS] exact float64 normal equations for the inputs that used
+        # to go to an iterative solver (operator, or sparse too big to densify),
+        # when p fits PHEASY_EXACT_GRAM_GB.  CGLS/LSMR/LSQR on a float32 operator
+        # stop at a precision floor (~1e-3 normal-equation residual on the MgC
+        # operator per fit_3090.sh), i.e. not at the least-squares solution.
+        # An explicit PHEASY_GPU_OLS_RESIDENT=1 / PHEASY_GPU_TSQR=1 keeps that solver.
+        if ((_is_linear_operator(A) or (sp.issparse(A) and not _should_densify_sparse(A)))
+                and not os.environ.get("PHEASY_GPU_OLS_RESIDENT", "").lower() in ("1", "true", "yes", "on") and not os.environ.get("PHEASY_GPU_TSQR", "").lower() in ("1", "true", "yes", "on")):
+            _ridge = float(os.environ.get("PHEASY_OLS_RIDGE", "0"))
+            _ex = _exact_normal_solve(A, F, ridge=_ridge * A.shape[0] if _ridge > 0 else 0.0,
+                                      label="OLS")
+            if _ex is not None:
+                self._ols_lsmr_info = dict(_ex[1])
+                self._results["execution_backend"] = "cpu_gram_exact"
+                return _ex[0], None
         streamed = sp.issparse(A) or (hasattr(A, "SM_prime") and hasattr(A, "NS"))
         if streamed and os.environ.get("PHEASY_GPU_TSQR", "0").lower() in ("1", "true", "yes", "on"):
             from . import gpu_backend as gb
@@ -6965,6 +7308,20 @@ class Optimizer(object):
             # relaxed-LASSO debias is no longer skipped on the two-level
             # operator (the L1 shrinkage bias is removed there too).
             _res_gpu = None
+            # [FIX EXACT-LS] exact relaxed refit on the support when it fits
+            # PHEASY_EXACT_GRAM_GB (the LSQR / resident CGLS refit stops at the
+            # float32 precision floor: 5e-3 coefficient error on a kappa~1e2 test)
+            _ex = _exact_normal_solve(A, y, cols=sup, label="LASSO debias")
+            if _ex is not None:
+                self._debias_backend = "cpu_gram_exact"
+                new = np.zeros_like(coef)
+                new[sup] = _ex[0]
+                r_new = float(_ex[1]["normr"])
+                r_old = float(np.linalg.norm(_rmatvec_f64_residual(A, coef, y)))
+                self._record_debias(r_new, r_old, "gram_exact")
+                if r_new <= r_old:
+                    return new
+                return coef
             if self._resident_debias_available():
                 coef_sub, _res_gpu = self._debias_resident_gpu(y, sup, coef)
             else:

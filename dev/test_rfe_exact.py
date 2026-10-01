@@ -117,15 +117,25 @@ class GramEngineTests(unittest.TestCase):
         # path too, so the whole run still reproduces the reference
         self._assert_matches_reference(got, rounds)
 
-    def test_ridge_rfe_keeps_the_penalty_in_the_final_refit(self):
+    def test_ridge_rfe_delivers_unregularized_ols_on_the_support(self):
+        # [PATCH rfe-final-tsqr] contract (also pinned for the resident TwoLevel
+        # path in test_gpu_rfe.py): PHEASY_RFE_RIDGE_ALPHA regularizes ranking
+        # and CV only; the delivered refit is OLS unless PHEASY_RFE_FINAL_RIDGE
         M = sp.csr_matrix(self.A)
         alpha = 50.0
-        got, _, _ = fit_rfe(M, self.y, self.env, ridge_alpha=alpha)
-        sup = got.support_
-        As = self.A[:, sup]
-        ridge = np.linalg.solve(As.T @ As + alpha * np.eye(sup.sum()), As.T @ self.y)
-        np.testing.assert_allclose(got.coef_[sup], ridge, rtol=1e-7,
-                                   atol=1e-9 * np.abs(ridge).max())
+        for final_ridge in (None, alpha):
+            env = dict(self.env)
+            if final_ridge is not None:
+                env["PHEASY_RFE_FINAL_RIDGE"] = repr(final_ridge)
+            with self.subTest(final_ridge=final_ridge):
+                got, _, _ = fit_rfe(M, self.y, env, ridge_alpha=alpha)
+                self.assertEqual(got.backend_metadata_["subset_solver"], "cpu_gram_exact")
+                sup = got.support_
+                As = self.A[:, sup]
+                want = np.linalg.solve(As.T @ As + (final_ridge or 0.0) * np.eye(sup.sum()),
+                                       As.T @ self.y)
+                np.testing.assert_allclose(got.coef_[sup], want, rtol=1e-7,
+                                           atol=1e-9 * np.abs(want).max())
 
     def test_bic_criterion_uses_the_exact_rss(self):
         M = sp.csr_matrix(self.A)
