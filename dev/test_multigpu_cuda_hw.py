@@ -46,5 +46,35 @@ class TestMultiGPUHardware(unittest.TestCase):
                 else:
                     os.environ[key] = value
 
+    @unittest.skipUnless(torch.cuda.is_available() and torch.cuda.device_count() >= 2,
+                         "two CUDA devices required for hardware acceptance")
+    def test_resident_twolevel_rfe_when_device_is_not_the_resident_card(self):
+        # [FIX AUTO-DEVICE] the resident operator lives on PHEASY_GPU_DEVICES[0]
+        # while device() is cuda:0 here (in production: _auto_device's pick).
+        # y used to be uploaded to device(), so the setup probe hit a
+        # cross-device error and required mode aborted the fit.
+        from unittest.mock import patch
+        import warnings
+        rng = np.random.default_rng(77)
+        prime = sp.csr_matrix(rng.normal(size=(48, 12)))
+        ns = sp.csr_matrix(rng.normal(size=(12, 8)) * np.geomspace(.1, 10, 8))
+        y = (prime.toarray() @ ns.toarray() @ np.array([1., -.5, .25, 0, 0, .1, 0, 0])
+             + rng.normal(scale=.01, size=48))
+        env = {"PHEASY_GPU_DEVICES": "1", "PHEASY_GPU_NGPU": "1", "PHEASY_GPU_AUTO_DEVICE": "0",
+               "PHEASY_GPU_MODE": "required", "PHEASY_GPU_RFE_RESIDENT": "1",
+               "PHEASY_RFE_GRAM_GB": "0", "PHEASY_RFE_N_JOBS": "1", "PHEASY_CV_GROUP_SIZE": "4",
+               "PHEASY_RFE_STEP": ".5", "PHEASY_RFE_MIN_FEATURES": "2"}
+        with patch.dict(os.environ, env), warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            os.environ.pop("PHEASY_GPU_DEVICE", None)
+            self.assertEqual(str(gb.device()), "cuda:0")
+            self.assertEqual(gb.resident_device_ids(), [1])
+            model = opt.Optimizer("RFE", cv=3, rand_seed=42, use_gpu=True)
+            model.fit(opt.TwoLevelSM(prime, ns), y)
+        meta = model.results["backend_metadata"]
+        self.assertEqual(model.results["execution_backend"], "gpu_rfe_resident_iterative")
+        self.assertEqual(meta["resident_input_kind"], "twolevel")
+        self.assertEqual(meta["cv_fold_scoring"], "gpu")
+
 if __name__ == "__main__":
     unittest.main()

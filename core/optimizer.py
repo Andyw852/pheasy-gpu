@@ -5494,7 +5494,14 @@ class _RFECVBase:
                         # omission as GpuSubsetOperator._value_dtype (7190139) and the
                         # ridge Augmented wrapper (694e1fd).
                         _vd = getattr(resident_A, "_value_dtype", None) or torch.float64
-                        resident_y = resident_backend._to_torch(y, _vd)
+                        # [FIX AUTO-DEVICE] y goes to the card the operator lives on
+                        # (resident_device_ids()[0], i.e. PHEASY_GPU_DEVICES[0]), not to
+                        # device(): with PHEASY_GPU_DEVICE unset _auto_device() picks the
+                        # card with the most free VRAM, and the setup probe below then
+                        # died with a cross-device error (fit_3090.sh exports
+                        # PHEASY_GPU_DEVICES=0,1,2 while card 0 is the busy one).
+                        resident_y = torch.as_tensor(np.asarray(y, dtype=np.float64),
+                                                     device=resident_A.device).to(_vd)
                         # Probe sparse kernels during setup, before any elimination.
                         resident_A.rmatvec(resident_A.matvec(resident_y.new_zeros(n_features)))
                         resident_operator = True

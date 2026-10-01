@@ -21,6 +21,10 @@
 #  DEVICES=0,1,2 会直接报 "PHEASY_GPU_DEVICES must contain unique visible CUDA device
 #  IDs"（实测踩过）。单卡跑就把 DEVICES 设成 0；多卡跑要保证 CUDA_VISIBLE_DEVICES 里
 #  的可见数量不少于 DEVICES 的项数。
+#  ⚠ [FIX AUTO-DEVICE] 常驻求解（LASSO/ALASSO/RIDGE/OLS/RFE）以 DEVICES 的**第一张**卡为
+#  主卡（RIDGE/OLS/RFE 的两级算子还会分片到列出的每张卡）；PHEASY_GPU_DEVICE 未设时的
+#  "自动选空闲最多的卡"(_auto_device) 只管非常驻的 GPU 步骤。0 号卡被别人占着时，请
+#  显式给 DEVICES=1 或 DEVICES=1,2。
 #
 #  GPU_MODE=required + GPU_FALLBACK=0 表示"要 GPU 就必须是 GPU"：任何回退都会报错，
 #  而不是悄悄用 CPU 跑完再告诉你。
@@ -54,6 +58,13 @@
 #  |                |                                       | 先在小构型子集上试，再放大。
 #  | RFE-OLS-TSQR   | RFE + 高瘦 QR（PHEASY_GPU_TSQR）      | 超大规模专用；TSQR 需要保留 O(p^2) 的 R 因子，
 #  |                |                                       | 内存要先算够；同样要求高矩阵。
+#
+#  [FIX EXACT-LS] SM_DTYPE=float32（默认）且 Gram 放得进 PHEASY_EXACT_GRAM_GB（默认
+#  min(16 GB, 空闲内存/4)，OLS/去偏约 2.5 万特征、5 折 RIDGE 约 1.5 万特征）时，OLS、
+#  RIDGE 的 CV 和 LASSO/ALASSO 去偏不走上表的 GPU 迭代，而是 CPU float64 精确求解
+#  （manifest: cpu_gram_exact / cpu_gram_ridge_exact）：float32 迭代停在精度地板，而
+#  3090 的 FP64 只有 FP32 的 1/64。超出预算（如 Mg8C120 p=69487）仍走上表的 GPU 路径；
+#  PHEASY_EXACT_GRAM_GB=0 强制回到 GPU 迭代。
 #
 #  选方法的经验（本项目材料 Mg8C120 实测，24 构型/2 折分组 holdout 的相对 L2 误差）:
 #      LASSO 1.11e-01   ALASSO 1.24e-01   OLS 5.66e-01   RIDGE 5.66e-01

@@ -37,12 +37,17 @@
 #  * `OLS` / `RIDGE`：单卡满尺寸实测约 470 s / 607 s（NDATA=296, cv=5），适合做基准。
 #  * `LASSO` / `ALASSO`：分钟级，且泛化最好（本项目材料分组 holdout 比 OLS/RIDGE 好
 #    约 5 倍）；两者都写进去是最常见的组合，各自独立目录便于对比 fit_manifest.json。
-#  * `RFE` / `RFE-OLS-TSQR`：耗时最长（每轮完整子集求解），**外层强制串行**；与别的
-#    默认（排序解允许停在实测地板、并记录 floor_accepted/floor_note）能跑完但
-#    accepted=False（全量那步地板高于可认证上限）；要 accepted=True 就加
-#    PHEASY_LSQR_MAXITER=20000 PHEASY_LSQR_ATOL=1e-3 PHEASY_LSQR_BTOL=1e-3
-#    （实测 5 轮、选中 4343 特征、accepted=True）。两者都会写 fit_manifest.json。
-#    方法并行没有问题，但它自己不会因为分了卡就变快。建议先在小 NDATA 子集上试。
+#  * `RFE` / `RFE-OLS-TSQR`：耗时最长（每轮完整子集求解），**外层强制串行**。
+#    [FIX RFE-GRAM] 特征数进入 PHEASY_RFE_GRAM_GB 预算（默认 min(16 GB, 空闲/4)，
+#    5 折约 1.5 万特征）后每一轮都是 float64 精确求解；稠密 SM 输入本来就在 GPU 上做
+#    float64 QR。只有超出预算的大问题（如 Mg8C120）还走迭代子集求解：默认允许停在
+#    实测地板（floor_accepted/floor_note），全量那步可能 accepted=False；要
+#    accepted=True 就加 PHEASY_LSQR_MAXITER=20000 PHEASY_LSQR_ATOL=1e-3
+#    PHEASY_LSQR_BTOL=1e-3。
+#    ⚠ 不设 PHEASY_TSQR_CRITERION=bic|aic 时，RFE-OLS-TSQR 与 RFE 是**同一个估计**
+#    （每个子集都是精确 OLS、同样的排序、同样的 CV+1-SE 选特征数），结果逐位相同，
+#    两个一起跑只是重复。特征数默认按 1-SE 规则取（CV 最小值一个标准误以内最稀疏的
+#    那个，PHEASY_RFE_1SE=1）；PHEASY_RFE_1SE=0 改为取 CV 最小。
 #  * 小 NDATA 时 SM 是**宽**的（实测 NDATA=24 为 36864x69487），所以不要开
 #    PHEASY_GPU_TSQR（要求高矩阵，会正确拒绝）；本脚本刻意不设它。
 #  * 每个方法的产物（fc2/fc3/fit_manifest.json/fit.log）在各自目录里，脚本结束后
@@ -50,9 +55,15 @@
 #    rmse / CGLS 探针字段）。
 #
 #  与生产脚本一致的默认值（fit_3090.sh 导出的那几项）已注入每个 fit：
-#    PHEASY_GPU_MODE=required  PHEASY_GPU_FALLBACK=0  PHEASY_GPU_*_RESIDENT=1
+#    PHEASY_GPU_MODE=required  PHEASY_GPU_FALLBACK=0  PHEASY_GPU_LASSO_RESIDENT=1
 #    PHEASY_LASSO_TWOLEVEL=1   LASSO_TWOLEVEL=1        LASSO_SPARSE=1
 #    PHEASY_CV_TOL=1e-3        PHEASY_CV_MAX_ITER=400  PHEASY_N_JOBS/线程数=NCPU
+#  [FIX EXACT-LS] RIDGE / OLS / RFE 的常驻开关只有显式给了环境变量 GPU_RESIDENT=0|1
+#  才导出（和 fit_3090.sh 一样）。以前这里无条件导出 PHEASY_GPU_{RIDGE,OLS,RFE}_RESIDENT=1，
+#  而显式 =1 表示"就要常驻迭代求解器"，于是 float32 两级 SM 上的 RIDGE/OLS 永远停在
+#  float32 精度地板（日志里"LSMR 容差被抬到 1.19e-6"），第五轮的 CPU float64 精确解
+#  （cpu_gram_exact / cpu_gram_ridge_exact，p 在 PHEASY_EXACT_GRAM_GB 内时）从未生效。
+#  不设时：预算内走精确解，超出预算仍是常驻 GPU（required 模式默认）。
 #  不设这些时流水线会把 SM 稠密化（实测 NDATA=24 就写了 10.2 GB sm_dense.npy），
 #  随后稠密 GPU 求解因显存预算不足被 fail-closed 拒绝 —— 那是配置问题，不是求解器
 #  问题，而报错信息看起来很像求解器故障。
@@ -142,7 +153,7 @@ export PATH="$(dirname "$(command -v "$PYTHON")"):$PATH"
 # cs.pkl.meta.json 记录的 sha256 前缀从 SPOSCAR.orig 复原）。
 INPUTS="POSCAR SPOSCAR disp_matrix.pkl force_matrix.pkl cs.pkl cs.pkl.meta.json
 neighbor_list.pkl phi.npz dataset_disps.npy dataset_forces.npy dataset_alignment.json
-sm_prime.npz ns_harm.npz ns_anharm3.npz .pheasy_stamp_struct .pheasy_stamp_data"
+sm_prime.npz ns_harm.npz ns_harm.npz.meta.json ns_anharm3.npz .pheasy_stamp_struct .pheasy_stamp_data"
 COPY_MAX_MIB=8
 free_mib() { nvidia-smi -i "$1" --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null | tr -d " "; }
 pick_card() {
@@ -196,13 +207,17 @@ for m in $FIT_METHODS; do
   # 刻意**不**开 PHEASY_GPU_TSQR：流式 TSQR 要求矩阵是高的，小 NDATA 下 SM 是宽的
   # （实测 NDATA=24 为 36864x69487），开了它 OLS 会被正确拒绝（"gpu_tsqr requires
   # a tall matrix"）。生产脚本 fit_3090.sh 也没开。
+  # [FIX EXACT-LS] RIDGE/OLS/RFE 的常驻开关只在显式 GPU_RESIDENT 时导出（见头部注释）
+  RES_ENV=()
+  if [ -n "${GPU_RESIDENT:-}" ]; then
+    RES_ENV=(PHEASY_GPU_RIDGE_RESIDENT="$GPU_RESIDENT" PHEASY_GPU_OLS_RESIDENT="$GPU_RESIDENT"
+             PHEASY_GPU_RFE_RESIDENT="$GPU_RESIDENT")
+  fi
   ( cd "$RUN" && env \
       CUDA_VISIBLE_DEVICES="$card" PHEASY_GPU_DEVICES=0 PHEASY_GPU_NGPU=1 \
       PHEASY_GPU_MODE=required PHEASY_GPU_FALLBACK=0 \
       PHEASY_GPU_LASSO_RESIDENT="${GPU_RESIDENT:-1}" \
-      PHEASY_GPU_RIDGE_RESIDENT="${GPU_RESIDENT:-1}" \
-      PHEASY_GPU_OLS_RESIDENT="${GPU_RESIDENT:-1}" \
-      PHEASY_GPU_RFE_RESIDENT="${GPU_RESIDENT:-1}" \
+      ${RES_ENV[@]+"${RES_ENV[@]}"} \
       PHEASY_GPU_DEBIAS="${GPU_DEBIAS:-1}" \
       PHEASY_LASSO_TWOLEVEL="${TWOLEVEL:-1}" LASSO_TWOLEVEL="${TWOLEVEL:-1}" \
       LASSO_SPARSE="${GPU_RESIDENT:-1}" PHEASY_LASSO_DEBIAS="${DEBIAS:-0}" \
