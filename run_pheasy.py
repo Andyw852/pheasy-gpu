@@ -1248,7 +1248,34 @@ class WorkFlow(object):
                     # (PHEASY_LASSO_TWOLEVEL=1)。默认关: 两级 matvec 每次是两次稀疏乘,
                     # 仅当稀疏乘积 SM 本身也放不下内存时才划算。
                     _is_lasso_family = (settings.MODEL.upper() in ('LASSO', 'ALASSO', 'RIDGE'))
-                    _lasso_twolevel = _os_p.environ.get('PHEASY_LASSO_TWOLEVEL','0').lower() in ('1','true','yes')
+                    # [PATCH lasso-twolevel-auto] same AUTO rule as RFE above.  With
+                    # the variable unset, LASSO/ALASSO/RIDGE used to take the dense
+                    # branch and materialize sm_dense.npy whatever the size: the
+                    # 3090 wrappers export PHEASY_LASSO_TWOLEVEL=1, but any other
+                    # driver did not (measured on Mg4C60 c2=all: a 154 GB
+                    # sm_dense.npy that filled the shared disk, where the two-level
+                    # operator needs ~8 GB).  An explicit 0/1 still forces it;
+                    # PHEASY_LASSO_TWOLEVEL_NNZ_MAX tunes the auto threshold.
+                    _lasso_tl_env = _os_p.environ.get('PHEASY_LASSO_TWOLEVEL')
+                    if _lasso_tl_env is not None and _lasso_tl_env.strip() != '':
+                        _lasso_twolevel = _lasso_tl_env.lower() in ('1', 'true', 'yes')
+                    elif _is_lasso_family:
+                        try:
+                            _lasso_nnz = int(SM_prime.nnz)
+                        except AttributeError:
+                            _lasso_nnz = int(getattr(SM_prime, 'size', 0))
+                        _lasso_nnz_max = int(float(_os_p.environ.get(
+                            'PHEASY_LASSO_TWOLEVEL_NNZ_MAX', '5e8')))
+                        _lasso_twolevel = _lasso_nnz > _lasso_nnz_max
+                        if _lasso_twolevel:
+                            print('[SM-twolevel auto] %s: SM_prime nnz=%d > %d; '
+                                  'using the matrix-free two-level path instead of '
+                                  'materializing sm_dense.npy (set '
+                                  'PHEASY_LASSO_TWOLEVEL=0 to force the dense path).'
+                                  % (settings.MODEL.upper(), _lasso_nnz, _lasso_nnz_max),
+                                  flush=True)
+                    else:
+                        _lasso_twolevel = False
                     # [ARDR-GRAM / RVM-GRAM] ARDR and the fast RVM consume a
                     # matrix-free TwoLevelSM: their updates only need X^T X and
                     # X^T y, which optimizer._build_gram_matrix builds from
