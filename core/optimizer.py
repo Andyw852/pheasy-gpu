@@ -4984,6 +4984,7 @@ def _gram_solve(build, rhs):
         M *= inv[None, :]
         return M, inv
     M, inv = _scaled()
+    c = None
     try:
         c = spla.cho_factor(M, lower=False, overwrite_a=True, check_finite=False)
         z = spla.cho_solve(c, rhs * inv, check_finite=False)
@@ -4991,7 +4992,9 @@ def _gram_solve(build, rhs):
             return z * inv, "cholesky"
     except (np.linalg.LinAlgError, ValueError):
         pass
-    del M
+    # release the (possibly overwritten) matrix AND the factor tuple that still
+    # references it before the fallback rebuilds a fresh one
+    del M, c
     M, inv = _scaled()
     w, V = np.linalg.eigh(M)
     del M
@@ -5128,6 +5131,10 @@ def _exact_gram_input(A):
         return False
 
 
+_EXACT_CHOL_FACTOR = 1.1   # peak / Gram bytes of the in-place Cholesky solve
+_EXACT_EIGH_FACTOR = 4.0   # peak / Gram bytes of the min-norm eigh fallback
+
+
 def _exact_normal_solve(A, y, cols=None, ridge=0.0, label="exact"):
     """[FIX EXACT-LS] min ||A[:, cols] x - y||^2 + ridge ||x||^2, exactly.
 
@@ -5143,29 +5150,72 @@ def _exact_normal_solve(A, y, cols=None, ridge=0.0, label="exact"):
     cols = np.arange(p_all) if cols is None else np.asarray(cols, dtype=np.int64)
     s = int(cols.size)
     budget = _exact_gram_budget_bytes()
-    if s == 0 or not (budget > 0 and 3.0 * 8.0 * s * s <= budget):
+    # [FIX EXACT-LS-MEM] memory model of the solve below.  The Gram is factored
+    # IN PLACE (Jacobi scaling and Cholesky overwrite it), so the Cholesky path
+    # peaks at one p x p float64 matrix plus the <=256 MiB row-block workspace
+    # of _accumulate_fold_grams: gate at 1.1 Gram.  The old gate charged 3 Grams
+    # because the solve worked on G.copy() (2 Grams) and kept room for the eigh
+    # fallback; on Mg4C60 that refused the exact path at every cutoff
+    # (p = 84557 needs 57 GB of Gram but was charged 172 GB) and sent OLS back to
+    # CGLS.  The eigh fallback (only for a numerically singular Gram) needs the
+    # rebuilt Gram + eigenvectors + LAPACK workspace, ~4 Grams; it is checked
+    # separately when it is reached.
+    gram_bytes = 8.0 * s * s
+    if s == 0 or not (budget > 0 and _EXACT_CHOL_FACTOR * gram_bytes <= budget):
+        if s > 0 and budget > 0:
+            print("[%s] exact float64 normal equations skipped: %d features need "
+                  "%.1f GB (%.1fx the %.1f GB Gram) > PHEASY_EXACT_GRAM_GB=%.1f GB; "
+                  "iterative solver" % (label, s, _EXACT_CHOL_FACTOR * gram_bytes / 1e9,
+                                        _EXACT_CHOL_FACTOR, gram_bytes / 1e9,
+                                        budget / 1e9), flush=True)
         return None
     t0 = _time.time()
     n = int(A.shape[0])
     try:
-        G, b, yy, _nk = _accumulate_fold_grams(A, y, cols, [(None, np.arange(n))])
+        G, b, _yy, _nk = _accumulate_fold_grams(A, y, cols, [(None, np.arange(n))])
     except (MemoryError, ValueError) as exc:
         print("[%s] exact Gram unavailable (%s: %s); iterative solver"
               % (label, type(exc).__name__, exc), flush=True)
         return None
-    G, b = G[0], b[0]
+    b = b[0]
     t_gram = _time.time() - t0
     r = float(ridge)
-    x, how = _gram_solve(
-        (lambda: (G.copy() if r <= 0 else _RFEGramCV._system(G.copy(), r))), b)
-    rss = max(float(yy[0]) - 2.0 * float(x @ b) + float(x @ (G @ x)), 0.0)
+    # The first build hands over the accumulated Gram itself (no copy); a second
+    # build happens only for the eigh fallback and re-streams the Gram.
+    _store = {"G": G[0]}
+    del G
+
+    def _build():
+        M = _store.pop("G", None)
+        if M is None:
+            need = _EXACT_EIGH_FACTOR * gram_bytes
+            if need > budget:
+                raise MemoryError(
+                    "the Gram is numerically singular and the min-norm eigh fallback "
+                    "needs %.1f GB > PHEASY_EXACT_GRAM_GB=%.1f GB"
+                    % (need / 1e9, budget / 1e9))
+            M = _accumulate_fold_grams(A, y, cols, [(None, np.arange(n))])[0][0]
+        return M if r <= 0 else _RFEGramCV._system(M, r)
+
+    try:
+        x, how = _gram_solve(_build, b)
+    except MemoryError as exc:
+        print("[%s] exact float64 normal equations abandoned (%s); iterative solver"
+              % (label, exc), flush=True)
+        return None
+    _store.clear()
+    # The Gram no longer exists (factored in place), so the residual is taken
+    # from the operator directly, in float64: one matvec.
+    x_full = np.zeros(p_all, dtype=np.float64)
+    x_full[cols] = x
+    normr = float(np.linalg.norm(_rmatvec_f64_residual(A, x_full, y)))
     info = {"solver": "Gram-Cholesky (exact float64)" if how == "cholesky"
             else "Gram-eigh min-norm (exact float64)",
             "backend": "cpu_gram_exact", "converged": True,
             "stop_reason": "normal_equations", "n_features": s, "n_samples": n,
             "ridge": r, "gram_seconds": t_gram,
             "solve_seconds": _time.time() - t0 - t_gram,
-            "normr": float(np.sqrt(rss)), "gram_bytes": int(8 * s * s)}
+            "normr": normr, "gram_bytes": int(gram_bytes)}
     print("[%s] exact float64 normal equations: %d features, Gram %.2f GB in %.1fs, "
           "%s solve in %.1fs, ||Ax-y||=%.6e"
           % (label, s, 8.0 * s * s / 1e9, t_gram, how, info["solve_seconds"],

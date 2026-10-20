@@ -3130,6 +3130,24 @@ def iterative_lstsq(A, y, atol=1e-8, btol=1e-8, maxiter=5000):
 
 
 _CGLS_FLOOR_MAX = 1e-3
+# [FIX F64-FLOOR] the cap above is a FLOAT32 statement: the stored data carry
+# ~1e-7 relative precision, and the measured MgC floors sat at 1e-6..1e-3.  In
+# float64 (eps 2.2e-16) no operator with cond < ~1e10 has a precision floor
+# anywhere near 1e-3, so a stall there is slow convergence on an ill-conditioned
+# system, not arithmetic.  Measured on Mg4C60 c3=4.0 (121438 columns, float64
+# factors): CGLS stalled at 8.2e-4 after 9050 iterations, was certified as
+# "precision_floor" and delivered an OLS fit WORSE in residual than the nested
+# c3=3.5 model, with spurious imaginary modes.  float64 solves therefore get
+# their own cap (PHEASY_CGLS_FLOOR_MAX_F64); a stall above it is not certified
+# and the fit is refused by the acceptance gate instead.
+_CGLS_FLOOR_MAX_F64 = 1e-6
+
+
+def _cgls_floor_cap(torch, dtype):
+    """Largest measured floor a CGLS stall may be certified at, per precision."""
+    if dtype == torch.float64:
+        return float(os.environ.get("PHEASY_CGLS_FLOOR_MAX_F64", str(_CGLS_FLOOR_MAX_F64)))
+    return _CGLS_FLOOR_MAX
 # Plain least squares carries no penalty, so sigma_min is unbounded from below
 # and there is no condition number to build a floor from.  Fall back to the same
 # one-decade-above-eps rule _lsmr_tol uses, so the CGLS and LSMR paths agree on
@@ -3182,7 +3200,7 @@ def _cgls_relative_floor(torch, dtype, norma, alpha=None):
         cond = max(1.0, float(norma) / float(np.sqrt(float(alpha))))
     else:
         cond = _CGLS_UNPENALIZED_COND
-    return min(eps * cond, _CGLS_FLOOR_MAX)
+    return min(eps * cond, _cgls_floor_cap(torch, dtype))
 
 
 def _iterative_lstsq_tensor(A, y, atol=1e-8, btol=1e-8, maxiter=5000, x0=None):
@@ -3259,6 +3277,7 @@ def _iterative_lstsq_tensor(A, y, atol=1e-8, btol=1e-8, maxiter=5000, x0=None):
                                      getattr(A, "penalty_alpha", None))
     atol_eff = max(float(atol), tol_floor)
     btol_eff = max(float(btol), tol_floor)
+    floor_cap = _cgls_floor_cap(torch, y.dtype)
     # How often to re-derive the residual honestly once the cheap test has been
     # caught lying.  Bounded so a pathological system cannot make the extra
     # matvec/rmatvec dominate the iteration.
@@ -3308,7 +3327,7 @@ def _iterative_lstsq_tensor(A, y, atol=1e-8, btol=1e-8, maxiter=5000, x0=None):
     # what to ask for instead.  An unconditional periodic honest probe therefore
     # runs from probe_start onwards, records the best criterion and the iterate
     # that reached it, and reports both.  It CERTIFIES early when that floor is
-    # inside _CGLS_FLOOR_MAX, but it never ends the run on a floor above the cap:
+    # inside floor_cap, but it never ends the run on a floor above the cap:
     # the recurrence is still creeping down there (measured 5.31e-03 at 10000
     # iterations -> 1.33e-03 at 20000), so stopping would deliver a worse iterate
     # than the remaining budget can still reach.
@@ -3357,13 +3376,13 @@ def _iterative_lstsq_tensor(A, y, atol=1e-8, btol=1e-8, maxiter=5000, x0=None):
                 stall_iteration = it
             next_probe = it + verify_every
             if stalls >= stall_limit and stall_floor is not None:
-                if stall_floor <= _CGLS_FLOOR_MAX:
+                if stall_floor <= floor_cap:
                     # Certifiable: promote the measured floor exactly as the
                     # honest path does and stop here instead of at the cap.
                     measured_floor = stall_floor
                     _, x, residual_norm, normal_norm = best_iterate
                     _accepted = min(measured_floor * (1.0 + _CGLS_FLOOR_MARGIN),
-                                    _CGLS_FLOOR_MAX)
+                                    floor_cap)
                     atol_eff = max(atol_eff, _accepted)
                     btol_eff = max(btol_eff, _accepted)
                     converged = True
@@ -3399,12 +3418,12 @@ def _iterative_lstsq_tensor(A, y, atol=1e-8, btol=1e-8, maxiter=5000, x0=None):
                 # (the current one is usually worse) and certify against the
                 # MEASURED floor instead of grinding to maxiter and reporting
                 # iteration_limit with an uncertified vector.  Refuse when even
-                # the measured floor is past _CGLS_FLOOR_MAX: at that point the
+                # the measured floor is past floor_cap: at that point the
                 # system is not solvable in this precision and a certificate would
                 # mean nothing.
                 measured_floor = best_iterate[0]
                 _, x, residual_norm, normal_norm = best_iterate
-                if measured_floor <= _CGLS_FLOOR_MAX:
+                if measured_floor <= floor_cap:
                     # The certificate is re-derived from x after the loop, and
                     # that re-derivation only reproduces to ~2% (see
                     # _CGLS_STALL_MARGIN), so certifying AT the measured value
@@ -3415,7 +3434,7 @@ def _iterative_lstsq_tensor(A, y, atol=1e-8, btol=1e-8, maxiter=5000, x0=None):
                     # two orders below the 1e-3 cap, so it certifies far less
                     # than the cap allows.
                     accepted = min(measured_floor * (1.0 + _CGLS_FLOOR_MARGIN),
-                                   _CGLS_FLOOR_MAX)
+                                   floor_cap)
                     atol_eff = max(atol_eff, accepted)
                     btol_eff = max(btol_eff, accepted)
                     converged = True
@@ -3528,6 +3547,7 @@ def _iterative_lstsq_tensor(A, y, atol=1e-8, btol=1e-8, maxiter=5000, x0=None):
             "atol_effective": float(atol_eff), "btol_effective": float(btol_eff),
             "tolerance_floor": float(tol_floor),
             "tolerance_floor_dtype": str(y.dtype).replace("torch.", ""),
+            "tolerance_floor_cap": float(floor_cap),
             # Analytic floor versus what the iteration actually reached: the
             # second is what a "precision_floor" verdict certified against.
             "tolerance_floor_measured": (None if measured_floor is None
@@ -3561,7 +3581,7 @@ def _iterative_lstsq_tensor(A, y, atol=1e-8, btol=1e-8, maxiter=5000, x0=None):
                      " certifiable cap %.3e): this is a PRECISION limit, not a"
                      " budget limit, and requesting atol >= %.3e would certify the"
                      " iterate the probe reached -- not a better one"
-                     % (stall_floor, stall_iteration, tol_floor, _CGLS_FLOOR_MAX,
+                     % (stall_floor, stall_iteration, tol_floor, floor_cap,
                         stall_floor * (1.0 + _CGLS_FLOOR_MARGIN)))
         warnings.warn("GPU CGLS did not converge: reason=%s, iterations=%d, normr=%g, normar=%g%s" %
                       (info["stop_reason"], n_iter, info["normr"], info["normar"], _hint),
