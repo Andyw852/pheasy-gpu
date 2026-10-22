@@ -2646,7 +2646,7 @@ def _ridge_solve(A, y, alpha, x0=None):
 def _solve_subset(A, y, row_idx, col_idx, ridge_alpha=0.0, qr=False,
                   lsmr_atol=None, lsmr_btol=None, lsmr_maxiter=None,
                   block_rows=None, diag_floor=1e-12, column_scale=None,
-                  diag_sink=None, diag_scope="full"):
+                  diag_sink=None, diag_scope="full", maxiter_override=None):
     """Solve min ||A[row_idx][:, col_idx] x - y[row_idx]||^2 (+ optional ridge).
 
     [FIX P09] the lsmr_* / block_rows / diag_floor knobs are threaded through
@@ -2679,8 +2679,11 @@ def _solve_subset(A, y, row_idx, col_idx, ridge_alpha=0.0, qr=False,
                                (lsmr_atol if lsmr_atol is not None else 1e-8), op))
         btol = float(_lsmr_tol("PHEASY_LSQR_BTOL",
                                (lsmr_btol if lsmr_btol is not None else 1e-8), op))
-        maxiter = int(os.environ.get("PHEASY_LSQR_MAXITER", str(
-            lsmr_maxiter if lsmr_maxiter is not None else 5000)))
+        # maxiter_override: the RFE final fallback's own cap
+        # (PHEASY_RFE_FINAL_LSMR_MAXITER), which must win over the shared one
+        maxiter = (int(maxiter_override) if maxiter_override is not None else
+                   int(os.environ.get("PHEASY_LSQR_MAXITER", str(
+                       lsmr_maxiter if lsmr_maxiter is not None else 5000))))
         if ridge_alpha > 0:
             sqrt_a = float(np.sqrt(ridge_alpha)) / scale
             base_op = op  # capture before reassignment below (closure safety)
@@ -5494,6 +5497,27 @@ class _RFEGramCV(object):
         return x, float(rm.mean()), se, rss
 
 
+def _rfe_final_lsmr_maxiter():
+    """Iteration cap of the RFE final LSMR fallback, or None to inherit.
+
+    When the exact final refit declines (Gram over the memory budget, operator
+    not column-sliceable) the DELIVERED coefficients are an LSMR solve, and its
+    convergence decides fit_accepted.  PHEASY_RFE_FINAL_LSMR_MAXITER raises the
+    cap of that one solve only: raising the shared PHEASY_LSQR_MAXITER instead
+    also lets every ranking round run that long (measured on Mg4C60 3.0/3.5 A:
+    the 66-69 GB Gram did not fit and the 5000-iteration fallback was rejected).
+    Unset: the final solve inherits PHEASY_LSQR_MAXITER (default 5000).
+    """
+    raw = os.environ.get("PHEASY_RFE_FINAL_LSMR_MAXITER", "").strip()
+    if not raw:
+        return None
+    cap = int(raw)
+    if cap <= 0:
+        raise ValueError("PHEASY_RFE_FINAL_LSMR_MAXITER must be a positive integer, "
+                         "got %r" % raw)
+    return cap
+
+
 def _rfe_final_refit_exact(A, y, best_idx, *, block_rows=None, diag_floor=1e-12,
                            iterative_diagnostics=None, n_samples=None):
     """[PATCH rfe-final-tsqr-v3] Exact OLS on the selected support.
@@ -5894,7 +5918,7 @@ class _RFECVBase:
                 resident_norms = torch.as_tensor(col_norms, dtype=_resident_value_dtype(resident_A, torch), device=resident_A.device)
             return resident_norms.index_select(0, cached_column_tensor)
 
-        def solve(col_idx, row_idx=None, download=True, scope=None):
+        def solve(col_idx, row_idx=None, download=True, scope=None, maxiter=None):
             nonlocal gpu_subset_solves, full_fit_coef, resident_subset_builds
             if resident_operator:
                 columns = resident_columns(col_idx)
@@ -5905,7 +5929,8 @@ class _RFECVBase:
                     ridge_alpha=self.ridge_alpha,
                     atol=float(os.environ.get("PHEASY_LSQR_ATOL", str(self.lsmr_atol))),
                     btol=float(os.environ.get("PHEASY_LSQR_BTOL", str(self.lsmr_btol))),
-                    maxiter=int(os.environ.get("PHEASY_LSQR_MAXITER", str(self.lsmr_maxiter))),
+                    maxiter=(int(maxiter) if maxiter is not None else
+                             int(os.environ.get("PHEASY_LSQR_MAXITER", str(self.lsmr_maxiter)))),
                     # RFE's subset solves are for RANKING, not for delivering
                     # coefficients: on the production operator the first round lands
                     # on a measured precision floor above the certifiable cap, and
@@ -5959,7 +5984,8 @@ class _RFECVBase:
                                  column_scale=col_norms if use_scaling else None,
                                  diag_sink=iterative_diagnostics,
                                  diag_scope=(scope if scope is not None
-                                             else ("full" if row_idx is None else "fold")))
+                                             else ("full" if row_idx is None else "fold")),
+                                 maxiter_override=maxiter)
 
         def operator_prediction(cols, rows, coef):
             nonlocal resident_subset_builds
@@ -6254,13 +6280,17 @@ class _RFECVBase:
             # convergence decides fit_accepted -- under the same iteration cap as
             # every ranking round.  Say so: a rejected large fit otherwise reads
             # like the (harmless) ranking warnings above it.
+            _final_cap = _rfe_final_lsmr_maxiter()
             print("[RFE] final refit: delivering a full-data LSMR solve on %d "
-                  "features (counted by the acceptance gate; iteration cap "
-                  "PHEASY_LSQR_MAXITER=%s)"
+                  "features (counted by the acceptance gate; iteration cap %s)"
                   % (int(best_idx.size),
-                     os.environ.get("PHEASY_LSQR_MAXITER", str(self.lsmr_maxiter))),
+                     "PHEASY_RFE_FINAL_LSMR_MAXITER=%d" % _final_cap
+                     if _final_cap is not None else
+                     "PHEASY_LSQR_MAXITER=%s, shared with the ranking rounds; set "
+                     "PHEASY_RFE_FINAL_LSMR_MAXITER to raise only this one"
+                     % os.environ.get("PHEASY_LSQR_MAXITER", str(self.lsmr_maxiter))),
                   flush=True)
-            coef_final = solve(best_idx)
+            coef_final = solve(best_idx, maxiter=_final_cap)
         coef_full = np.zeros(n_features, dtype=np.float64)
         coef_full[best_idx] = coef_final
 

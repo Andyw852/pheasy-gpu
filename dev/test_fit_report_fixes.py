@@ -329,19 +329,24 @@ class SolveScopeWarningTests(unittest.TestCase):
         self.assertIn("LSMR did not converge: iteration limit reached", msg)
         self.assertIn("before using these coefficients", msg)
 
-    def _rfe(self, A, y):
+    def _rfe(self, A, y, **extra):
         import warnings
         env = {"PHEASY_LSQR_MAXITER": "1", "PHEASY_RFE_GRAM_GB": "0",
                "PHEASY_USE_GPU": "0", "PHEASY_GPU_SM": "0",
                "PHEASY_CV_GROUP_SIZE": "12", "PHEASY_RFE_STEP": "0.2"}
-        with patch.dict(os.environ, env), contextlib.redirect_stdout(io.StringIO()) as log, \
+        env.update(extra)
+        clean = {k: v for k, v in os.environ.items()
+                 if k != "PHEASY_RFE_FINAL_LSMR_MAXITER"}
+        with patch.dict(os.environ, clean, clear=True), patch.dict(os.environ, env), \
+                contextlib.redirect_stdout(io.StringIO()) as log, \
                 warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
             o = opt.Optimizer("RFE-OLS", cv=3, rand_seed=0, use_gpu=False)
             o.fit(A, y)
         msgs = [str(x.message) for x in w if "did not converge" in str(x.message)]
-        bad = [d["fit_scope"] for d in o.results["backend_metadata"]["iterative_diagnostics"]
-               if d.get("converged") is False]
+        diags = o.results["backend_metadata"]["iterative_diagnostics"]
+        bad = [d["fit_scope"] for d in diags if d.get("converged") is False]
+        self._diags = diags
         return o.results, msgs, bad, log.getvalue()
 
     @staticmethod
@@ -376,6 +381,46 @@ class SolveScopeWarningTests(unittest.TestCase):
         self.assertEqual(sum("[full]" in m for m in msgs), 1)
         self.assertIn("full", bad)
         self.assertFalse(r["fit_accepted"])
+        self.assertIn("PHEASY_LSQR_MAXITER=1, shared with the ranking rounds", log)
+
+    def test_final_cap_alone_rejects_when_too_small(self):
+        # ranking / fold solves converge (shared cap 5000); only the delivered
+        # fallback solve is capped at 1 -> it alone fails and rejects the fit
+        from scipy.sparse.linalg import aslinearoperator
+        dense, y = self._problem()
+        r, msgs, bad, log = self._rfe(aslinearoperator(dense), y,
+                                      PHEASY_LSQR_MAXITER="5000",
+                                      PHEASY_RFE_FINAL_LSMR_MAXITER="1")
+        self.assertEqual(bad, ["full"])
+        self.assertFalse(r["fit_accepted"])
+        full = [d for d in self._diags if d["fit_scope"] == "full"]
+        self.assertEqual([d["itn"] for d in full], [1])
+        self.assertIn("iteration cap PHEASY_RFE_FINAL_LSMR_MAXITER=1", log)
+
+    def test_final_cap_rescues_the_fit_without_touching_ranking(self):
+        # shared cap 1 (every ranking / fold solve fails, as on Mg4C60), final
+        # cap 5000: the delivered solve converges and the fit is accepted
+        from scipy.sparse.linalg import aslinearoperator
+        dense, y = self._problem()
+        r, msgs, bad, _ = self._rfe(aslinearoperator(dense), y,
+                                    PHEASY_RFE_FINAL_LSMR_MAXITER="5000")
+        self.assertTrue(bad)
+        self.assertTrue(set(bad) <= {"ranking", "fold"}, bad)
+        self.assertTrue(r["fit_accepted"])
+        ranking = [d["itn"] for d in self._diags if d["fit_scope"] == "ranking"]
+        self.assertTrue(ranking and max(ranking) == 1, ranking)
+        full = [d for d in self._diags if d["fit_scope"] == "full"]
+        self.assertEqual(len(full), 1)
+        self.assertTrue(full[0]["converged"])
+        self.assertGreater(full[0]["itn"], 1)
+
+    def test_final_cap_must_be_positive(self):
+        for raw in ("0", "-3"):
+            with patch.dict(os.environ, {"PHEASY_RFE_FINAL_LSMR_MAXITER": raw}):
+                with self.assertRaises(ValueError):
+                    opt._rfe_final_lsmr_maxiter()
+        with patch.dict(os.environ, {"PHEASY_RFE_FINAL_LSMR_MAXITER": " "}):
+            self.assertIsNone(opt._rfe_final_lsmr_maxiter())
 
 class ManifestValueTests(unittest.TestCase):
     def test_small_array_keeps_values_and_metadata(self):

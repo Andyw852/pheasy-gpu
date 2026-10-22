@@ -66,6 +66,8 @@
 #    PHEASY_RFE_STEP=0.05    RFE 每轮删除比例
 #    PHEASY_RFE_MIN_FEATURES RFE 最小保留特征数
 #    PHEASY_RFE_1SE=1        RFE-OLS 取 CV 最小值一个标准误以内最稀疏的特征数 (0 = 取 CV 最小)
+#    PHEASY_RFE_FINAL_LSMR_MAXITER= RFE 最终精确重拟合放弃(内存不够)时，交付系数那次 LSMR 的迭代上限
+#                            (默认同 PHEASY_LSQR_MAXITER=5000；只放宽这一次，不拖慢每轮 ranking)
 #    PHEASY_ARD_STD=          ARDR/RVM 的 --std 约定 (unit_variance 默认 | unit_norm 旧版)
 #    PHEASY_ARDR_MAX_ITER=    ARDR 迭代上限 (默认 1000)
 #    PHEASY_RVM_BETA=         RVM 固定噪声精度 (默认按证据更新)

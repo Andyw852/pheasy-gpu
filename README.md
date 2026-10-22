@@ -149,6 +149,7 @@ biases alpha*/ridge toward 0.
 | `PHEASY_ARDR_CV` / `PHEASY_RVM_CV` | `1` | `0` = no lambda_t CV, use `PHEASY_*_THRESHOLD` (default `1e4`) |
 | `PHEASY_RFE_JACOBI` | `1` for operators | Jacobi-preconditioned RFE subset solves |
 | `PHEASY_RFE_GRAM_GB` | `min(16, free/4)` | host budget of the exact per-fold Gram RFE engine (`0` = off) |
+| `PHEASY_RFE_FINAL_LSMR_MAXITER` | unset (= `PHEASY_LSQR_MAXITER`, 5000) | iteration cap of the RFE final LSMR fallback only. When the exact final refit declines (its Gram exceeds 80 % of free RAM, or the operator cannot be column-sliced; the log says `[RFE] final refit: delivering a full-data LSMR solve`), the delivered coefficients are that solve and its convergence decides `fit_accepted`; raise this instead of `PHEASY_LSQR_MAXITER`, which also caps every ranking round. Non-converged solves are labelled `[ranking]` / `[fold]` (not part of the acceptance gate) or `[full]` (counted) |
 | `PHEASY_EXACT_GRAM_GB` | `min(16, free/4)` | host budget of the exact float64 OLS / RIDGE-CV / LASSO-debias solves on float32 operator input (`0` = off) |
 | `PHEASY_EXACT_GRAM_ALL` | `0` | `1` = use those exact solves on float64 operator input too |
 | `PHEASY_RFE_1SE` | `1` | RFE-OLS feature count: sparsest within one SE of the CV minimum (`0` = the CV minimum) |
