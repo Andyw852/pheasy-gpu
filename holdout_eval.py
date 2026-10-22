@@ -85,7 +85,7 @@ def _load_sm_f(d, n_configs, rows_per_config, sm_dtype):
             key = "F" if "F" in fm else list(fm.keys())[0]
             F = np.asarray(fm[key], dtype=np.float64).ravel()[:n_rows]
             print("loaded SM %s F %s (%.1fs, GPU)" % (SM.shape, F.shape, time.time() - t0), flush=True)
-            return SM, F
+            return SM, F, int(ns_harm.shape[1])
     except Exception as _e:
         print("GPU load failed (%s); falling back to CPU" % _e, flush=True)
     NS = sp.block_diag([ns_harm, ns_anh], format="csr")
@@ -97,7 +97,7 @@ def _load_sm_f(d, n_configs, rows_per_config, sm_dtype):
     key = "F" if "F" in fm else list(fm.keys())[0]
     F = np.asarray(fm[key], dtype=np.float64).ravel()[:n_rows]
     print("loaded SM %s F %s (%.1fs)" % (SM.shape, F.shape, time.time() - t0), flush=True)
-    return SM, F
+    return SM, F, int(ns_harm.shape[1])
 
 
 # [FIX] single source of truth for the fit settings: the summary header and the
@@ -120,10 +120,24 @@ FIT_KW = dict(nalpha=20, cv=5, tol=1e-6, max_iter=20000, alpha_auto=True,
 RIDGE_BASE = np.logspace(-6, 4, 50)          # 1e-6 .. 1e4, 50 pts
 
 
-def _method_fit(method, A, y):
+def _harm_free(method, n_harm, n_cols):
+    """[HARM_DENSE] run_pheasy's FC2 mask: the sparse methods never prune the
+    first n_harm (harmonic) columns unless PHEASY_HARM_DENSE=0.  Without it
+    the holdout would compare an FC2-pruning L1 fit that production no longer
+    delivers."""
+    from pheasy_gpu.core.optimizer import harm_dense_enabled
+    if not n_harm or not harm_dense_enabled(method) or not 0 < n_harm < n_cols:
+        return None
+    free = np.zeros(n_cols, dtype=bool)
+    free[:n_harm] = True
+    return free
+
+
+def _method_fit(method, A, y, n_harm=None):
     from pheasy_gpu.core.optimizer import Optimizer
     std = method in ("LASSO", "ALASSO", "RIDGE")
-    kw = dict(FIT_KW, rand_seed=0, standardize=std)
+    free = _harm_free(method, n_harm, A.shape[1])
+    kw = dict(FIT_KW, rand_seed=0, standardize=std, unpenalized=free)
     if method == "LASSO":
         # [FIX] holdout_eval constructs Optimizer directly (bypassing run_pheasy,
         # the ONLY caller of derive_alpha_grid), so plain LASSO used to get the
@@ -133,7 +147,8 @@ def _method_fit(method, A, y):
         # normalization, so pass the raw A.
         from pheasy_gpu.core.optimizer import derive_alpha_grid
         kw["alpha"] = derive_alpha_grid(A, y, nalpha=FIT_KW["nalpha"],
-                                        decades=FIT_KW["decades"], standardize=True)
+                                        decades=FIT_KW["decades"], standardize=True,
+                                        unpenalized=free)
     if method == "RIDGE":
         kw["alpha"] = RIDGE_BASE
         kw["alpha_auto"] = False
@@ -214,11 +229,14 @@ def main():
             "PHEASY_CV_GROUP_SIZE=%d overrides --rows-per-config=%d"
             % (_gs, args.rows_per_config))
     print("inner CV grouped by config (group_size=%d)" % _gs, flush=True)
-    SM, F = _load_sm_f(args.data_dir, args.n_configs, args.rows_per_config,
-                       args.sm_dtype)
+    SM, F, n_harm = _load_sm_f(args.data_dir, args.n_configs, args.rows_per_config,
+                               args.sm_dtype)
+    from pheasy_gpu.core.optimizer import harm_dense_enabled
     print("settings: " + " ".join("%s=%s" % kv for kv in FIT_KW.items())
           + " standardize=L1/RIDGE sm_dtype=%s group_size=%d"
-          % (args.sm_dtype, args.rows_per_config), flush=True)
+          % (args.sm_dtype, args.rows_per_config)
+          + " harm_dense(%d FC2 cols)=%s" % (n_harm, ",".join(
+              m for m in methods if harm_dense_enabled(m)) or "none"), flush=True)
     n_conf = args.n_configs
     rng = np.random.default_rng(args.seed)
     order = rng.permutation(n_conf)
@@ -241,7 +259,7 @@ def main():
         A_val = SM[val]
         for m in methods:
             t0 = time.time()
-            coef, flag = _method_fit(m, A_tr, y_tr)
+            coef, flag = _method_fit(m, A_tr, y_tr, n_harm)
             pred = A_val @ coef
             err = pred - F[val]
             rmse = float(np.sqrt(np.mean(err * err)))

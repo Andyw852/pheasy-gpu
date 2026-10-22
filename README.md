@@ -67,8 +67,7 @@ penalty / a flat prior / are never eliminated, and are refitted jointly.
 Pruning FC2 removes the weak interlayer / inter-cage couplings first, and those
 set the low-frequency acoustic branches and kappa.  `PHEASY_HARM_DENSE=0`
 (`HARM_DENSE=false`) restores joint pruning of FC2 and FC3 and logs a warning.
-OLS and RIDGE do not use the mask either way.
-`fit_manifest.json` records the effective state under `harm_dense`.  The alpha grid is then
+OLS and RIDGE do not use the mask either way.  The alpha grid is then
 anchored at the anharmonic KKT threshold on the residual of the FC2-only OLS.
 On the Gram paths (CPU and GPU dense FISTA) the harmonic block is eliminated
 exactly (Schur complement) and the anharmonic block is Jacobi-scaled before
@@ -79,6 +78,8 @@ their step from an upper bound on lambda_max of the reduced Gram (CPU: Lanczos
 above `PHEASY_LIPSCHITZ_LANCZOS_P`, default 1024 penalized columns, exact
 eigvalsh below), and lambda_max of the unreduced Grams is no longer computed.
 With `--fix_fc2` the harmonic block is not fitted at all and the flag is moot.
+`fit_manifest.json` records the effective state under `harm_dense`
+(`enabled`, `source` env|default, `applied`, `harmonic_columns`).
 See `dev/test_harm_dense.py` for the contract.
 
 ## Cross-validation on large fits (alpha-resolved CV)

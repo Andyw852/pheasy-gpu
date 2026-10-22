@@ -1544,7 +1544,7 @@ class WorkFlow(object):
                 harm_dense_prune_warning as _hd_warning)
             _hd_on, _hd_src = _hd_setting(settings.MODEL)
             self._harm_dense_info = {"enabled": bool(_hd_on), "source": _hd_src,
-                                     "harmonic_columns": None}
+                                     "applied": False, "harmonic_columns": None}
             _hd_msg = _hd_warning(settings.MODEL)
             if _hd_msg and not settings.FIX_FC2 and settings.MAX_ORDER >= 3:
                 logger.warning(_hd_msg)
@@ -1564,7 +1564,7 @@ class WorkFlow(object):
                             "belong together" % (_n_harm, SM.shape[1]))
                     _unpenalized = np.zeros(SM.shape[1], dtype=bool)
                     _unpenalized[:_n_harm] = True
-                    self._harm_dense_info["harmonic_columns"] = _n_harm
+                    self._harm_dense_info.update(applied=True, harmonic_columns=_n_harm)
                     logger.info("[HARM_DENSE] %s (%s): %d harmonic columns are never "
                                 "penalized or pruned; %d anharmonic columns are "
                                 "sparsified."

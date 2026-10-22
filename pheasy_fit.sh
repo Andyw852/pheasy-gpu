@@ -220,9 +220,9 @@ if [ "$LASSO_TWOLEVEL" = "1" ] || [ "$LASSO_TWOLEVEL" = "true" ]; then
   export PHEASY_LASSO_TWOLEVEL=1
 fi
 if [ "$HARM_DENSE" = "1" ] || [ "$HARM_DENSE" = "true" ]; then
-  export PHEASY_HARM_DENSE=1
+  unset PHEASY_HARM_DENSE        # 交给 pheasy 按方法默认：稀疏方法保护二阶，OLS/RIDGE 不受影响
 else
-  export PHEASY_HARM_DENSE=0     # 显式关闭；pheasy 对稀疏方法默认保护二阶
+  export PHEASY_HARM_DENSE=0     # 显式关闭：稀疏方法二阶三阶一起剪（日志会警告）
 fi
 
 _STRUCT_FILES="cs.pkl neighbor_list.pkl ns_harm.npz ns_anharm3.npz ns_anharm4.npz"
