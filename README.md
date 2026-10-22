@@ -101,12 +101,16 @@ CPU) now:
   limit cross-validates at least as well as every resolved alpha, the fit is
   returned as OLS with `alpha_opt = 0` and `cv_selected_ols_limit = true`.
   This is a certified conclusion (the data support no L1 penalty), not a
-  pinned grid edge, *provided the resolved path reaches the OLS level*. When
-  the best resolved alpha cross-validates more than `PHEASY_CV_GAP_WARN`
-  (default 2) times worse than OLS, the lightly regularized interval between
-  them was never resolved: `alpha_opt = 0` is then a fallback, the log says
-  so, and the manifest carries `cv_gap_ratio` / `cv_gap_unresolved = true`.
-  The selection itself is unchanged. `PHEASY_LASSO_1SE=1` picks the sparsest
+  pinned grid edge, *unless the solver failed below the resolved range*: when
+  grid alphas below the smallest resolved one were not resolved and the best
+  resolved alpha cross-validates more than `PHEASY_CV_GAP_WARN` (default 2)
+  times worse than OLS, the lightly regularized interval was never measured.
+  `alpha_opt = 0` is then a fallback: the log says so, and the manifest
+  carries `cv_gap_unresolved = true` and `sparsity_supported = null` with a
+  `sparsity_undetermined_reason` (also when nothing was resolved at all).
+  `cv_gap_ratio` is always recorded; a resolved path that falls all the way to
+  OLS stays a CV conclusion however large the ratio. The selection itself is
+  unchanged. `PHEASY_LASSO_1SE=1` picks the sparsest
   resolved alpha within one standard error instead.
 * if the CV curve is still falling at the bottom of the grid, extend the grid
   downward (same log density, every fold warm-starts from its last grid

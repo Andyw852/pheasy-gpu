@@ -1012,14 +1012,20 @@ def _select_cv_alpha(alphas, mse_path, resolved, ols_mse=None, label="[CV]",
     # alphas between it and the smallest resolved alpha were never resolved:
     # then alpha* = 0 is a fallback, not a CV conclusion.  gap_ratio = best
     # resolved CV mean / OLS CV mean (None: nothing resolved to compare).
+    # It takes grid alphas BELOW the resolved range that the solver could not
+    # resolve (the extension never starts from an unresolved bottom).  A
+    # resolved bottom whose curve still falls toward OLS is a monotone path to
+    # the OLS limit -- a CV conclusion however large the ratio (noiseless data:
+    # OLS CV MSE ~1e-30).
     gap_ratio = None
     if ols is not None and vidx.size:
         _om = float(ols.mean())
         gap_ratio = (m_best / _om if _om > 0
                      else (1.0 if m_best <= 0 else float("inf")))
+    n_below = n_alpha if lo_valid is None else lo_valid
     gap_thr = float(os.environ.get("PHEASY_CV_GAP_WARN", "2.0"))
     out["gap_ratio"] = None if gap_ratio is None else float(gap_ratio)
-    out["gap_unresolved"] = bool(best == -1 and ols is not None
+    out["gap_unresolved"] = bool(best == -1 and ols is not None and n_below > 0
                                  and (gap_ratio is None or gap_ratio > gap_thr))
     # [FIX CV-EXT] the curve is still falling at the very first grid point: the
     # grid should go further down -- whether or not that point beats OLS yet (a
@@ -1065,12 +1071,14 @@ def _select_cv_alpha(alphas, mse_path, resolved, ols_mse=None, label="[CV]",
             print("%s WARNING: alpha* = 0 (OLS limit) is a FALLBACK, not a CV "
                   "conclusion: the best resolved alpha cross-validates %.3gx WORSE "
                   "than OLS (CV MSE %.6e vs %.6e; PHEASY_CV_GAP_WARN=%g), and the "
-                  "lightly regularized interval (0, %.3e) between them was not "
-                  "resolved by the solver.  Whether a small L1 penalty beats OLS is "
-                  "unknown; raise PHEASY_CV_MAX_ITER / PHEASY_CV_EXTEND_DECADES (or "
-                  "use --std) to resolve smaller alphas."
+                  "%d grid alpha(s) below the smallest resolved one (%.3e .. %.3e) "
+                  "were not resolved by the solver, so the lightly regularized "
+                  "interval (0, %.3e) was never measured.  Whether a small L1 "
+                  "penalty beats OLS is unknown; raise PHEASY_CV_MAX_ITER (or use "
+                  "--std) to resolve smaller alphas."
                   % (label, gap_ratio, m_best, float(ols.mean()), gap_thr,
-                     alphas[lo_valid]), flush=True)
+                     n_below, alphas[0], alphas[n_below - 1], alphas[lo_valid]),
+                  flush=True)
     elif best == -1:
         print("%s alpha* = 0: the unregularized (OLS) limit cross-validates at least as "
               "well as every resolved alpha, so the data support NO L1 penalty.  The "
@@ -7217,7 +7225,8 @@ class Optimizer(object):
         # (this is how the delivered Mg8C120 v4 fit lost 6x generalization:
         # debias was off AND the 4-decade grid pinned alpha* at its bottom).
         _alpha_at_edge = bool(getattr(self._model, "_alpha_at_min", False))
-        for _k in ("cv_selected_ols_limit", "sparsity_supported"):
+        for _k in ("cv_selected_ols_limit", "sparsity_supported",
+                   "sparsity_undetermined_reason"):
             self._results.pop(_k, None)
         # [FIX CV-RES] the resolved CV chose the exact alpha -> 0 end: the model
         # already IS the least-squares fit, so there is no shrinkage to debias.
@@ -7230,14 +7239,38 @@ class Optimizer(object):
         if _alpha_zero:
             self._results["cv_selected_ols_limit"] = True
         if _alpha_at_edge and method in ("LASSO", "ALASSO"):
-            self._results["sparsity_supported"] = False
+            # [FIX CV-GAP] False is a CV verdict.  When alpha* landed on the
+            # OLS limit / grid bottom only because the alphas that would decide
+            # it were never resolved, the CV neither supports nor rules out
+            # sparsity: report None (undetermined) and say why.  The fit
+            # itself (relaxed refit, OLS) is unchanged.
+            _cvsel = getattr(self._model, "cv_selection_", None) or {}
+            if _cvsel.get("gap_unresolved"):
+                _gr = _cvsel.get("gap_ratio")
+                self._results["sparsity_supported"] = None
+                self._results["sparsity_undetermined_reason"] = (
+                    "alpha* = 0 by default: no alpha was resolved in every fold"
+                    if _gr is None else
+                    "alpha* = 0 by default: the best resolved alpha cross-validates "
+                    "%.3gx worse than the OLS limit and the lightly regularized "
+                    "alphas between them were not resolved" % _gr)
+            elif _cvsel.get("fallback"):
+                self._results["sparsity_supported"] = None
+                self._results["sparsity_undetermined_reason"] = (
+                    "no alpha was resolved in every fold and there is no OLS "
+                    "reference: alpha* is the plain argmin of unresolved solves")
+            else:
+                self._results["sparsity_supported"] = False
         _edge_relaxed = (_alpha_at_edge and not _alpha_zero
                          and self._alpha_edge_relaxed_enabled())
         if _edge_relaxed and not self._debias_enabled():
             self._results["debias_forced_reason"] = (
-                "alpha* sits at the grid bottom (CV curve still falling): no "
-                "sparsity is supported, so the L1 shrinkage bias is removed by "
-                "the relaxed refit even though PHEASY_LASSO_DEBIAS=0.")
+                ("alpha* sits at the grid bottom of an UNRESOLVED CV (sparsity "
+                 "undetermined), so" if "sparsity_undetermined_reason" in self._results
+                 else "alpha* sits at the grid bottom (CV curve still falling): no "
+                 "sparsity is supported, so")
+                + " the L1 shrinkage bias is removed by the relaxed refit even "
+                "though PHEASY_LASSO_DEBIAS=0.")
         if (method in ("LASSO", "ALASSO") and not _alpha_zero
                 and (self._debias_enabled() or _edge_relaxed)):
             # Preserve physical-coordinate coefficients for paired evaluation.

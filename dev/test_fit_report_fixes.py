@@ -199,6 +199,19 @@ class CvGapTests(unittest.TestCase):
         self.assertTrue(sel["gap_unresolved"])
         self.assertIn("by DEFAULT", out.getvalue())
 
+    def test_resolved_bottom_is_not_a_gap_however_large_the_ratio(self):
+        # bottom alpha resolved and the curve falls toward OLS: monotone path
+        res = np.ones((4, 5), dtype=bool)
+        mse = np.vstack([np.full(5, 1e-20), np.full(5, 1e-18),
+                         np.full(5, 1e-10), np.full(5, 1e-4)])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            sel = opt._select_cv_alpha(self.alphas, mse, res, ols_mse=np.full(5, 1e-30))
+        self.assertEqual(sel["best"], -1)
+        self.assertGreater(sel["gap_ratio"], 1e9)
+        self.assertFalse(sel["gap_unresolved"])
+        self.assertIn("a CV conclusion, not an optimiser artefact", out.getvalue())
+
     def test_regularized_optimum_is_not_flagged(self):
         mse = np.vstack([np.full(5, 1.0), np.full(5, 0.8),
                          np.full(5, 0.9), np.full(5, 2.0)])
@@ -221,6 +234,66 @@ class CvGapTests(unittest.TestCase):
         self.assertIn("cv_gap_unresolved", r)
         self.assertIsInstance(r["cv_gap_unresolved"], bool)
         self.assertEqual(r["cv_selection"].get("gap_unresolved"), r["cv_gap_unresolved"])
+
+
+class SparsityVerdictTests(unittest.TestCase):
+    """sparsity_supported=False is a CV verdict; an unresolved gap is not one."""
+
+    def fit(self, n_unresolved=0, ols_limit=True):
+        # noiseless dense truth: the OLS limit wins.  The unpenalized block
+        # sends LASSO through the CPU FISTA path, i.e. through _select_cv_alpha.
+        # n_unresolved > 0 emulates a solver that could not resolve the lowest
+        # grid alphas (the Mn2In2Se5 symptom); the Gram path here resolves all.
+        rng = np.random.default_rng(5)
+        X = rng.normal(size=(40 * 6, 12))
+        y = X @ rng.normal(size=12)
+        free = np.zeros(12, dtype=bool)
+        free[:3] = True
+        real = opt._select_cv_alpha
+
+        def select(alphas, mse_path, resolved, *a, **kw):
+            resolved = np.array(resolved, dtype=bool)
+            resolved[:n_unresolved] = False
+            return real(alphas, mse_path, resolved, *a, **kw)
+
+        env = {"PHEASY_CV_GROUP_SIZE": "6", "PHEASY_USE_GPU": "0", "PHEASY_GPU_SM": "0"}
+        with patch.dict(os.environ, env), patch.object(opt, "_select_cv_alpha", select), \
+                contextlib.redirect_stdout(io.StringIO()) as log:
+            grid = opt.derive_alpha_grid(X, y, nalpha=9, decades=4.0, unpenalized=free)
+            o = opt.Optimizer("LASSO", alpha=grid, cv=5, rand_seed=0, tol=1e-10,
+                              max_iter=100000, ols_limit=ols_limit, unpenalized=free)
+            o.fit(X, y)
+        return o.results, log.getvalue()
+
+    def test_resolved_monotone_path_keeps_the_false_verdict(self):
+        # every alpha resolved, curve falling all the way to OLS: the gap ratio
+        # is huge (OLS CV MSE ~1e-30) but alpha* = 0 IS a CV conclusion
+        r, log = self.fit()
+        self.assertTrue(r["cv_selected_ols_limit"])
+        self.assertGreater(r["cv_gap_ratio"], 1e3)
+        self.assertFalse(r["cv_gap_unresolved"])
+        self.assertIs(r["sparsity_supported"], False)
+        self.assertNotIn("sparsity_undetermined_reason", r)
+        self.assertNotIn("FALLBACK", log)
+
+    def test_unresolved_gap_is_undetermined_and_fit_unchanged(self):
+        ref, _ = self.fit()
+        r, log = self.fit(n_unresolved=3)
+        self.assertTrue(r["cv_gap_unresolved"])
+        self.assertIn("FALLBACK", log)
+        self.assertIsNone(r["sparsity_supported"])
+        self.assertIn("by default", r["sparsity_undetermined_reason"])
+        self.assertEqual(r["alpha"], ref["alpha"])
+        np.testing.assert_array_equal(r["coef"], ref["coef"])
+        json.dumps(manifest_value(r), allow_nan=False)
+
+    def test_nothing_resolved_without_ols_reference_is_undetermined(self):
+        r, log = self.fit(n_unresolved=10 ** 6, ols_limit=False)
+        self.assertIn("no alpha was RESOLVED in every fold", log)
+        self.assertTrue(r["cv_selection"]["fallback"])
+        self.assertTrue(r["alpha_at_grid_edge"])
+        self.assertIsNone(r["sparsity_supported"])
+        self.assertIn("plain argmin", r["sparsity_undetermined_reason"])
 
 
 class ManifestValueTests(unittest.TestCase):
