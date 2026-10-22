@@ -296,6 +296,87 @@ class SparsityVerdictTests(unittest.TestCase):
         self.assertIn("plain argmin", r["sparsity_undetermined_reason"])
 
 
+
+class SolveScopeWarningTests(unittest.TestCase):
+    """A non-converged RFE ranking / fold solve must not read like a rejected fit."""
+
+    @staticmethod
+    def _lsmr_result(istop=7, itn=5000):
+        # scipy lsmr: (x, istop, itn, normr, normar, norma, conda, normx)
+        return (np.zeros(3), istop, itn, 1.0, 0.1, 1.0, 10.0, 1.0)
+
+    def _warn(self, scope):
+        import warnings
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            info = opt._iterative_solver_info(self._lsmr_result(), "LSMR", scope=scope)
+        self.assertFalse(info["converged"])
+        self.assertEqual(len(w), 1)
+        return str(w[0].message)
+
+    def test_scope_is_named_with_its_acceptance_role(self):
+        for scope in ("ranking", "fold"):
+            msg = self._warn(scope)
+            self.assertIn("LSMR did not converge [%s]" % scope, msg)
+            self.assertIn("not part of the acceptance gate", msg)
+            self.assertIn("istop=7, iterations=5000", msg)
+        msg = self._warn("full")
+        self.assertIn("[full]", msg)
+        self.assertIn("fit_accepted=False", msg)
+
+    def test_unscoped_message_is_unchanged(self):
+        msg = self._warn(None)
+        self.assertIn("LSMR did not converge: iteration limit reached", msg)
+        self.assertIn("before using these coefficients", msg)
+
+    def _rfe(self, A, y):
+        import warnings
+        env = {"PHEASY_LSQR_MAXITER": "1", "PHEASY_RFE_GRAM_GB": "0",
+               "PHEASY_USE_GPU": "0", "PHEASY_GPU_SM": "0",
+               "PHEASY_CV_GROUP_SIZE": "12", "PHEASY_RFE_STEP": "0.2"}
+        with patch.dict(os.environ, env), contextlib.redirect_stdout(io.StringIO()) as log, \
+                warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            o = opt.Optimizer("RFE-OLS", cv=3, rand_seed=0, use_gpu=False)
+            o.fit(A, y)
+        msgs = [str(x.message) for x in w if "did not converge" in str(x.message)]
+        bad = [d["fit_scope"] for d in o.results["backend_metadata"]["iterative_diagnostics"]
+               if d.get("converged") is False]
+        return o.results, msgs, bad, log.getvalue()
+
+    @staticmethod
+    def _problem():
+        rng = np.random.default_rng(3)
+        dense = rng.normal(size=(120, 10))
+        beta = np.zeros(10)
+        beta[:4] = rng.normal(size=4)
+        return dense, dense @ beta + 1e-3 * rng.normal(size=120)
+
+    def test_rfe_ranking_nonconvergence_is_labelled_and_fit_accepted(self):
+        # production operator: the final refit is exact, so only ranking / fold
+        # LSMR solves fail -- labelled, and they do not veto the fit
+        import scipy.sparse as sp
+        dense, y = self._problem()
+        A = opt.TwoLevelSM(sp.csr_matrix(dense), sp.identity(10, format="csr"))
+        r, msgs, bad, _ = self._rfe(A, y)
+        self.assertTrue(any("[ranking]" in m for m in msgs), msgs[:3])
+        self.assertFalse(any("[full]" in m for m in msgs), msgs[:3])
+        self.assertTrue(bad)
+        self.assertTrue(set(bad) <= {"ranking", "fold"}, bad)
+        self.assertTrue(r["fit_accepted"])
+
+    def test_rfe_final_lsmr_fallback_is_labelled_full_and_vetoes(self):
+        # an operator the exact refit cannot slice falls back to LSMR for the
+        # DELIVERED coefficients: that one is [full] and does reject the fit
+        from scipy.sparse.linalg import aslinearoperator
+        dense, y = self._problem()
+        r, msgs, bad, log = self._rfe(aslinearoperator(dense), y)
+        self.assertIn("LSMR fallback", log)
+        self.assertIn("final refit: delivering a full-data LSMR solve", log)
+        self.assertEqual(sum("[full]" in m for m in msgs), 1)
+        self.assertIn("full", bad)
+        self.assertFalse(r["fit_accepted"])
+
 class ManifestValueTests(unittest.TestCase):
     def test_small_array_keeps_values_and_metadata(self):
         rmse = np.array([1.0, 2.0, 3.0, 4.0, 5.0])

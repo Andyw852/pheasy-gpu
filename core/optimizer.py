@@ -1134,8 +1134,30 @@ def _dense_ols_fold_mse(A, y, splits):
     return out
 
 
-def _iterative_solver_info(result, solver):
-    """Expose stopping diagnostics and warn when an iterative solve stops early."""
+# What a non-converged iterative solve means for the fit, by its role.  RFE tags
+# every subset solve (fit_scope in backend_metadata.iterative_diagnostics) and
+# the acceptance gate counts only "full" -- so a ranking / fold warning must not
+# read like a rejected fit (the same text used to say "check ... before using
+# these coefficients" for solves whose coefficients are never delivered).
+_SOLVE_SCOPE_NOTE = {
+    "ranking": ("RFE ranking solve: it only orders the features for elimination; "
+                "it is not part of the acceptance gate (fit_accepted) and its "
+                "coefficients are not delivered."),
+    "fold": ("CV fold solve: it only scores one validation fold; it is not part "
+             "of the acceptance gate (fit_accepted) and its coefficients are not "
+             "delivered."),
+    "full": ("Full-data solve: counted by the acceptance gate, so the fit is "
+             "returned with fit_accepted=False.  Check the fit residual and "
+             "solver tolerances/iteration limit."),
+}
+
+
+def _iterative_solver_info(result, solver, scope=None):
+    """Expose stopping diagnostics and warn when an iterative solve stops early.
+
+    scope ("ranking" / "fold" / "full", optional) names the solve's role in the
+    warning and says whether it counts toward fit_accepted.
+    """
     if isinstance(result, dict):
         return dict(result, solver=solver, converged=bool(result.get("converged", False)),
                     itn=int(result.get("n_iter", result.get("itn", 0))))
@@ -1149,11 +1171,14 @@ def _iterative_solver_info(result, solver):
         reason = ("iteration limit reached" if istop == 7 else
                   "condition limit reached" if istop in (3, 6) else
                   "unexpected stopping status")
+        note = _SOLVE_SCOPE_NOTE.get(scope) if scope is not None else None
         warnings.warn(
-            "%s did not converge: %s (istop=%d, iterations=%d, "
-            "normr=%.6e, normar=%.6e). Check the fit residual and solver "
-            "tolerances/iteration limit before using these coefficients."
-            % (solver, reason, istop, info["itn"], info["normr"], info["normar"]),
+            "%s did not converge%s: %s (istop=%d, iterations=%d, "
+            "normr=%.6e, normar=%.6e). %s"
+            % (solver, " [%s]" % scope if scope is not None else "", reason, istop,
+               info["itn"], info["normr"], info["normar"],
+               note or "Check the fit residual and solver tolerances/iteration "
+                       "limit before using these coefficients."),
             RuntimeWarning, stacklevel=3)
     return info
 
@@ -2673,7 +2698,10 @@ def _solve_subset(A, y, row_idx, col_idx, ridge_alpha=0.0, qr=False,
                                 rmatvec=rmv_aug, dtype=np.float64)
             y_sub = np.concatenate([y_sub, np.zeros(n)])
         res = _lsmr(op, y_sub, atol=atol, btol=btol, maxiter=maxiter)
-        _subset_info = _iterative_solver_info(res, "LSMR")
+        # only a solve recorded in diag_sink reaches the acceptance gate, so only
+        # then does its scope say anything about fit_accepted
+        _subset_info = _iterative_solver_info(
+            res, "LSMR", scope=diag_scope if diag_sink is not None else None)
         if diag_sink is not None:
             diag_sink.append(dict(_subset_info, fit_scope=diag_scope,
                                   n_features=int(len(col_idx))))
@@ -5500,6 +5528,8 @@ def _rfe_final_refit_exact(A, y, best_idx, *, block_rows=None, diag_floor=1e-12,
               % type(exc).__name__, flush=True)
         return None
     if _rows is None:
+        print("[RFE] final exact refit: %s cannot be column-sliced; LSMR fallback"
+              % type(A).__name__, flush=True)
         return None
 
     if method == "tsqr":
@@ -6220,6 +6250,16 @@ class _RFECVBase:
                 A, y, best_idx, block_rows=self.block_rows, diag_floor=self.diag_floor,
                 iterative_diagnostics=iterative_diagnostics, n_samples=n_samples)
         if coef_final is None:
+            # The DELIVERED coefficients are then an LSMR iterate whose
+            # convergence decides fit_accepted -- under the same iteration cap as
+            # every ranking round.  Say so: a rejected large fit otherwise reads
+            # like the (harmless) ranking warnings above it.
+            print("[RFE] final refit: delivering a full-data LSMR solve on %d "
+                  "features (counted by the acceptance gate; iteration cap "
+                  "PHEASY_LSQR_MAXITER=%s)"
+                  % (int(best_idx.size),
+                     os.environ.get("PHEASY_LSQR_MAXITER", str(self.lsmr_maxiter))),
+                  flush=True)
             coef_final = solve(best_idx)
         coef_full = np.zeros(n_features, dtype=np.float64)
         coef_full[best_idx] = coef_final
