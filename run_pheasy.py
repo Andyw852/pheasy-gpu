@@ -14,7 +14,8 @@ import pheasy_gpu.structure.io as io
 from pheasy_gpu.version import get_logo_version
 from pheasy_gpu.basic_io import InputParser, logger
 from pheasy_gpu.structure.atoms import NeighborList, create_supercell
-from pheasy_gpu.structure.symmetry import get_spacegroup, get_symmetry
+from pheasy_gpu.structure.symmetry import (
+    get_spacegroup, get_symmetry, symmetry_summary, symmetry_warning)
 from pheasy_gpu.structure.force_constants import ForceConstants
 from pheasy_gpu.core.cluster_orbit import CSGenerator, ClusterSpace
 from pheasy_gpu.core.symmetry_constraints import SymmetryConstraints
@@ -205,6 +206,24 @@ class WorkFlow(object):
         logger.info(
             "Space group: %s, %i symmetry operations found." % (space_group, nsym)
         )
+        # Record the symmetry the fit is constrained by (fit_manifest.json
+        # "symmetry"), and probe a looser tolerance: a slightly distorted cell
+        # found in a subgroup here is otherwise only noticed when a later step
+        # (kappa at symprec 1e-3) silently symmetrizes the force constants.
+        self._symmetry_info = symmetry_summary(
+            pcell, settings.SYMPREC, space_group, nsym,
+            is_magnetic=settings.IS_MAGNETIC)
+        _probe = self._symmetry_info["probe"]
+        if _probe is not None:
+            logger.info(
+                "Symmetry probe at symprec %g: %s, %s symmetry operations."
+                % (_probe["symprec"], _probe["spacegroup"], _probe["n_operations"]))
+        _sym_msg = symmetry_warning(self._symmetry_info)
+        if _sym_msg:
+            logger.warning(_sym_msg)
+            if os.environ.get("PHEASY_SYMPREC_STRICT", "0").strip().lower() in (
+                    "1", "true", "yes", "on"):
+                raise ValueError("PHEASY_SYMPREC_STRICT=1: " + _sym_msg)
 
         """Create supercell or read supercell from file.
            In case of reading supercell from file, check if DIM is
@@ -1511,20 +1530,30 @@ class WorkFlow(object):
                 settings.MODEL = "RFE-OLS"
                 print("[run_pheasy] PHEASY_USE_RFE=1 detected, "
                       "switching LASSO -> RFE-OLS", flush=True)
-            # [HARM_DENSE] PHEASY_HARM_DENSE=1: the sparse methods prune the
-            # anharmonic block only.  The reduced parameter vector is ordered
+            # [HARM_DENSE] the sparse methods prune the anharmonic block only.
+            # This is the DEFAULT for the sparse methods (PHEASY_HARM_DENSE
+            # unset); PHEASY_HARM_DENSE=0 restores joint pruning of FC2.  The
+            # reduced parameter vector is ordered
             # [HARM | ANHARM3 | ANHARM4 ...] (NS_full = block_diag(ns_harm, ...),
             # and the rotational sum rules act inside the harmonic block only),
             # so the free set is the first ns_harm.shape[1] columns.  With
             # FIX_FC2 the harmonic block is not in SM at all: nothing to do.
             _unpenalized = None
-            from pheasy_gpu.core.optimizer import harm_dense_enabled as _hd_on
-            if _hd_on():
+            from pheasy_gpu.core.optimizer import (
+                harm_dense_setting as _hd_setting,
+                harm_dense_prune_warning as _hd_warning)
+            _hd_on, _hd_src = _hd_setting(settings.MODEL)
+            self._harm_dense_info = {"enabled": bool(_hd_on), "source": _hd_src,
+                                     "harmonic_columns": None}
+            _hd_msg = _hd_warning(settings.MODEL)
+            if _hd_msg and not settings.FIX_FC2 and settings.MAX_ORDER >= 3:
+                logger.warning(_hd_msg)
+            if _hd_on:
                 if settings.FIX_FC2:
-                    logger.info("PHEASY_HARM_DENSE=1 ignored: FIX_FC2 already "
+                    logger.info("[HARM_DENSE] ignored: FIX_FC2 already "
                                 "removes the harmonic block from the fit.")
                 elif settings.MAX_ORDER < 3:
-                    logger.info("PHEASY_HARM_DENSE=1 ignored: MAX_ORDER=2 has no "
+                    logger.info("[HARM_DENSE] ignored: MAX_ORDER=2 has no "
                                 "anharmonic block to sparsify.")
                 else:
                     _n_harm = int(spmat.load_npz("ns_harm.npz").shape[1])
@@ -1535,9 +1564,15 @@ class WorkFlow(object):
                             "belong together" % (_n_harm, SM.shape[1]))
                     _unpenalized = np.zeros(SM.shape[1], dtype=bool)
                     _unpenalized[:_n_harm] = True
-                    logger.info("PHEASY_HARM_DENSE=1: %d harmonic columns are never "
+                    self._harm_dense_info["harmonic_columns"] = _n_harm
+                    logger.info("[HARM_DENSE] %s (%s): %d harmonic columns are never "
                                 "penalized or pruned; %d anharmonic columns are "
-                                "sparsified." % (_n_harm, SM.shape[1] - _n_harm))
+                                "sparsified."
+                                % (settings.MODEL.upper(),
+                                   "PHEASY_HARM_DENSE=%s" % os.environ.get(
+                                       "PHEASY_HARM_DENSE") if _hd_src == "env"
+                                   else "default for sparse methods",
+                                   _n_harm, SM.shape[1] - _n_harm))
             # Auto-derive the LASSO/ALASSO alpha grid from the data (default),
             # so the shell script no longer needs the derive_alpha_grid logic.
             alpha_kwargs = {}
@@ -1692,23 +1727,11 @@ class WorkFlow(object):
             fit_metrics = optimizer.metrics
 
             # Persist a reproducibility manifest before any material output.
-            # Numpy arrays are summarized rather than copied into JSON.
+            # Numpy arrays are summarized; small ones (per-fold CV errors) also
+            # carry their values (PHEASY_MANIFEST_MAX_ARRAY).
             import json as _fit_json
             import platform as _fit_platform
-            def _manifest_value(_v):
-                if isinstance(_v, np.ndarray):
-                    return {"type": "ndarray", "shape": list(_v.shape), "dtype": str(_v.dtype)}
-                if isinstance(_v, (np.integer, np.floating, np.bool_)):
-                    return _v.item()
-                if isinstance(_v, dict):
-                    return {str(_k): _manifest_value(_x) for _k, _x in _v.items()}
-                if isinstance(_v, (list, tuple)):
-                    return [_manifest_value(_x) for _x in _v]
-                try:
-                    _fit_json.dumps(_v)
-                    return _v
-                except TypeError:
-                    return repr(_v)
+            from pheasy_gpu.core.utilities import manifest_value as _manifest_value
             # Every PHEASY_* setting is a reproducibility input, not just the GPU
             # ones: the list used to be a prefix whitelist (PHEASY_GPU/USE_GPU/
             # OLS/LSQR/CV) and therefore omitted the knobs that decide a VERDICT
@@ -1729,7 +1752,13 @@ class WorkFlow(object):
                 except Exception:
                     _versions[_pkg] = "unavailable"
             with open("fit_manifest.json", "w") as _mf:
-                _fit_json.dump({"model": settings.MODEL, "python": _fit_platform.python_version(), "platform": _fit_platform.platform(), "versions": _versions, "environment": _gpu_env, "results": _manifest_value(fit_results), "metrics": _manifest_value(fit_metrics)}, _mf, indent=2, sort_keys=True)
+                _fit_json.dump({"model": settings.MODEL, "python": _fit_platform.python_version(), "platform": _fit_platform.platform(), "versions": _versions, "environment": _gpu_env, "results": _manifest_value(fit_results), "metrics": _manifest_value(fit_metrics),
+                                # the symmetry that constrained this fit (+ the
+                                # looser-tolerance probe) and the effective
+                                # [HARM_DENSE] state, which the environment
+                                # block no longer shows once it is a default
+                                "symmetry": _manifest_value(getattr(self, "_symmetry_info", None)),
+                                "harm_dense": _manifest_value(getattr(self, "_harm_dense_info", None))}, _mf, indent=2, sort_keys=True)
 
             # warn when alpha_opt sits at a grid edge (the CV wanted a value
             # outside the grid); this replaces the old shell retry loop.
@@ -1781,7 +1810,20 @@ class WorkFlow(object):
                     logger.info("- alpha_min: {:.3e}".format(float(_used_alpha[0])))
                     logger.info("- alpha_max: {:.3e}".format(float(_used_alpha[-1])))
                 logger.info("- alpha_opt: {}".format(fit_results["alpha"]))
-                if fit_results.get("cv_selected_ols_limit"):
+                if fit_results.get("cv_selected_ols_limit") and fit_results.get(
+                        "cv_gap_unresolved"):
+                    # [FIX CV-GAP] OLS won by default: the interval below the
+                    # resolved path was never evaluated
+                    _gr = fit_results.get("cv_gap_ratio")
+                    logger.warning(
+                        "- alpha_opt = 0 is a FALLBACK, not a CV conclusion: %s.  "
+                        "The delivered fit is OLS."
+                        % ("no alpha was resolved in every fold, so OLS was "
+                           "compared with nothing" if _gr is None else
+                           "the best resolved alpha cross-validates %.3gx worse "
+                           "than the OLS limit and the lightly regularized alphas "
+                           "between them were not resolved" % _gr))
+                elif fit_results.get("cv_selected_ols_limit"):
                     # [FIX CV-RES] a certified conclusion, not a pinned grid edge
                     logger.info("- alpha_opt = 0: the exact OLS limit cross-validates "
                                 "at least as well as every RESOLVED alpha -- the data "

@@ -60,10 +60,15 @@ unless `PHEASY_ALLOW_UNACCEPTED_FIT=1` is set.
 | `RFE-OLS-TSQR` | the same elimination with a Q-less tall-skinny QR base solver; feature count by AIC (`PHEASY_TSQR_CRITERION=aic\|bic\|cv`) |
 | `RIDGE` | L2 with cross-validated alpha |
 
-`PHEASY_HARM_DENSE=1` (or `HARM_DENSE=true` in `pheasy_fit.sh`) makes the
-sparse methods (LASSO, ALASSO, RFE-OLS, RFE-OLS-TSQR, ARDR, RVM) act on the
-anharmonic block only: the harmonic (FC2) columns carry no L1 penalty / a flat
-prior / are never eliminated, and are refitted jointly.  The alpha grid is then
+By default the sparse methods (LASSO, ALASSO, RFE-OLS, RFE-OLS-TSQR, ARDR,
+RVM) act on the anharmonic block only (`PHEASY_HARM_DENSE` unset, or `=1`;
+`HARM_DENSE=true` in `pheasy_fit.sh`): the harmonic (FC2) columns carry no L1
+penalty / a flat prior / are never eliminated, and are refitted jointly.
+Pruning FC2 removes the weak interlayer / inter-cage couplings first, and those
+set the low-frequency acoustic branches and kappa.  `PHEASY_HARM_DENSE=0`
+(`HARM_DENSE=false`) restores joint pruning of FC2 and FC3 and logs a warning.
+OLS and RIDGE do not use the mask either way.
+`fit_manifest.json` records the effective state under `harm_dense`.  The alpha grid is then
 anchored at the anharmonic KKT threshold on the residual of the FC2-only OLS.
 On the Gram paths (CPU and GPU dense FISTA) the harmonic block is eliminated
 exactly (Schur complement) and the anharmonic block is Jacobi-scaled before
@@ -96,8 +101,13 @@ CPU) now:
   limit cross-validates at least as well as every resolved alpha, the fit is
   returned as OLS with `alpha_opt = 0` and `cv_selected_ols_limit = true`.
   This is a certified conclusion (the data support no L1 penalty), not a
-  pinned grid edge. `PHEASY_LASSO_1SE=1` picks the sparsest resolved alpha
-  within one standard error instead.
+  pinned grid edge, *provided the resolved path reaches the OLS level*. When
+  the best resolved alpha cross-validates more than `PHEASY_CV_GAP_WARN`
+  (default 2) times worse than OLS, the lightly regularized interval between
+  them was never resolved: `alpha_opt = 0` is then a fallback, the log says
+  so, and the manifest carries `cv_gap_ratio` / `cv_gap_unresolved = true`.
+  The selection itself is unchanged. `PHEASY_LASSO_1SE=1` picks the sparsest
+  resolved alpha within one standard error instead.
 * if the CV curve is still falling at the bottom of the grid, extend the grid
   downward (same log density, every fold warm-starts from its last grid
   solution) until the minimum is bracketed, the curve meets the OLS limit, or
@@ -275,5 +285,18 @@ pheasy-gpu --dim 3 3 3 -w 3 -f --c3 5.2 --ndata 45 -l OLS --full_ifc --hdf5
   curve goes flat and the fit ends up over-regularized. Use `--tol 1e-6`.
 - `PHEASY_SM_DTYPE` (`float64` default) controls the precision of SM / NS / FM.
   All of them must agree, otherwise scipy silently upcasts.
+- Symmetry tolerance: every stage logs the space group found at `--symprec`
+  (default 1e-5) and probes `PHEASY_SYMPREC_PROBE` (default 1e-3; `0`
+  disables). A cell with small numerical distortions is found in a subgroup at
+  the tight tolerance and its force constants are then constrained by that
+  subgroup only; when the probe finds more operations the log warns
+  (`PHEASY_SYMPREC_STRICT=1` makes it an error). Use the same `--symprec` as
+  the downstream kappa step, or symmetrize the structure first; a new
+  `--symprec` invalidates the cluster-space cache, so rerun from `-s`.
+  `fit_manifest.json` records both under `symmetry`.
+- `fit_manifest.json` stores arrays of at most `PHEASY_MANIFEST_MAX_ARRAY`
+  (default 1000) elements with their `values` (non-finite as null), e.g. the
+  per-fold `metrics.rmse_path`; larger arrays keep `type` / `shape` / `dtype`
+  only.
 - `tools/prepare_dataset.py` is a repository utility (not installed by pip);
   run it from the checkout, not from the installed package.

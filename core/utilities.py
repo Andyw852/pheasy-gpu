@@ -15,6 +15,7 @@ __all__ = [
     "get_rotation_cartesian",
     "get_exclude_set",
     "generate_uniform_grid",
+    "manifest_value",
 ]
 
 import numbers
@@ -501,3 +502,42 @@ def assert_uniform_dtype(**arrays):
             raise RuntimeError(_msg)
         _w.warn(_msg)
     return seen
+
+
+def manifest_value(value, max_array=None):
+    """JSON-ready copy of a fit result / metric for fit_manifest.json.
+
+    Arrays keep their ``type`` / ``shape`` / ``dtype`` summary; arrays of at
+    most ``max_array`` elements (default PHEASY_MANIFEST_MAX_ARRAY, 1000; 0
+    disables) also carry ``values`` (``tolist()``, non-finite entries as null),
+    so e.g. the per-fold ``metrics.rmse_path`` survives for standard errors.
+    Large arrays (the coefficient vector) stay metadata only.
+    """
+    import json as _json
+    if max_array is None:
+        max_array = int(_os_smd.environ.get("PHEASY_MANIFEST_MAX_ARRAY", "1000"))
+    if isinstance(value, np.ndarray):
+        out = {"type": "ndarray", "shape": list(value.shape), "dtype": str(value.dtype)}
+        if 0 < value.size <= int(max_array) and value.dtype.kind in "biuf":
+            out["values"] = _null_nonfinite(value.tolist())
+        return out
+    if isinstance(value, (np.integer, np.floating, np.bool_)):
+        return value.item()
+    if isinstance(value, dict):
+        return {str(k): manifest_value(v, max_array) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [manifest_value(v, max_array) for v in value]
+    try:
+        _json.dumps(value)
+        return value
+    except TypeError:
+        return repr(value)
+
+
+def _null_nonfinite(obj):
+    """Replace NaN / +-inf floats in a nested tolist() by None."""
+    if isinstance(obj, list):
+        return [_null_nonfinite(v) for v in obj]
+    if isinstance(obj, float) and not np.isfinite(obj):
+        return None
+    return obj

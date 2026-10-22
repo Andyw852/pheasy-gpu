@@ -55,7 +55,9 @@
 #  │ 【稀疏化范围】                                                       │
 #  │   HARM_DENSE     true = 二阶块不惩罚/不剪 (PHEASY_HARM_DENSE=1)，   │
 #  │                  LASSO/ALASSO/RFE-OLS/RFE-OLS-TSQR(及 ARDR/RVM) 只稀疏│
-#  │                  化三阶；二阶随三阶联合重拟合 (默认 false)           │
+#  │                  化三阶；二阶随三阶联合重拟合 (默认 true)            │
+#  │                  false = PHEASY_HARM_DENSE=0，二阶和三阶一起剪      │
+#  │                  (低频声学支和 κ 会失真，日志会打印警告)            │
 #  └─────────────────────────────────────────────────────────────────────┘
 #
 #  其它常用环境变量：
@@ -177,7 +179,7 @@ SM_DTYPE=float32
 NCPU=8
 LASSO_SPARSE=0          # PHEASY_LASSO_SPARSE
 LASSO_TWOLEVEL=1        # PHEASY_LASSO_TWOLEVEL；避免大体系物化 dense SM
-HARM_DENSE=false        # PHEASY_HARM_DENSE；true = 只稀疏化非谐块
+HARM_DENSE=true         # PHEASY_HARM_DENSE；true = 只稀疏化非谐块 (false = 二阶也剪)
 
 _ALLOWED="FIT_METHOD FIT_ORDER C2_CUTOFF C3_CUTOFF C4_CUTOFF NULL_SPACE_EPS \
 NDATA FORCE_REBUILD STANDARDIZE LASSO_TOL LASSO_MAX_ITER CV NMU ALPHA_DECADES \
@@ -219,6 +221,8 @@ if [ "$LASSO_TWOLEVEL" = "1" ] || [ "$LASSO_TWOLEVEL" = "true" ]; then
 fi
 if [ "$HARM_DENSE" = "1" ] || [ "$HARM_DENSE" = "true" ]; then
   export PHEASY_HARM_DENSE=1
+else
+  export PHEASY_HARM_DENSE=0     # 显式关闭；pheasy 对稀疏方法默认保护二阶
 fi
 
 _STRUCT_FILES="cs.pkl neighbor_list.pkl ns_harm.npz ns_anharm3.npz ns_anharm4.npz"

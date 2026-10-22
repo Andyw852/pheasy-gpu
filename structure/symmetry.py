@@ -9,8 +9,14 @@ __all__ = [
     "get_spacegroup",
     "get_symmetry",
     "get_ir_reciprocal_grid",
+    "spacegroup_record",
+    "symmetry_summary",
+    "symmetry_warning",
 ]
 
+
+import os
+import re
 
 import numpy as np
 
@@ -200,3 +206,85 @@ def get_ir_reciprocal_grid(struct, grid_size, is_shift=[0, 0, 0]):
     ir_grid = np.where(ir_grid >= 0.5, ir_grid - 1.0, ir_grid)
 
     return ir_grid[ir_inds], weights[ir_inds]
+
+
+def spacegroup_record(spacegroup, n_operations, symprec):
+    """Space group found at one tolerance, as a JSON-ready dict.
+
+    ``spacegroup`` is spglib's "Symbol (number)" string (or None when spglib
+    found none); ``n_operations`` the number of symmetry operations.
+    """
+    symbol, number = None, None
+    if spacegroup:
+        m = re.match(r"^\s*(.*?)\s*\((\d+)\)\s*$", str(spacegroup))
+        if m:
+            symbol, number = m.group(1), int(m.group(2))
+        else:
+            symbol = str(spacegroup).strip()
+    return {
+        "symprec": float(symprec),
+        "spacegroup": None if spacegroup is None else str(spacegroup),
+        "symbol": symbol,
+        "number": number,
+        "n_operations": None if n_operations is None else int(n_operations),
+    }
+
+
+def _find_spacegroup_record(struct, symprec, is_magnetic=False):
+    spacegroup = get_spacegroup(struct, symprec=symprec)
+    ops = get_symmetry(struct, symprec=symprec, is_magnetic=is_magnetic)
+    n_ops = None if ops is None else int(np.asarray(ops["translations"]).shape[0])
+    return spacegroup_record(spacegroup, n_ops, symprec)
+
+
+def symmetry_summary(struct, symprec, spacegroup, n_operations,
+                     is_magnetic=False, probe_symprec=None):
+    """Symmetry used by the fit plus a probe at a looser tolerance.
+
+    A structure with a small numerical distortion (relaxation noise of
+    1e-5..1e-4 A) is found in a SUBGROUP at a tight --symprec, and every force
+    constant is then constrained by that subgroup only.  A later step run at a
+    looser tolerance (phono3py/kappa at 1e-3) symmetrizes the result and hides
+    the problem.  The probe re-detects the space group at ``probe_symprec``
+    (default PHEASY_SYMPREC_PROBE, 1e-3; <= 0 disables it) when that is looser
+    than ``symprec``.
+
+    Returns a dict: the fit record (spacegroup_record) under "fit", the probe
+    record (or None) under "probe", and "probe_more_symmetric" (True when the
+    probe finds more operations).
+    """
+    if probe_symprec is None:
+        probe_symprec = float(os.environ.get("PHEASY_SYMPREC_PROBE", "1e-3"))
+    probe_symprec = float(probe_symprec)
+    out = {
+        "symprec": float(symprec),
+        "fit": spacegroup_record(spacegroup, n_operations, symprec),
+        "probe": None,
+        "probe_more_symmetric": False,
+    }
+    if probe_symprec > 0 and probe_symprec > float(symprec):
+        probe = _find_spacegroup_record(struct, probe_symprec, is_magnetic)
+        out["probe"] = probe
+        out["probe_more_symmetric"] = bool(
+            probe["n_operations"] is not None and n_operations is not None
+            and probe["n_operations"] > int(n_operations))
+    return out
+
+
+def symmetry_warning(summary):
+    """Warning text when the probe tolerance finds more symmetry, else None."""
+    if not summary or not summary.get("probe_more_symmetric"):
+        return None
+    fit, probe = summary["fit"], summary["probe"]
+    return (
+        "!!! Symmetry depends on the tolerance: --symprec %g finds %s with %d "
+        "operations, but symprec %g finds %s with %d.  The force constants are "
+        "constrained by the LOWER symmetry only (more free parameters, IFCs that "
+        "break the true symmetry); a later step at the looser tolerance would "
+        "symmetrize them and hide it.  Use --symprec %g here and the same value "
+        "downstream, or symmetrize the structure before generating the "
+        "displacements.  Changing --symprec invalidates the cluster space: rerun "
+        "from the cluster stage (-s). !!!"
+        % (fit["symprec"], fit["spacegroup"], fit["n_operations"],
+           probe["symprec"], probe["spacegroup"], probe["n_operations"],
+           probe["symprec"]))

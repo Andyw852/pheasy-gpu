@@ -1887,7 +1887,9 @@ class GpuLassoCV(object):
         self.ols_cv_mse_ = ols_mse
         self.cv_selection_ = {"n_resolved": sel["n_valid"], "ols_mean": sel["ols_mean"],
                               "fallback": sel["fallback"], "extended_decades": extended,
-                              "bracketed": sel.get("bracketed", False)}
+                              "bracketed": sel.get("bracketed", False),
+                              "gap_ratio": sel.get("gap_ratio"),
+                              "gap_unresolved": sel.get("gap_unresolved", False)}
         self._alpha_is_zero = best_i == -1
         self._alpha_at_min = bool(sel["at_min"])
         self._alpha_at_min_flat = bool(sel["at_min"] and sel["flat"])
@@ -4477,7 +4479,9 @@ class GpuTwoLevelLassoCV(GpuLassoCV):
         self.cv_selection_ = {"n_resolved": sel["n_valid"], "ols_mean": sel["ols_mean"],
                               "fallback": sel["fallback"], "max_cv_iterations": max_cv_iterations,
                               "extended_decades": extended,
-                              "bracketed": sel.get("bracketed", False)}
+                              "bracketed": sel.get("bracketed", False),
+                              "gap_ratio": sel.get("gap_ratio"),
+                              "gap_unresolved": sel.get("gap_unresolved", False)}
         self._alpha_is_zero = best_i == -1
         if best_i == -1:
             self.alpha_ = 0.0

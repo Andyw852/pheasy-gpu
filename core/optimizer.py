@@ -475,10 +475,52 @@ def lasso_alpha_grid(lo, hi, nalpha):
 # enough (alpha_max, ALASSO's weighted grid, sklearn backends, debias support,
 # the zero tolerance and the elimination loops all ignore it).
 # ---------------------------------------------------------------------------
-def harm_dense_enabled():
-    """PHEASY_HARM_DENSE=1: never penalize / prune the second-order block."""
-    return os.environ.get("PHEASY_HARM_DENSE", "0").strip().lower() in (
-        "1", "true", "yes", "on")
+# Methods that prune / shrink coefficients.  Without the free harmonic block
+# they cut the weak FC2 couplings (interlayer, inter-cage) first -- exactly the
+# ones the low-frequency acoustic branches and kappa depend on -- so for them
+# the harmonic block is protected unless PHEASY_HARM_DENSE says otherwise.
+# Spellings as Optimizer._fit_impl normalizes them (upper case, "_" -> "-").
+HARM_DENSE_DEFAULT_METHODS = frozenset((
+    "LASSO", "ALASSO", "RFE", "RFECV", "RFE-OLS", "RFE-OLS-CV", "RFE-OLS-TSQR",
+    "RFE-TSQR", "ARDR", "ARD", "ARD-REGRESSION", "RVM", "FAST-RVM", "FASTRVM",
+    "RVM-FAST"))
+
+
+def is_sparse_method(method):
+    """True for the methods that prune / shrink individual coefficients."""
+    if method is None:
+        return False
+    return str(method).strip().upper().replace("_", "-") in HARM_DENSE_DEFAULT_METHODS
+
+
+def harm_dense_setting(method=None):
+    """(enabled, source) of the [HARM_DENSE] switch for ``method``.
+
+    An explicit PHEASY_HARM_DENSE always wins (source "env").  Unset, the
+    sparse methods (is_sparse_method) default to True (source "default") and
+    every other method -- or ``method=None`` -- to False.
+    """
+    raw = os.environ.get("PHEASY_HARM_DENSE", "").strip().lower()
+    if raw:
+        return raw in ("1", "true", "yes", "on"), "env"
+    return is_sparse_method(method), "default"
+
+
+def harm_dense_enabled(method=None):
+    """Never penalize / prune the second-order block (see harm_dense_setting)."""
+    return harm_dense_setting(method)[0]
+
+
+def harm_dense_prune_warning(method):
+    """Warning text when a sparse method WILL prune FC2 (explicit opt-out), else None."""
+    if not is_sparse_method(method) or harm_dense_enabled(method):
+        return None
+    return ("!!! PHEASY_HARM_DENSE=%s: %s will PRUNE the second-order (FC2) block "
+            "together with FC3.  The weak FC2 couplings (interlayer / inter-cage / "
+            "long-range) go first, which distorts the low-frequency acoustic "
+            "branches and kappa.  Unset PHEASY_HARM_DENSE (or set it to 1) to keep "
+            "every harmonic term. !!!"
+            % (os.environ.get("PHEASY_HARM_DENSE", ""), str(method).strip().upper()))
 
 
 def _as_free_mask(unpenalized, n_features):
@@ -920,7 +962,8 @@ def _select_cv_alpha(alphas, mse_path, resolved, ols_mse=None, label="[CV]",
     rtol = float(os.environ.get("PHEASY_LASSO_TIE_RTOL", "1e-9"))
     out = {"valid": valid, "means": means, "ols_mean": None if ols is None else float(ols.mean()),
            "best": None, "at_min": False, "at_max": False, "flat": False,
-           "n_valid": int(valid.sum()), "fallback": False}
+           "n_valid": int(valid.sum()), "fallback": False,
+           "gap_ratio": None, "gap_unresolved": False}
     if not valid.any() and ols is None:
         # Nothing was resolved and there is no exact reference: keep the old
         # plain argmin over whatever finite means exist, and say so loudly.
@@ -965,6 +1008,19 @@ def _select_cv_alpha(alphas, mse_path, resolved, ols_mse=None, label="[CV]",
     lo_valid = int(vidx.min()) if vidx.size else None
     out["best"] = best
     out["one_se"] = bool(best != cv_best)
+    # [FIX CV-GAP] the OLS limit can win only because the lightly regularized
+    # alphas between it and the smallest resolved alpha were never resolved:
+    # then alpha* = 0 is a fallback, not a CV conclusion.  gap_ratio = best
+    # resolved CV mean / OLS CV mean (None: nothing resolved to compare).
+    gap_ratio = None
+    if ols is not None and vidx.size:
+        _om = float(ols.mean())
+        gap_ratio = (m_best / _om if _om > 0
+                     else (1.0 if m_best <= 0 else float("inf")))
+    gap_thr = float(os.environ.get("PHEASY_CV_GAP_WARN", "2.0"))
+    out["gap_ratio"] = None if gap_ratio is None else float(gap_ratio)
+    out["gap_unresolved"] = bool(best == -1 and ols is not None
+                                 and (gap_ratio is None or gap_ratio > gap_thr))
     # [FIX CV-EXT] the curve is still falling at the very first grid point: the
     # grid should go further down -- whether or not that point beats OLS yet (a
     # shallow minimum far below can beat both the grid bottom and the OLS limit).
@@ -998,6 +1054,23 @@ def _select_cv_alpha(alphas, mse_path, resolved, ols_mse=None, label="[CV]",
         print("%s alpha* = %.6e chosen by the one-standard-error rule (CV minimum: %s)"
               % (label, alphas[best], "the OLS limit" if cv_best == -1 else
                  "alpha %.3e" % alphas[cv_best]), flush=True)
+    elif out["gap_unresolved"]:
+        if gap_ratio is None:
+            print("%s WARNING: alpha* = 0 (OLS limit) by DEFAULT: no grid alpha was "
+                  "resolved in every fold, so OLS was compared with nothing.  This is "
+                  "NOT a CV conclusion that the data support no L1 penalty; raise "
+                  "PHEASY_CV_MAX_ITER (or use --std) to resolve the path."
+                  % label, flush=True)
+        else:
+            print("%s WARNING: alpha* = 0 (OLS limit) is a FALLBACK, not a CV "
+                  "conclusion: the best resolved alpha cross-validates %.3gx WORSE "
+                  "than OLS (CV MSE %.6e vs %.6e; PHEASY_CV_GAP_WARN=%g), and the "
+                  "lightly regularized interval (0, %.3e) between them was not "
+                  "resolved by the solver.  Whether a small L1 penalty beats OLS is "
+                  "unknown; raise PHEASY_CV_MAX_ITER / PHEASY_CV_EXTEND_DECADES (or "
+                  "use --std) to resolve smaller alphas."
+                  % (label, gap_ratio, m_best, float(ols.mean()), gap_thr,
+                     alphas[lo_valid]), flush=True)
     elif best == -1:
         print("%s alpha* = 0: the unregularized (OLS) limit cross-validates at least as "
               "well as every resolved alpha, so the data support NO L1 penalty.  The "
@@ -3512,7 +3585,9 @@ class _LassoCVIterative:
         self.ols_cv_mse_ = ols_mse
         self.cv_selection_ = {"n_resolved": sel["n_valid"], "ols_mean": sel["ols_mean"],
                               "fallback": sel["fallback"], "extended_decades": extended,
-                              "bracketed": sel.get("bracketed", False)}
+                              "bracketed": sel.get("bracketed", False),
+                              "gap_ratio": sel.get("gap_ratio"),
+                              "gap_unresolved": sel.get("gap_unresolved", False)}
         self._alpha_is_zero = best_i == -1
         self._alpha_at_min = bool(sel["at_min"])
         self._alpha_at_min_flat = bool(sel["at_min"] and sel["flat"])
@@ -3668,7 +3743,13 @@ class _LassoCVModel:
         best = float(np.nanmin(means))
         self.cv_selection_ = {"n_resolved": int(means.size),
                               "ols_mean": None if ols is None else float(ols.mean()),
-                              "fallback": False, "extended_decades": float(extended)}
+                              "fallback": False, "extended_decades": float(extended),
+                              # [FIX CV-GAP] coordinate descent solves every grid
+                              # alpha, so no interval is left unresolved here
+                              "gap_ratio": (best / float(ols.mean())
+                                            if ols is not None and float(ols.mean()) > 0
+                                            else None),
+                              "gap_unresolved": False}
         if ols is None:
             return False
         rtol = float(os.environ.get("PHEASY_LASSO_TIE_RTOL", "1e-9"))
@@ -7221,8 +7302,15 @@ class Optimizer(object):
             self._results["alpha"] = float(self._model.alpha_)
             self._results["n_iter"] = int(self._model.n_iter_)
             _sel = getattr(self._model, "cv_selection_", None)
+            for _k in ("cv_gap_ratio", "cv_gap_unresolved"):
+                self._results.pop(_k, None)
             if isinstance(_sel, dict):
                 self._results["cv_selection"] = dict(_sel)
+                # [FIX CV-GAP] alpha* = 0 chosen only because the lightly
+                # regularized interval below the resolved path was unresolved
+                self._results["cv_gap_ratio"] = _sel.get("gap_ratio")
+                self._results["cv_gap_unresolved"] = bool(
+                    _sel.get("gap_unresolved", False))
             info = getattr(self._model, "regularized_solver_info_", None)
             if not info:
                 # Every LASSO/ALASSO backend is supposed to certify its own
