@@ -5632,6 +5632,102 @@ def _ls_optimality(g, rnorm, colnorm):
     return float(np.max(np.abs(g) / cn) / rnorm) if g.size else 0.0
 
 
+def _support_ls_gradient(A, y, cols, coef):
+    """[FIX LSMR-CERT] float64 g = A_S^T (A_S coef - y) and ||r||, two products.
+
+    TwoLevelSM (and its column-scaled wrapper) is applied factor by factor in
+    float64: its own matvec rounds to the float32 storage dtype, which would put
+    a ~eps32 / (||r||/||y||) floor under the very certificate.  SM_prime^T is
+    used through its CSC view, so no transpose is materialized.  Other input
+    goes through A @ x and A.T @ r.
+    """
+    y64 = np.asarray(y, dtype=np.float64).ravel()
+    cols = np.asarray(cols, dtype=np.int64)
+    coef = np.asarray(coef, dtype=np.float64).ravel()
+    base = getattr(A, "_twolevel_base", None)
+    if base is not None and hasattr(A, "_twolevel_scale"):
+        # A = base[:, j] / scale[j]
+        s = np.asarray(A._twolevel_scale, dtype=np.float64).ravel()[cols]
+        g, rn = _support_ls_gradient(base, y64, cols, coef / s)
+        return g / s, rn
+    if isinstance(A, TwoLevelSM) and sp.issparse(A.SM_prime):
+        NSs = A.NS[:, cols]
+        u = np.asarray(NSs @ coef, dtype=np.float64).ravel()
+        r = np.asarray(A.SM_prime @ u, dtype=np.float64).ravel() - y64
+        t = np.asarray(A.SM_prime.T @ r, dtype=np.float64).ravel()
+        g = np.asarray(NSs.T @ t, dtype=np.float64).ravel()
+    else:
+        x = np.zeros(int(A.shape[1]), dtype=np.float64)
+        x[cols] = coef
+        r = np.asarray(A @ x, dtype=np.float64).ravel() - y64
+        g = np.asarray(A.T @ r, dtype=np.float64).ravel()[cols]
+    return g, float(np.linalg.norm(r))
+
+
+def _rfe_final_opt_tol():
+    """[FIX LSMR-CERT] optimality bar of a delivered RFE final LSMR solve.
+
+    PHEASY_RFE_FINAL_OPT_TOL (default 1e-6); 0 records the value without gating.
+    """
+    raw = os.environ.get("PHEASY_RFE_FINAL_OPT_TOL", "1e-6")
+    tol = float(raw)
+    if not (tol >= 0.0):
+        raise ValueError("PHEASY_RFE_FINAL_OPT_TOL must be >= 0, got %r" % raw)
+    return tol
+
+
+def _certify_final_lsmr(A, y, cols, coef, colnorm, ridge_alpha, diag):
+    """[FIX LSMR-CERT] certify a delivered full-data LSMR solve against A.
+
+    LSMR's istop=2 test is ||A^T r|| <= atol ||A|| ||r|| with ||A|| a global
+    norm estimate, so it can report convergence while the small-norm (FC3)
+    columns are still far from optimal: Mg4C60 c3=3.0 (6234) stopped with
+    istop=2 and a support gradient ~5900x the exact solution's, residual 10%
+    higher.  Measure max_j |A_j^T r + alpha x_j| / (||A_j|| ||r||) in float64
+    and, above PHEASY_RFE_FINAL_OPT_TOL, mark the solve not converged so the
+    acceptance gate rejects it.  Updates diag in place; returns the optimality.
+    """
+    tol = _rfe_final_opt_tol()
+    y64 = np.asarray(y, dtype=np.float64).ravel()
+    coef = np.asarray(coef, dtype=np.float64).ravel()
+    diag["lsmr_converged"] = bool(diag.get("converged", False))
+    try:
+        g, rn = _support_ls_gradient(A, y64, cols, coef)
+        if ridge_alpha > 0:
+            g = g + float(ridge_alpha) * coef
+        opt_val = _ls_optimality(g, rn, np.asarray(colnorm, dtype=np.float64).ravel())
+    except Exception as exc:
+        opt_val = None
+        print("[RFE] final refit: could not certify the LSMR solve (%s: %s)"
+              % (type(exc).__name__, exc), flush=True)
+    diag["optimality_tol"] = tol
+    if opt_val is None:
+        diag["optimality"] = None
+        if tol > 0:
+            diag["converged"] = False
+            diag["stop_reason"] = "optimality_unavailable"
+        return None
+    diag["optimality"] = float(opt_val)
+    diag["rel_residual"] = float(rn / max(float(np.linalg.norm(y64)), 1e-300))
+    if tol > 0 and opt_val > tol:
+        diag["converged"] = False
+        diag["stop_reason"] = "optimality_not_certified"
+        print("[RFE] final refit: WARNING LSMR reported %s (istop=%s) but the "
+              "delivered solve is not least-squares optimal: optimality "
+              "max|A_j^T r|/(||A_j|| ||r||) = %.3e > PHEASY_RFE_FINAL_OPT_TOL=%.1e. "
+              "The fit will not be accepted.  Give the exact refit the memory it "
+              "needs, or raise PHEASY_RFE_FINAL_LSMR_MAXITER / tighten "
+              "PHEASY_LSQR_ATOL." % ("convergence" if diag["lsmr_converged"]
+                                     else "no convergence", diag.get("istop"),
+                                     opt_val, tol), flush=True)
+    else:
+        print("[RFE] final refit: LSMR solve optimality %.3e (%s PHEASY_RFE_FINAL_OPT_TOL"
+              "=%.1e), ||r||/||y|| = %.3e"
+              % (opt_val, "<=" if tol > 0 else "not gated,", tol, diag["rel_residual"]),
+              flush=True)
+    return float(opt_val)
+
+
 def _rfe_final_refit_exact(A, y, best_idx, *, block_rows=None, diag_floor=1e-12,
                            iterative_diagnostics=None, n_samples=None):
     """[PATCH rfe-final-tsqr-v3] Exact OLS on the selected support.
@@ -6496,7 +6592,14 @@ class _RFECVBase:
                      "PHEASY_RFE_FINAL_LSMR_MAXITER to raise only this one"
                      % os.environ.get("PHEASY_LSQR_MAXITER", str(self.lsmr_maxiter))),
                   flush=True)
+            _n_diag = len(iterative_diagnostics)
             coef_final = solve(best_idx, maxiter=_final_cap)
+            # [FIX LSMR-CERT] istop=2 is not a certificate on its own
+            _final = [d for d in iterative_diagnostics[_n_diag:]
+                      if isinstance(d, dict) and d.get("fit_scope") == "full"]
+            if _final:
+                _certify_final_lsmr(A, y, best_idx, coef_final, col_norms[best_idx],
+                                    self.ridge_alpha, _final[-1])
         coef_full = np.zeros(n_features, dtype=np.float64)
         coef_full[best_idx] = coef_final
 

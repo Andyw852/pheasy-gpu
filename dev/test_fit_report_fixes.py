@@ -647,6 +647,83 @@ class ExactRefitScalingTests(unittest.TestCase):
         self.assertNotIn("optimality max", log)
 
 
+class LsmrCertificationTests(unittest.TestCase):
+    """[FIX LSMR-CERT] a delivered RFE final LSMR solve must be LS-optimal."""
+
+    @staticmethod
+    def _operator(dtype=np.float32, seed=7, m=240, n=16):
+        import scipy.sparse as sp
+        rng = np.random.default_rng(seed)
+        prime = rng.normal(size=(m, n + 4)) * np.geomspace(1e-2, 1e2, n + 4)[None, :]
+        ns = sp.csr_matrix(rng.normal(size=(n + 4, n)))
+        A = opt.TwoLevelSM(sp.csr_matrix(prime.astype(dtype)), ns)
+        dense = prime.astype(dtype).astype(np.float64) @ ns.toarray()
+        y = dense @ rng.normal(size=n) + 1e-2 * rng.normal(size=m)
+        return A, dense, y
+
+    def test_support_gradient_is_float64_and_handles_the_scaled_wrapper(self):
+        A, dense, y = self._operator()
+        cols = np.array([0, 3, 5, 9, 15])
+        coef = np.random.default_rng(1).normal(size=cols.size)
+        g, rn = opt._support_ls_gradient(A, y, cols, coef)
+        r = dense[:, cols] @ coef - y
+        np.testing.assert_allclose(g, dense[:, cols].T @ r, rtol=1e-11, atol=0)
+        self.assertAlmostEqual(rn, float(np.linalg.norm(r)), places=10)
+        w = np.linspace(0.5, 3.0, dense.shape[1])
+        W = opt._scale_operator(A, w)
+        W._twolevel_base, W._twolevel_scale = A, w
+        g2, rn2 = opt._support_ls_gradient(W, y, cols, coef)
+        Ad = dense / w[None, :]
+        r2 = Ad[:, cols] @ coef - y
+        np.testing.assert_allclose(g2, Ad[:, cols].T @ r2, rtol=1e-11, atol=0)
+        self.assertAlmostEqual(rn2, float(np.linalg.norm(r2)), places=10)
+
+    def _fit(self, dtype, extra):
+        A, dense, y = self._operator(dtype=dtype)
+        env = {"PHEASY_RFE_FINAL_TSQR": "0", "PHEASY_RFE_GRAM_GB": "0",
+               "PHEASY_USE_GPU": "0", "PHEASY_GPU_SM": "0",
+               "PHEASY_CV_GROUP_SIZE": "12", "PHEASY_RFE_STEP": "0.2"}
+        env.update(extra)
+        import warnings
+        with patch.dict(os.environ, env), contextlib.redirect_stdout(io.StringIO()) as log, \
+                warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            o = opt.Optimizer("RFE-OLS", cv=3, rand_seed=0, use_gpu=False)
+            o.fit(A, y)
+        full = [d for d in o.results["backend_metadata"]["iterative_diagnostics"]
+                if d["fit_scope"] == "full"]
+        return o.results, full[-1], log.getvalue()
+
+    def test_early_istop_without_optimality_is_rejected(self):
+        res, d, log = self._fit(np.float32, {"PHEASY_LSQR_ATOL": "1e-2",
+                                             "PHEASY_LSQR_BTOL": "1e-2"})
+        self.assertIn("delivering a full-data LSMR solve", log)
+        self.assertTrue(d["lsmr_converged"])           # LSMR itself said "converged"
+        self.assertGreater(d["optimality"], 1e-6)
+        self.assertFalse(d["converged"])
+        self.assertEqual(d["stop_reason"], "optimality_not_certified")
+        self.assertFalse(res["fit_accepted"])
+        self.assertIn("is not least-squares optimal", log)
+
+    def test_a_converged_lsmr_solve_is_certified(self):
+        res, d, log = self._fit(np.float64, {"PHEASY_LSQR_ATOL": "1e-14",
+                                             "PHEASY_LSQR_BTOL": "1e-14",
+                                             "PHEASY_LSQR_MAXITER": "2000"})
+        self.assertLessEqual(d["optimality"], 1e-6)
+        self.assertTrue(d["converged"])
+        self.assertTrue(res["fit_accepted"])
+        self.assertIn("LSMR solve optimality", log)
+
+    def test_zero_tolerance_records_without_gating(self):
+        res, d, log = self._fit(np.float32, {"PHEASY_LSQR_ATOL": "1e-2",
+                                             "PHEASY_LSQR_BTOL": "1e-2",
+                                             "PHEASY_RFE_FINAL_OPT_TOL": "0"})
+        self.assertGreater(d["optimality"], 1e-6)
+        self.assertTrue(d["converged"])
+        self.assertTrue(res["fit_accepted"])
+        self.assertIn("not gated", log)
+
+
 class ManifestValueTests(unittest.TestCase):
     def test_small_array_keeps_values_and_metadata(self):
         rmse = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
