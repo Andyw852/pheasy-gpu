@@ -532,6 +532,121 @@ class AvailableMemoryTests(unittest.TestCase):
         self.assertFalse(ok)
 
 
+class ExactRefitScalingTests(unittest.TestCase):
+    """[FIX RFE-CHOL] Jacobi-scaled in-place Cholesky of the RFE final refit."""
+
+    @staticmethod
+    def _problem(seed=11, m=400, n=24, spread=1e5):
+        import scipy.sparse as sp
+        rng = np.random.default_rng(seed)
+        base = rng.normal(size=(m, n))
+        base[:, 1] = base[:, 0] + 1e-3 * rng.normal(size=m)   # a soft direction
+        scale = np.geomspace(1.0 / spread, spread, n)
+        X = base * scale[None, :]
+        y = X @ (rng.normal(size=n) / scale) + 1e-2 * rng.normal(size=m)
+        A = opt.TwoLevelSM(sp.csr_matrix(X), sp.identity(n, format="csr"))
+        return A, X, y
+
+    def _refit(self, A, y, idx, avail=None, **patches):
+        diags = []
+        ctx = [patch.object(opt, "_available_memory_bytes", return_value=avail)]
+        ctx += [patch.object(*k) if isinstance(k, tuple) else k for k in patches.values()]
+        with contextlib.ExitStack() as st, contextlib.redirect_stdout(io.StringIO()) as log:
+            for c in ctx:
+                st.enter_context(c)
+            st.enter_context(patch.dict(os.environ, {"PHEASY_RFE_FINAL_BLOCK_ROWS": "64"}))
+            coef = opt._rfe_final_refit_exact(A, y, idx, iterative_diagnostics=diags)
+        return coef, diags, log.getvalue()
+
+    def test_ill_scaled_support_is_least_squares_optimal(self):
+        A, X, y = self._problem()
+        idx = np.arange(X.shape[1])
+        coef, diags, log = self._refit(A, y, idx)
+        self.assertIn("Jacobi-scaled Cholesky ok", log)
+        self.assertEqual(diags[-1]["solver"], "Gram-Cholesky")
+        self.assertLess(diags[-1]["optimality"], 1e-8)
+        # independent certificate against A itself, column-normalized
+        r = X @ coef - y
+        g = X.T @ r
+        self.assertLess(np.max(np.abs(g) / np.linalg.norm(X, axis=0)) / np.linalg.norm(r),
+                        1e-8)
+        # reference in normalized columns (an SVD of the raw X truncates the
+        # soft direction: its singular value sits below rcond * s_max)
+        cn = np.linalg.norm(X, axis=0)
+        ref = np.linalg.lstsq(X / cn, y, rcond=None)[0]
+        np.testing.assert_allclose(coef * cn, ref, rtol=1e-7, atol=1e-7)
+
+    def test_cholesky_is_in_place_and_the_gate_counts_one_gram(self):
+        self.assertTrue(opt._cholesky_in_place())
+        A, X, y = self._problem(n=20)
+        idx = np.arange(20)
+        n, blk = 20, 64
+        one = 8.0 * n * n + 16.0 * blk * n
+        # fits once (in place), not twice
+        avail = 1.05 * one / 0.8
+        coef, diags, log = self._refit(A, y, idx, avail=avail)
+        self.assertIsNotNone(coef)
+        self.assertNotIn("iterative fallback", log)
+        coef, diags, log = self._refit(A, y, idx, avail=avail,
+                                       p=(opt, "_cholesky_in_place", lambda: False))
+        self.assertIsNone(coef)
+        self.assertIn("iterative fallback", log)
+
+    def test_memory_error_in_cholesky_falls_back_to_lsmr(self):
+        A, X, y = self._problem(n=12)
+
+        def boom(*a, **k):
+            raise MemoryError
+        coef, diags, log = self._refit(A, y, np.arange(12),
+                                       p=patch.object(opt.spla, "cholesky", boom))
+        self.assertIsNone(coef)
+        self.assertEqual(diags, [])
+        self.assertIn("Cholesky out of memory (MemoryError); LSMR fallback", log)
+
+    def test_memory_error_in_accumulation_falls_back_to_lsmr(self):
+        A, X, y = self._problem(n=12)
+        real = opt._rfe_row_source
+
+        def rows_then_oom(A_, cols):
+            def rows(i0, i1):
+                raise MemoryError
+            return rows
+        coef, diags, log = self._refit(A, y, np.arange(12),
+                                       p=(opt, "_rfe_row_source", rows_then_oom))
+        self.assertIs(opt._rfe_row_source, real)
+        self.assertIsNone(coef)
+        self.assertIn("Gram accumulation out of memory (MemoryError); LSMR fallback", log)
+
+    def test_not_pd_gram_goes_to_tsqr_then_lsmr(self):
+        A, X, y = self._problem(n=10)
+        import scipy.sparse as sp
+        Xd = np.hstack([X, X[:, :1]])                  # exact duplicate column
+        A = opt.TwoLevelSM(sp.csr_matrix(Xd), sp.identity(11, format="csr"))
+        coef, diags, log = self._refit(A, y, np.arange(11))
+        self.assertIn("scaled Gram not PD", log)
+        self.assertIn("trying TSQR", log)
+        self.assertIsNone(coef)                        # TSQR flags the rank deficiency
+        coef, diags, log = self._refit(A, y, np.arange(11), avail=1.0)
+        self.assertIn("iterative fallback", log)
+
+    def test_refinement_is_logged_and_never_worsens(self):
+        A, X, y = self._problem(seed=5, spread=1e6)
+        with patch.dict(os.environ, {"PHEASY_RFE_FINAL_REFINE": "3"}):
+            coef, diags, log = self._refit(A, y, np.arange(X.shape[1]))
+        d = diags[-1]
+        self.assertIn("optimality", d)
+        self.assertLessEqual(d["refine_steps"], 3)
+        self.assertLess(d["optimality"], 1e-8)
+        self.assertIn("optimality max|A_j^T r|/(||A_j|| ||r||)", log)
+
+    def test_check_can_be_disabled(self):
+        A, X, y = self._problem(n=8)
+        with patch.dict(os.environ, {"PHEASY_RFE_FINAL_CHECK": "0"}):
+            coef, diags, log = self._refit(A, y, np.arange(8))
+        self.assertNotIn("optimality", diags[-1])
+        self.assertNotIn("optimality max", log)
+
+
 class ManifestValueTests(unittest.TestCase):
     def test_small_array_keeps_values_and_metadata(self):
         rmse = np.array([1.0, 2.0, 3.0, 4.0, 5.0])

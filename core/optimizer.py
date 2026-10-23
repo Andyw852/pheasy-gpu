@@ -5594,6 +5594,44 @@ def _rfe_final_lsmr_maxiter():
     return cap
 
 
+def _cholesky_in_place():
+    """[FIX RFE-CHOL] True when scipy's potrf factors a Fortran float64 array in
+    place (no second n x n array), which the exact refit's memory gate assumes."""
+    try:
+        t = np.asfortranarray(np.eye(4) * 4.0)
+        c = spla.cholesky(t, lower=True, overwrite_a=True, check_finite=False)
+        return bool(np.shares_memory(c, t))
+    except Exception:
+        return False
+
+
+def _ls_gradient(rows, m, y64, coef, blk):
+    """[FIX RFE-CHOL] one streaming pass: g = A_S^T (A_S coef - y) and ||r||.
+
+    Uses the same float64 row blocks the Gram was accumulated from, so it
+    certifies the solve against A itself rather than against the (rounded) G.
+    """
+    g = np.zeros(coef.size, dtype=np.float64)
+    rr = 0.0
+    for i0 in range(0, m, blk):
+        i1 = min(i0 + blk, m)
+        B = rows(i0, i1)
+        Bd = np.asarray(B.toarray() if sp.issparse(B) else B, dtype=np.float64)
+        r = Bd @ coef - y64[i0:i1]
+        g += Bd.T @ r
+        rr += float(r @ r)
+        del Bd, B, r
+    return g, float(np.sqrt(rr))
+
+
+def _ls_optimality(g, rnorm, colnorm):
+    """Scale-invariant LS optimality max_j |A_j^T r| / (||A_j|| ||r||); 0 is optimal."""
+    if not (rnorm > 0):
+        return 0.0
+    cn = np.where(colnorm > 0, colnorm, 1.0)
+    return float(np.max(np.abs(g) / cn) / rnorm) if g.size else 0.0
+
+
 def _rfe_final_refit_exact(A, y, best_idx, *, block_rows=None, diag_floor=1e-12,
                            iterative_diagnostics=None, n_samples=None):
     """[PATCH rfe-final-tsqr-v3] Exact OLS on the selected support.
@@ -5604,6 +5642,15 @@ def _rfe_final_refit_exact(A, y, best_idx, *, block_rows=None, diag_floor=1e-12,
     merged Q (~120 GB) and OOM-killed the box at this size; it is still available
     via PHEASY_RFE_FINAL_METHOD=tsqr.  Both are unregularized OLS (no ridge bias).
     Returns the coefficient vector or None (caller falls back to LSMR).
+
+    [FIX RFE-CHOL] The Gram is Jacobi-scaled (unit diagonal) before an IN-PLACE
+    Cholesky: FC2 and FC3 columns differ by orders of magnitude in norm, and an
+    unscaled factorization of A^T A loses accuracy along exactly the weakly
+    determined directions (soft modes).  The solve is then certified against A
+    with one more streaming pass (scale-invariant optimality, logged and stored
+    in the diagnostics) and improved by PHEASY_RFE_FINAL_REFINE (default 1)
+    corrected semi-normal-equation refinement steps.  A not-PD Gram goes to
+    TSQR when it fits; any MemoryError goes to the LSMR fallback, both logged.
     """
     y64 = np.asarray(y, dtype=np.float64).ravel()
     m = int(A.shape[0])
@@ -5613,12 +5660,23 @@ def _rfe_final_refit_exact(A, y, best_idx, *, block_rows=None, diag_floor=1e-12,
     method = os.environ.get("PHEASY_RFE_FINAL_METHOD", "gram").lower()
 
     # [FIX RFE-GRAM] refuse a Gram that cannot fit instead of letting the
-    # n x n allocation be OOM-killed half way through the accumulation
+    # n x n allocation be OOM-killed half way through the accumulation.
+    # [FIX RFE-CHOL] count what is really alive: the Gram (once when potrf
+    # works in place, twice when it would copy), TSQR's two R-sized arrays, and
+    # the row block twice (sparse product, then its dense copy).
     _avail = _available_memory_bytes()
-    _need = 8.0 * n * n * (1.0 if method != "tsqr" else 2.0) + 8.0 * blk * n
-    if _avail is not None and _need > 0.8 * _avail:
+
+    def _need(meth):
+        if meth == "tsqr":
+            return 16.0 * n * n + 16.0 * blk * n
+        return 8.0 * n * n * (1.0 if _cholesky_in_place() else 2.0) + 16.0 * blk * n
+
+    def _fits(meth):
+        return _avail is None or _need(meth) <= 0.8 * _avail
+
+    if not _fits(method):
         print("[RFE] final exact refit: needs ~%.1f GB, only %.1f GB available; "
-              "iterative fallback" % (_need / 1e9, _avail / 1e9), flush=True)
+              "iterative fallback" % (_need(method) / 1e9, _avail / 1e9), flush=True)
         return None
     # --- row-block source (float64 blocks of A[:, best_idx]) -----------------
     try:
@@ -5632,7 +5690,7 @@ def _rfe_final_refit_exact(A, y, best_idx, *, block_rows=None, diag_floor=1e-12,
               % type(A).__name__, flush=True)
         return None
 
-    if method == "tsqr":
+    def _tsqr():
         print("[RFE] final exact refit: streaming TSQR (%d x %d), blocks of %d"
               % (m, n, blk), flush=True)
         try:
@@ -5648,21 +5706,34 @@ def _rfe_final_refit_exact(A, y, best_idx, *, block_rows=None, diag_floor=1e-12,
                 print("[RFE] final exact refit: TSQR rank-deficient; LSMR fallback",
                       flush=True)
                 return None
+        except MemoryError:
+            print("[RFE] final exact refit: TSQR out of memory (MemoryError); "
+                  "LSMR fallback", flush=True)
+            return None
         except Exception as exc:
             print("[RFE] final exact refit: TSQR failed (%s); LSMR fallback"
                   % type(exc).__name__, flush=True)
             return None
+        return coef
+
+    extra = {}
+    if method == "tsqr":
+        coef = _tsqr()
+        if coef is None:
+            return None
+        used = "TSQR"
     else:
         print("[RFE] final exact refit: Gram normal equations (%d x %d), blocks of %d"
               % (m, n, blk), flush=True)
-        G = np.zeros((n, n), dtype=np.float64, order="F")
-        rhs = np.zeros(n, dtype=np.float64)
         try:
             from scipy.linalg import blas as _blas_rfe
         except Exception:                          # pragma: no cover
             _blas_rfe = None
         _syrk = _blas_rfe is not None and hasattr(_blas_rfe, "dsyrk")
+        G = None
         try:
+            G = np.zeros((n, n), dtype=np.float64, order="F")
+            rhs = np.zeros(n, dtype=np.float64)
             for i0 in range(0, m, blk):
                 i1 = min(i0 + blk, m)
                 B = _rows(i0, i1)
@@ -5679,33 +5750,92 @@ def _rfe_final_refit_exact(A, y, best_idx, *, block_rows=None, diag_floor=1e-12,
                     G += Bd.T @ Bd
                 rhs += Bd.T @ y64[i0:i1]
                 del Bd, B
+            if _syrk:
+                # dsyrk filled the upper triangle only
+                _mirror_upper(G)
         except MemoryError:
-            print("[RFE] final exact refit: Gram accumulation OOM; LSMR fallback",
-                  flush=True)
+            del G
+            print("[RFE] final exact refit: Gram accumulation out of memory "
+                  "(MemoryError); LSMR fallback", flush=True)
             return None
-        if _syrk:
-            # dsyrk filled the upper triangle only
-            _mirror_upper(G)
+        colnorm = np.sqrt(np.clip(np.diag(G), 0.0, None))
         ridge = _rfe_final_ridge()
         if ridge > 0:
             G.flat[:: n + 1] += ridge
+        # [FIX RFE-CHOL] Jacobi scaling to unit diagonal, in place
+        d = np.sqrt(colnorm * colnorm + max(ridge, 0.0))
+        d[~(d > 0)] = 1.0
+        inv = 1.0 / d
+        G *= inv[:, None]
+        G *= inv[None, :]
+        rhs_s = rhs * inv
+        del rhs
         try:
-            L = np.linalg.cholesky(G)
-            from scipy.linalg import solve_triangular as _stri
-            z = _stri(L, rhs, lower=True, check_finite=False)
-            coef = _stri(L.T, z, lower=False, check_finite=False)
-            _resid = float(np.linalg.norm(G @ coef - rhs))
-            print("[RFE] final exact refit: Cholesky ok (||Gx-b||=%.3e)" % _resid,
-                  flush=True)
+            L = spla.cholesky(G, lower=True, overwrite_a=True, check_finite=False)
         except np.linalg.LinAlgError:
-            print("[RFE] final exact refit: Gram not PD; lstsq(rcond=1e-12)", flush=True)
-            coef = np.linalg.lstsq(G, rhs, rcond=1e-12)[0]
+            del G
+            if not _fits("tsqr"):
+                print("[RFE] final exact refit: scaled Gram not PD (rank-deficient "
+                      "support) and TSQR needs ~%.1f GB, only %.1f GB available; "
+                      "LSMR fallback" % (_need("tsqr") / 1e9, _avail / 1e9), flush=True)
+                return None
+            print("[RFE] final exact refit: scaled Gram not PD (rank-deficient "
+                  "support); trying TSQR", flush=True)
+            coef = _tsqr()
+            if coef is None:
+                return None
+            used = "TSQR"
+        except MemoryError:
+            del G
+            print("[RFE] final exact refit: Cholesky out of memory (MemoryError); "
+                  "LSMR fallback", flush=True)
+            return None
+        else:
+            del G                                  # L owns the storage
+            dl = np.diag(L)
+            cond_est = float((dl.max() / dl.min()) ** 2) if dl.size and dl.min() > 0 \
+                else float("inf")
+
+            def _step(g):
+                return inv * spla.cho_solve((L, True), g * inv, check_finite=False)
+            coef = inv * spla.cho_solve((L, True), rhs_s, check_finite=False)
+            used = "Gram-Cholesky"
+            extra["cond_est_scaled"] = cond_est
+            print("[RFE] final exact refit: Jacobi-scaled Cholesky ok "
+                  "(cond_est(scaled G) ~ %.2e)" % cond_est, flush=True)
+            if os.environ.get("PHEASY_RFE_FINAL_CHECK", "1").lower() not in (
+                    "0", "false", "off", "no"):
+                n_ref = max(0, int(os.environ.get("PHEASY_RFE_FINAL_REFINE", "1")))
+                g, rn = _ls_gradient(_rows, m, y64, coef, blk)
+                if ridge > 0:
+                    g += ridge * coef
+                opt_val = _ls_optimality(g, rn, colnorm)
+                print("[RFE] final exact refit: optimality max|A_j^T r|/(||A_j|| ||r||)"
+                      " = %.3e, ||r||/||y|| = %.3e"
+                      % (opt_val, rn / max(float(np.linalg.norm(y64)), 1e-300)), flush=True)
+                steps = 0
+                while steps < n_ref and opt_val > 1e-12:
+                    trial = coef - _step(g)
+                    g2, rn2 = _ls_gradient(_rows, m, y64, trial, blk)
+                    if ridge > 0:
+                        g2 += ridge * trial
+                    opt2 = _ls_optimality(g2, rn2, colnorm)
+                    steps += 1
+                    print("[RFE] final exact refit: refinement %d: optimality %.3e -> %.3e%s"
+                          % (steps, opt_val, opt2, "" if opt2 < opt_val else " (rejected)"),
+                          flush=True)
+                    if not (opt2 < opt_val):
+                        break
+                    coef, g, rn, opt_val = trial, g2, rn2, opt2
+                extra.update(optimality=float(opt_val), refine_steps=int(steps),
+                             rel_residual=float(rn / max(float(np.linalg.norm(y64)), 1e-300)))
+            del L
     if iterative_diagnostics is not None:
         iterative_diagnostics.append(dict(
-            solver="Gram-Cholesky" if method != "tsqr" else "TSQR",
-            converged=True, stop_reason="qr_exact" if method == "tsqr" else "normal_equations",
+            solver=used, converged=True,
+            stop_reason="qr_exact" if used == "TSQR" else "normal_equations",
             fit_scope="full", n_features=n,
-            n_samples=int(m if n_samples is None else n_samples)))
+            n_samples=int(m if n_samples is None else n_samples), **extra))
     return np.asarray(coef, dtype=np.float64)
 
 
