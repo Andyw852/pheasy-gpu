@@ -1205,17 +1205,93 @@ def _solve_sparse_lsqr(A, y, info=None):
     return np.asarray(res[0], dtype=np.float64)
 
 
-def _available_memory_bytes():
-    """Available physical RAM in bytes (None if undetectable).
+_MEMINFO_PATH = "/proc/meminfo"
+_PROC_CGROUP_PATH = "/proc/self/cgroup"
+_CGROUP_ROOT = "/sys/fs/cgroup"
 
-    [FIX P26] Reads the OS's available-memory estimate (not total) so the
-    dense/iterative dispatch reflects what the node can actually hand out right
-    now, not just a fixed element budget.
+
+def _meminfo_available_bytes():
+    """MemAvailable from /proc/meminfo in bytes, or None if unreadable."""
+    try:
+        with open(_MEMINFO_PATH) as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def _read_int_file(path):
+    with open(path) as fh:
+        raw = fh.read().strip()
+    return None if raw == "max" else int(raw)
+
+
+def _cgroup_memory_headroom():
+    """Bytes left under this process's cgroup memory limit, or None (no limit).
+
+    A batch job (slurm --mem) may be capped far below the node's MemAvailable;
+    sizing an allocation by the node alone gets the job OOM-killed.  cgroup v2:
+    the tightest limit on the path from the leaf up; v1: the memory controller's
+    own limit.
     """
     try:
-        return int(os.sysconf("SC_AVPHYS_PAGES")) * int(os.sysconf("SC_PAGE_SIZE"))
-    except (ValueError, OSError, AttributeError):
+        with open(_PROC_CGROUP_PATH) as fh:
+            lines = fh.read().splitlines()
+    except OSError:
         return None
+    best = None
+    for line in lines:
+        parts = line.split(":", 2)
+        if len(parts) != 3:
+            continue
+        hier, controllers, path = parts
+        if hier == "0" and controllers == "":               # cgroup v2
+            root, files = _CGROUP_ROOT, ("memory.max", "memory.current")
+        elif "memory" in controllers.split(","):            # cgroup v1
+            root = os.path.join(_CGROUP_ROOT, "memory")
+            files = ("memory.limit_in_bytes", "memory.usage_in_bytes")
+        else:
+            continue
+        rel = path.strip("/")
+        segs = rel.split("/") if rel else []
+        # limits are hierarchical: the tightest one from the leaf up counts
+        for depth in range(len(segs), -1, -1):
+            base = os.path.join(root, *segs[:depth])
+            try:
+                limit = _read_int_file(os.path.join(base, files[0]))
+                usage = _read_int_file(os.path.join(base, files[1]))
+            except (OSError, ValueError):
+                continue
+            if limit is not None and usage is not None and limit < (1 << 60):
+                room = max(limit - usage, 0)
+                best = room if best is None else min(best, room)
+    return best
+
+
+def _available_memory_bytes():
+    """RAM this process can allocate now, in bytes (None if undetectable).
+
+    [FIX P26] the dense/iterative dispatch, the exact-Gram budgets and the RFE
+    final exact refit size themselves by this.  [FIX MEMAVAIL] It used to be
+    sysconf(SC_AVPHYS_PAGES), i.e. MemFree, which leaves out the reclaimable
+    page cache: on the shared GPU box (148 GB of cache) it reported 30-50 GB
+    while MemAvailable was 166-199 GB, so the RFE final exact refit of Mg4C60
+    (66-69 GB Gram) always fell back to LSMR.  Now: MemAvailable, capped by the
+    cgroup headroom of a memory-limited job; MemFree only when /proc/meminfo
+    has no MemAvailable (non-Linux, kernels before 3.14).
+    """
+    avail = _meminfo_available_bytes()
+    if avail is None:
+        try:
+            avail = int(os.sysconf("SC_AVPHYS_PAGES")) * int(os.sysconf("SC_PAGE_SIZE"))
+        except (ValueError, OSError, AttributeError):
+            avail = None
+    room = _cgroup_memory_headroom()
+    if room is not None:
+        avail = room if avail is None else min(avail, room)
+    return avail
 
 
 def _should_densify_sparse(A):

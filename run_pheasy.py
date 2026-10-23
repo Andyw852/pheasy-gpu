@@ -91,9 +91,11 @@ def _cap_n_jobs_by_memory(n_jobs, cs_full, n_configs=0, per_config_bytes=0):
         return 1
     if _os.environ.get("PHEASY_N_JOBS_NO_CAP", "").lower() in ("1", "true", "yes"):
         return n_jobs
-    try:
-        avail = _os.sysconf("SC_AVPHYS_PAGES") * _os.sysconf("SC_PAGE_SIZE")
-    except (ValueError, OSError, AttributeError):
+    # MemAvailable (+ cgroup headroom), not MemFree: the same helper the
+    # solvers size themselves by ([FIX MEMAVAIL] in core/optimizer.py)
+    from pheasy_gpu.core.optimizer import _available_memory_bytes
+    avail = _available_memory_bytes()
+    if avail is None:
         return n_jobs
     try:
         per_worker_cs = len(_pk.dumps(cs_full, protocol=_pk.HIGHEST_PROTOCOL))

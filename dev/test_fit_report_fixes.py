@@ -422,6 +422,116 @@ class SolveScopeWarningTests(unittest.TestCase):
         with patch.dict(os.environ, {"PHEASY_RFE_FINAL_LSMR_MAXITER": " "}):
             self.assertIsNone(opt._rfe_final_lsmr_maxiter())
 
+
+class AvailableMemoryTests(unittest.TestCase):
+    """[FIX MEMAVAIL] size allocations by MemAvailable (+ cgroup), not MemFree."""
+
+    GB = 1024 ** 3
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.mkdtemp(prefix="memavail_")
+        self.cg = os.path.join(self.tmp, "cgroup")
+        os.makedirs(self.cg)
+
+    def _write(self, rel, text):
+        path = os.path.join(self.tmp, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as fh:
+            fh.write(text)
+        return path
+
+    def _env(self, free_gb, avail_gb=None, proc_cgroup="0::/\n"):
+        lines = "MemTotal: %d kB\nMemFree: %d kB\n" % (512 * 1024 ** 2, free_gb * 1024 ** 2)
+        if avail_gb is not None:
+            lines += "MemAvailable: %d kB\n" % (avail_gb * 1024 ** 2)
+        meminfo = self._write("meminfo", lines)
+        cgfile = self._write("self_cgroup", proc_cgroup)
+        return (patch.object(opt, "_MEMINFO_PATH", meminfo),
+                patch.object(opt, "_PROC_CGROUP_PATH", cgfile),
+                patch.object(opt, "_CGROUP_ROOT", self.cg))
+
+    def _avail(self, *args, **kw):
+        a, b, c = self._env(*args, **kw)
+        with a, b, c:
+            return opt._available_memory_bytes()
+
+    def test_memavailable_not_memfree(self):
+        # the GPU box: 148 GB page cache, MemFree 36 GB, MemAvailable 166 GB
+        self.assertEqual(self._avail(36, 166), 166 * self.GB)
+
+    def test_cgroup_v2_limit_caps_the_node(self):
+        self._write("cgroup/job/memory.max", str(64 * self.GB))
+        self._write("cgroup/job/memory.current", str(10 * self.GB))
+        self.assertEqual(self._avail(36, 166, "0::/job\n"), 54 * self.GB)
+
+    def test_cgroup_v2_tightest_ancestor_wins(self):
+        self._write("cgroup/slurm/memory.max", str(30 * self.GB))
+        self._write("cgroup/slurm/memory.current", str(5 * self.GB))
+        self._write("cgroup/slurm/step/memory.max", "max")
+        self._write("cgroup/slurm/step/memory.current", str(4 * self.GB))
+        self.assertEqual(self._avail(36, 166, "0::/slurm/step\n"), 25 * self.GB)
+
+    def test_unlimited_cgroups_leave_memavailable(self):
+        self._write("cgroup/job/memory.max", "max")
+        self._write("cgroup/job/memory.current", str(10 * self.GB))
+        self._write("cgroup/memory/job/memory.limit_in_bytes", str(1 << 62))
+        self._write("cgroup/memory/job/memory.usage_in_bytes", str(self.GB))
+        self.assertEqual(self._avail(36, 166, "4:memory:/job\n0::/job\n"),
+                         166 * self.GB)
+
+    def test_cgroup_v1_limit(self):
+        self._write("cgroup/memory/job/memory.limit_in_bytes", str(32 * self.GB))
+        self._write("cgroup/memory/job/memory.usage_in_bytes", str(2 * self.GB))
+        self.assertEqual(self._avail(36, 166, "4:memory:/job\n"), 30 * self.GB)
+
+    def test_no_memavailable_falls_back_to_sysconf(self):
+        got = self._avail(36, None)
+        self.assertIsNotNone(got)
+        self.assertGreater(got, 0)
+
+    def test_rfe_final_exact_refit_runs_under_page_cache_pressure(self):
+        # MemFree tiny, MemAvailable large: the exact refit must run (it used to
+        # fall back to LSMR, and with a 1-iteration cap that fallback is rejected)
+        import scipy.sparse as sp
+        rng = np.random.default_rng(3)
+        dense = rng.normal(size=(120, 10))
+        beta = np.zeros(10)
+        beta[:4] = rng.normal(size=4)
+        y = dense @ beta + 1e-3 * rng.normal(size=120)
+        env = {"PHEASY_LSQR_MAXITER": "1", "PHEASY_RFE_GRAM_GB": "0",
+               "PHEASY_USE_GPU": "0", "PHEASY_GPU_SM": "0",
+               "PHEASY_CV_GROUP_SIZE": "12", "PHEASY_RFE_STEP": "0.2"}
+        results = {}
+        for label, free_kb, avail_kb in (("cache", 1, 64 * 1024 ** 2),
+                                         ("tight", 1, 1)):
+            meminfo = self._write("meminfo_" + label,
+                                  "MemFree: %d kB\nMemAvailable: %d kB\n" % (free_kb, avail_kb))
+            cgfile = self._write("self_cgroup_" + label, "0::/\n")
+            A = opt.TwoLevelSM(sp.csr_matrix(dense), sp.identity(10, format="csr"))
+            with patch.object(opt, "_MEMINFO_PATH", meminfo), \
+                    patch.object(opt, "_PROC_CGROUP_PATH", cgfile), \
+                    patch.object(opt, "_CGROUP_ROOT", self.cg), \
+                    patch.dict(os.environ, env), \
+                    contextlib.redirect_stdout(io.StringIO()) as log:
+                import warnings
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    o = opt.Optimizer("RFE-OLS", cv=3, rand_seed=0, use_gpu=False)
+                    o.fit(A, y)
+            full = [d for d in o.results["backend_metadata"]["iterative_diagnostics"]
+                    if d["fit_scope"] == "full"]
+            results[label] = (o.results["fit_accepted"], [d["solver"] for d in full],
+                              log.getvalue())
+        ok, solvers, log = results["cache"]
+        self.assertTrue(ok)
+        self.assertNotIn("iterative fallback", log)
+        self.assertIn(solvers[-1], ("Gram-Cholesky", "TSQR"))
+        ok, solvers, log = results["tight"]
+        self.assertIn("iterative fallback", log)
+        self.assertFalse(ok)
+
+
 class ManifestValueTests(unittest.TestCase):
     def test_small_array_keeps_values_and_metadata(self):
         rmse = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
