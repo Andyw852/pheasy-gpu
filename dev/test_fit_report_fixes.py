@@ -532,7 +532,6 @@ class AvailableMemoryTests(unittest.TestCase):
         self.assertFalse(ok)
 
 
-
 class Float32IterativeAcceptanceTests(unittest.TestCase):
     """[FIX F32-ITER] a float32 iterate delivered as the answer is not accepted;
     exact paths run by default whenever 0.8 x available RAM allows them."""
@@ -610,9 +609,12 @@ class Float32IterativeAcceptanceTests(unittest.TestCase):
         with patch.object(opt, "_available_memory_bytes", lambda: 1.0):
             r = self._fit("RFE-OLS", A, y, PHEASY_EXACT_GRAM_GB="0",
                           PHEASY_RFE_FINAL_LSMR_MAXITER="20000")
+            # accepting it knowingly takes both opt-outs: the float32 rule and
+            # the [FIX LSMR-CERT] optimality gate (record-only tolerance)
             ok = self._fit("RFE-OLS", A, y, PHEASY_EXACT_GRAM_GB="0",
                            PHEASY_RFE_FINAL_LSMR_MAXITER="20000",
-                           PHEASY_ACCEPT_FLOAT32_ITERATIVE="1")
+                           PHEASY_ACCEPT_FLOAT32_ITERATIVE="1",
+                           PHEASY_RFE_FINAL_OPT_TOL="0")
         self.assertIn("LSMR", r["float32_iterative_delivered"])
         self.assertFalse(r["fit_accepted"])
         self.assertTrue(ok["fit_accepted"])
@@ -620,6 +622,20 @@ class Float32IterativeAcceptanceTests(unittest.TestCase):
         exact = self._fit("RFE-OLS", A, y)
         self.assertTrue(exact["fit_accepted"])
         self.assertNotIn("float32_iterative_delivered", exact)
+
+    def test_float64_certified_rfe_iterate_is_exempt(self):
+        # an iterate that passed the float64 optimality certificate is the LS
+        # answer of the stored matrix: not listed, whatever the storage dtype
+        A, _, _ = self._problem(np.float32)
+        ok = {"solver": "LSMR", "optimality": 3e-7, "optimality_tol": 1e-6}
+        meta = {"iterative_diagnostics": [dict(ok, fit_scope="full")]}
+        self.assertEqual(opt._float32_iterative_deliveries(
+            {"backend_metadata": meta}, A, "RFE"), [])
+        for bad in ({"optimality": 3e-3, "optimality_tol": 1e-6},
+                    {"optimality": 3e-7, "optimality_tol": 0.0}, {}):
+            meta = {"iterative_diagnostics": [dict(bad, solver="LSMR", fit_scope="full")]}
+            self.assertEqual(opt._float32_iterative_deliveries(
+                {"backend_metadata": meta}, A, "RFE"), ["LSMR"], bad)
 
     def test_float32_iterative_lasso_debias_is_not_accepted(self):
         A, y, _ = self._problem(np.float32)
@@ -646,6 +662,201 @@ class Float32IterativeAcceptanceTests(unittest.TestCase):
             warnings.simplefilter("ignore")
             o.fit(A, y)
         return o.results
+
+
+class ExactRefitScalingTests(unittest.TestCase):
+    """[FIX RFE-CHOL] Jacobi-scaled in-place Cholesky of the RFE final refit."""
+
+    @staticmethod
+    def _problem(seed=11, m=400, n=24, spread=1e5):
+        import scipy.sparse as sp
+        rng = np.random.default_rng(seed)
+        base = rng.normal(size=(m, n))
+        base[:, 1] = base[:, 0] + 1e-3 * rng.normal(size=m)   # a soft direction
+        scale = np.geomspace(1.0 / spread, spread, n)
+        X = base * scale[None, :]
+        y = X @ (rng.normal(size=n) / scale) + 1e-2 * rng.normal(size=m)
+        A = opt.TwoLevelSM(sp.csr_matrix(X), sp.identity(n, format="csr"))
+        return A, X, y
+
+    def _refit(self, A, y, idx, avail=None, **patches):
+        diags = []
+        ctx = [patch.object(opt, "_available_memory_bytes", return_value=avail)]
+        ctx += [patch.object(*k) if isinstance(k, tuple) else k for k in patches.values()]
+        with contextlib.ExitStack() as st, contextlib.redirect_stdout(io.StringIO()) as log:
+            for c in ctx:
+                st.enter_context(c)
+            st.enter_context(patch.dict(os.environ, {"PHEASY_RFE_FINAL_BLOCK_ROWS": "64"}))
+            coef = opt._rfe_final_refit_exact(A, y, idx, iterative_diagnostics=diags)
+        return coef, diags, log.getvalue()
+
+    def test_ill_scaled_support_is_least_squares_optimal(self):
+        A, X, y = self._problem()
+        idx = np.arange(X.shape[1])
+        coef, diags, log = self._refit(A, y, idx)
+        self.assertIn("Jacobi-scaled Cholesky ok", log)
+        self.assertEqual(diags[-1]["solver"], "Gram-Cholesky")
+        self.assertLess(diags[-1]["optimality"], 1e-8)
+        # independent certificate against A itself, column-normalized
+        r = X @ coef - y
+        g = X.T @ r
+        self.assertLess(np.max(np.abs(g) / np.linalg.norm(X, axis=0)) / np.linalg.norm(r),
+                        1e-8)
+        # reference in normalized columns (an SVD of the raw X truncates the
+        # soft direction: its singular value sits below rcond * s_max)
+        cn = np.linalg.norm(X, axis=0)
+        ref = np.linalg.lstsq(X / cn, y, rcond=None)[0]
+        np.testing.assert_allclose(coef * cn, ref, rtol=1e-7, atol=1e-7)
+
+    def test_cholesky_is_in_place_and_the_gate_counts_one_gram(self):
+        self.assertTrue(opt._cholesky_in_place())
+        A, X, y = self._problem(n=20)
+        idx = np.arange(20)
+        n, blk = 20, 64
+        one = 8.0 * n * n + 16.0 * blk * n
+        # fits once (in place), not twice
+        avail = 1.05 * one / 0.8
+        coef, diags, log = self._refit(A, y, idx, avail=avail)
+        self.assertIsNotNone(coef)
+        self.assertNotIn("iterative fallback", log)
+        coef, diags, log = self._refit(A, y, idx, avail=avail,
+                                       p=(opt, "_cholesky_in_place", lambda: False))
+        self.assertIsNone(coef)
+        self.assertIn("iterative fallback", log)
+
+    def test_memory_error_in_cholesky_falls_back_to_lsmr(self):
+        A, X, y = self._problem(n=12)
+
+        def boom(*a, **k):
+            raise MemoryError
+        coef, diags, log = self._refit(A, y, np.arange(12),
+                                       p=patch.object(opt.spla, "cholesky", boom))
+        self.assertIsNone(coef)
+        self.assertEqual(diags, [])
+        self.assertIn("Cholesky out of memory (MemoryError); LSMR fallback", log)
+
+    def test_memory_error_in_accumulation_falls_back_to_lsmr(self):
+        A, X, y = self._problem(n=12)
+        real = opt._rfe_row_source
+
+        def rows_then_oom(A_, cols):
+            def rows(i0, i1):
+                raise MemoryError
+            return rows
+        coef, diags, log = self._refit(A, y, np.arange(12),
+                                       p=(opt, "_rfe_row_source", rows_then_oom))
+        self.assertIs(opt._rfe_row_source, real)
+        self.assertIsNone(coef)
+        self.assertIn("Gram accumulation out of memory (MemoryError); LSMR fallback", log)
+
+    def test_not_pd_gram_goes_to_tsqr_then_lsmr(self):
+        A, X, y = self._problem(n=10)
+        import scipy.sparse as sp
+        Xd = np.hstack([X, X[:, :1]])                  # exact duplicate column
+        A = opt.TwoLevelSM(sp.csr_matrix(Xd), sp.identity(11, format="csr"))
+        coef, diags, log = self._refit(A, y, np.arange(11))
+        self.assertIn("scaled Gram not PD", log)
+        self.assertIn("trying TSQR", log)
+        self.assertIsNone(coef)                        # TSQR flags the rank deficiency
+        coef, diags, log = self._refit(A, y, np.arange(11), avail=1.0)
+        self.assertIn("iterative fallback", log)
+
+    def test_refinement_is_logged_and_never_worsens(self):
+        A, X, y = self._problem(seed=5, spread=1e6)
+        with patch.dict(os.environ, {"PHEASY_RFE_FINAL_REFINE": "3"}):
+            coef, diags, log = self._refit(A, y, np.arange(X.shape[1]))
+        d = diags[-1]
+        self.assertIn("optimality", d)
+        self.assertLessEqual(d["refine_steps"], 3)
+        self.assertLess(d["optimality"], 1e-8)
+        self.assertIn("optimality max|A_j^T r|/(||A_j|| ||r||)", log)
+
+    def test_check_can_be_disabled(self):
+        A, X, y = self._problem(n=8)
+        with patch.dict(os.environ, {"PHEASY_RFE_FINAL_CHECK": "0"}):
+            coef, diags, log = self._refit(A, y, np.arange(8))
+        self.assertNotIn("optimality", diags[-1])
+        self.assertNotIn("optimality max", log)
+
+
+class LsmrCertificationTests(unittest.TestCase):
+    """[FIX LSMR-CERT] a delivered RFE final LSMR solve must be LS-optimal."""
+
+    @staticmethod
+    def _operator(dtype=np.float32, seed=7, m=240, n=16):
+        import scipy.sparse as sp
+        rng = np.random.default_rng(seed)
+        prime = rng.normal(size=(m, n + 4)) * np.geomspace(1e-2, 1e2, n + 4)[None, :]
+        ns = sp.csr_matrix(rng.normal(size=(n + 4, n)))
+        A = opt.TwoLevelSM(sp.csr_matrix(prime.astype(dtype)), ns)
+        dense = prime.astype(dtype).astype(np.float64) @ ns.toarray()
+        y = dense @ rng.normal(size=n) + 1e-2 * rng.normal(size=m)
+        return A, dense, y
+
+    def test_support_gradient_is_float64_and_handles_the_scaled_wrapper(self):
+        A, dense, y = self._operator()
+        cols = np.array([0, 3, 5, 9, 15])
+        coef = np.random.default_rng(1).normal(size=cols.size)
+        g, rn = opt._support_ls_gradient(A, y, cols, coef)
+        r = dense[:, cols] @ coef - y
+        np.testing.assert_allclose(g, dense[:, cols].T @ r, rtol=1e-11, atol=0)
+        self.assertAlmostEqual(rn, float(np.linalg.norm(r)), places=10)
+        w = np.linspace(0.5, 3.0, dense.shape[1])
+        W = opt._scale_operator(A, w)
+        W._twolevel_base, W._twolevel_scale = A, w
+        g2, rn2 = opt._support_ls_gradient(W, y, cols, coef)
+        Ad = dense / w[None, :]
+        r2 = Ad[:, cols] @ coef - y
+        np.testing.assert_allclose(g2, Ad[:, cols].T @ r2, rtol=1e-11, atol=0)
+        self.assertAlmostEqual(rn2, float(np.linalg.norm(r2)), places=10)
+
+    def _fit(self, dtype, extra):
+        A, dense, y = self._operator(dtype=dtype)
+        env = {"PHEASY_RFE_FINAL_TSQR": "0", "PHEASY_RFE_GRAM_GB": "0",
+               "PHEASY_USE_GPU": "0", "PHEASY_GPU_SM": "0",
+               "PHEASY_CV_GROUP_SIZE": "12", "PHEASY_RFE_STEP": "0.2"}
+        env.update(extra)
+        import warnings
+        with patch.dict(os.environ, env), contextlib.redirect_stdout(io.StringIO()) as log, \
+                warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            o = opt.Optimizer("RFE-OLS", cv=3, rand_seed=0, use_gpu=False)
+            o.fit(A, y)
+        full = [d for d in o.results["backend_metadata"]["iterative_diagnostics"]
+                if d["fit_scope"] == "full"]
+        return o.results, full[-1], log.getvalue()
+
+    def test_early_istop_without_optimality_is_rejected(self):
+        res, d, log = self._fit(np.float32, {"PHEASY_LSQR_ATOL": "1e-2",
+                                             "PHEASY_LSQR_BTOL": "1e-2"})
+        self.assertIn("delivering a full-data LSMR solve", log)
+        self.assertTrue(d["lsmr_converged"])           # LSMR itself said "converged"
+        self.assertGreater(d["optimality"], 1e-6)
+        self.assertFalse(d["converged"])
+        self.assertEqual(d["stop_reason"], "optimality_not_certified")
+        self.assertFalse(res["fit_accepted"])
+        self.assertIn("is not least-squares optimal", log)
+
+    def test_a_converged_lsmr_solve_is_certified(self):
+        res, d, log = self._fit(np.float64, {"PHEASY_LSQR_ATOL": "1e-14",
+                                             "PHEASY_LSQR_BTOL": "1e-14",
+                                             "PHEASY_LSQR_MAXITER": "2000"})
+        self.assertLessEqual(d["optimality"], 1e-6)
+        self.assertTrue(d["converged"])
+        self.assertTrue(res["fit_accepted"])
+        self.assertIn("LSMR solve optimality", log)
+
+    def test_zero_tolerance_records_without_gating(self):
+        # float32 input: an uncertified iterate also needs the [FIX F32-ITER]
+        # override to be accepted (the record-only tolerance alone is not enough)
+        res, d, log = self._fit(np.float32, {"PHEASY_LSQR_ATOL": "1e-2",
+                                             "PHEASY_LSQR_BTOL": "1e-2",
+                                             "PHEASY_RFE_FINAL_OPT_TOL": "0",
+                                             "PHEASY_ACCEPT_FLOAT32_ITERATIVE": "1"})
+        self.assertGreater(d["optimality"], 1e-6)
+        self.assertTrue(d["converged"])
+        self.assertTrue(res["fit_accepted"])
+        self.assertIn("not gated", log)
 
 
 class ManifestValueTests(unittest.TestCase):
