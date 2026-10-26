@@ -532,6 +532,122 @@ class AvailableMemoryTests(unittest.TestCase):
         self.assertFalse(ok)
 
 
+
+class Float32IterativeAcceptanceTests(unittest.TestCase):
+    """[FIX F32-ITER] a float32 iterate delivered as the answer is not accepted;
+    exact paths run by default whenever 0.8 x available RAM allows them."""
+
+    @staticmethod
+    def _problem(dtype, n=240, p=12, seed=4):
+        import scipy.sparse as sp
+        rng = np.random.default_rng(seed)
+        dense = rng.normal(size=(n, p)).astype(np.float32).astype(np.float64)
+        beta = np.zeros(p)
+        beta[:5] = rng.normal(size=5)
+        y = dense @ beta + 1e-3 * rng.normal(size=n)
+        A = opt.TwoLevelSM(sp.csr_matrix(dense.astype(dtype)),
+                           sp.eye(p, format="csr", dtype=dtype))
+        return A, y, dense
+
+    def _fit(self, method, A, y, **env):
+        import warnings
+        base = {"PHEASY_GPU_MODE": "cpu", "PHEASY_USE_GPU": "0", "PHEASY_GPU_SM": "0",
+                "PHEASY_CV_GROUP_SIZE": "12", "PHEASY_RFE_GRAM_GB": "0",
+                "PHEASY_RIDGE_LCURVE": "0"}
+        base.update(env)
+        clean = {k: v for k, v in os.environ.items()
+                 if k not in ("PHEASY_ACCEPT_FLOAT32_ITERATIVE", "PHEASY_EXACT_GRAM_GB")}
+        kw = {"alpha": [1e-4, 1e-3, 1e-2]} if method == "RIDGE" else {}
+        o = opt.Optimizer(method, cv=3, rand_seed=0, use_gpu=False, **kw)
+        with patch.dict(os.environ, clean, clear=True), patch.dict(os.environ, base), \
+                warnings.catch_warnings(), contextlib.redirect_stdout(io.StringIO()):
+            warnings.simplefilter("ignore")
+            o.fit(A, y)
+        return o.results
+
+    def test_budget_defaults_to_most_of_available_ram(self):
+        with patch.object(opt, "_available_memory_bytes", lambda: 100e9), \
+                patch.dict(os.environ, {"PHEASY_EXACT_GRAM_GB": ""}):
+            self.assertAlmostEqual(opt._exact_gram_budget_bytes(), 80e9)
+        with patch.dict(os.environ, {"PHEASY_EXACT_GRAM_GB": "5"}):
+            self.assertAlmostEqual(opt._exact_gram_budget_bytes(), 5e9)
+
+    def test_float32_ols_takes_the_exact_path_and_is_accepted(self):
+        A, y, dense = self._problem(np.float32)
+        r = self._fit("OLS", A, y)
+        self.assertEqual(r["execution_backend"], "cpu_gram_exact")
+        self.assertTrue(r["fit_accepted"])
+        self.assertNotIn("float32_iterative_delivered", r)
+
+    def test_float32_iterative_ols_is_not_accepted(self):
+        A, y, _ = self._problem(np.float32)
+        r = self._fit("OLS", A, y, PHEASY_EXACT_GRAM_GB="0")
+        self.assertEqual(r["float32_iterative_delivered"], ["LSMR"])
+        self.assertFalse(r["fit_accepted"])
+        self.assertEqual(r["status"], "fit_returned_not_accepted")
+        self.assertIn("float32 iterative solve", r["not_accepted_reason"])
+        ok = self._fit("OLS", A, y, PHEASY_EXACT_GRAM_GB="0",
+                       PHEASY_ACCEPT_FLOAT32_ITERATIVE="1")
+        self.assertTrue(ok["fit_accepted"])
+        self.assertTrue(ok["float32_iterative_override"])
+
+    def test_float64_iterative_ols_is_still_accepted(self):
+        A, y, _ = self._problem(np.float64)
+        r = self._fit("OLS", A, y, PHEASY_EXACT_GRAM_GB="0")
+        self.assertTrue(r["fit_accepted"])
+        self.assertNotIn("float32_iterative_delivered", r)
+
+    def test_float32_iterative_ridge_is_not_accepted(self):
+        A, y, _ = self._problem(np.float32)
+        r = self._fit("RIDGE", A, y, PHEASY_EXACT_GRAM_GB="0")
+        self.assertTrue(r.get("float32_iterative_delivered"), r.get("regularized_solver_info"))
+        self.assertFalse(r["fit_accepted"])
+
+    def test_float32_rfe_lsmr_fallback_is_not_accepted_even_if_converged(self):
+        A, y, _ = self._problem(np.float32)
+        # the final exact refit is refused (no memory), the LSMR fallback gets a
+        # generous cap and converges -- at the float32 floor, so not accepted
+        with patch.object(opt, "_available_memory_bytes", lambda: 1.0):
+            r = self._fit("RFE-OLS", A, y, PHEASY_EXACT_GRAM_GB="0",
+                          PHEASY_RFE_FINAL_LSMR_MAXITER="20000")
+            ok = self._fit("RFE-OLS", A, y, PHEASY_EXACT_GRAM_GB="0",
+                           PHEASY_RFE_FINAL_LSMR_MAXITER="20000",
+                           PHEASY_ACCEPT_FLOAT32_ITERATIVE="1")
+        self.assertIn("LSMR", r["float32_iterative_delivered"])
+        self.assertFalse(r["fit_accepted"])
+        self.assertTrue(ok["fit_accepted"])
+        # with memory the same fit takes the exact refit and is accepted
+        exact = self._fit("RFE-OLS", A, y)
+        self.assertTrue(exact["fit_accepted"])
+        self.assertNotIn("float32_iterative_delivered", exact)
+
+    def test_float32_iterative_lasso_debias_is_not_accepted(self):
+        A, y, _ = self._problem(np.float32)
+        kw = dict(PHEASY_LASSO_DEBIAS="1")
+        o = opt.Optimizer("LASSO", alpha=[1e-4, 1e-3], cv=3, rand_seed=0, use_gpu=False)
+        r = self._fit_with(o, A, y, PHEASY_EXACT_GRAM_GB="0", **kw)
+        self.assertEqual(r["debias_backend"], "cpu_lsmr")
+        self.assertTrue(r["float32_iterative_delivered"])
+        self.assertFalse(r["fit_accepted"])
+        o = opt.Optimizer("LASSO", alpha=[1e-4, 1e-3], cv=3, rand_seed=0, use_gpu=False)
+        r = self._fit_with(o, A, y, **kw)
+        self.assertEqual(r["debias_backend"], "cpu_gram_exact")
+        self.assertTrue(r["fit_accepted"])
+
+    def _fit_with(self, o, A, y, **env):
+        import warnings
+        base = {"PHEASY_GPU_MODE": "cpu", "PHEASY_USE_GPU": "0", "PHEASY_GPU_SM": "0",
+                "PHEASY_CV_GROUP_SIZE": "12"}
+        base.update(env)
+        clean = {k: v for k, v in os.environ.items()
+                 if k not in ("PHEASY_ACCEPT_FLOAT32_ITERATIVE", "PHEASY_EXACT_GRAM_GB")}
+        with patch.dict(os.environ, clean, clear=True), patch.dict(os.environ, base), \
+                warnings.catch_warnings(), contextlib.redirect_stdout(io.StringIO()):
+            warnings.simplefilter("ignore")
+            o.fit(A, y)
+        return o.results
+
+
 class ManifestValueTests(unittest.TestCase):
     def test_small_array_keeps_values_and_metadata(self):
         rmse = np.array([1.0, 2.0, 3.0, 4.0, 5.0])

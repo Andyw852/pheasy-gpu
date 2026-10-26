@@ -1899,10 +1899,13 @@ class WorkFlow(object):
             if not fit_results.get("fit_accepted", True):
                 _allow_unaccepted = os.environ.get("PHEASY_ALLOW_UNACCEPTED_FIT", "0").lower() in ("1", "true", "yes", "on")
                 _status = fit_results.get("status", "fit_returned_not_accepted")
-                logger.error("Fit was returned but not accepted (%s); refusing to write force constants. "
-                             "Set PHEASY_ALLOW_UNACCEPTED_FIT=1 only for diagnostic output.", _status)
+                _why = fit_results.get("not_accepted_reason")
+                logger.error("Fit was returned but not accepted (%s%s); refusing to write force constants. "
+                             "Set PHEASY_ALLOW_UNACCEPTED_FIT=1 only for diagnostic output.",
+                             _status, (": " + _why) if _why else "")
                 if not _allow_unaccepted:
-                    raise RuntimeError("fit did not meet convergence acceptance criteria: %s" % _status)
+                    raise RuntimeError("fit did not meet convergence acceptance criteria: %s%s"
+                                       % (_status, (": " + _why) if _why else ""))
                 logger.warning("PHEASY_ALLOW_UNACCEPTED_FIT=1: writing diagnostic, uncertified force constants")
 
             # [fit-alignment] GATE, evaluated BEFORE anything is written.

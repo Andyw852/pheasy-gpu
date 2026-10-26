@@ -1152,6 +1152,53 @@ _SOLVE_SCOPE_NOTE = {
 }
 
 
+_ITERATIVE_SOLVER_TAGS = ("LSMR", "LSQR", "CGLS")
+
+
+def _is_iterative_solve(info):
+    """True when a solver certificate describes an iterative (Krylov) solve."""
+    if not isinstance(info, dict):
+        return False
+    name = str(info.get("solver", "")).upper()
+    return any(t in name for t in _ITERATIVE_SOLVER_TAGS) and "EXACT" not in name
+
+
+def _float32_iterative_deliveries(results, A, method):
+    """[FIX F32-ITER] iterative solves whose iterate IS the delivered least-
+    squares answer, on float32-stored input (list of solver names).
+
+    "Converged" there means "stopped at the float32 precision floor"
+    (atol 1.19e-6), not "reached the least-squares solution", and the error
+    sits in the soft directions the norm-wise stopping test barely sees.
+    Measured on Mg4C60 3.0 A (RFE final refit, LSMR istop=2, conda 224):
+    b*(1/12) 24 % low and kappa 6-12 % low against the exact refit of the same
+    support.  Exact alternatives exist for every case listed here (float64
+    Gram / TSQR), so such a fit is not accepted unless asked for.  float64
+    storage reaches the 1e-8 tolerance and is not affected; LASSO/ALASSO's
+    own FISTA solve has no exact counterpart and is not listed.
+    """
+    try:
+        if np.dtype(_array_precision(A)) != np.dtype(np.float32):
+            return []
+    except Exception:
+        return []
+    infos = []
+    if method == "OLS":
+        infos.append(results.get("solver_info"))
+    elif method == "RIDGE":
+        infos.append(results.get("regularized_solver_info"))
+    elif method in ("RFE", "RFE-OLS-TSQR"):
+        meta = results.get("backend_metadata")
+        if isinstance(meta, dict):
+            infos.extend(d for d in meta.get("iterative_diagnostics") or ()
+                         if isinstance(d, dict) and d.get("fit_scope", "full") == "full")
+    elif method in ("LASSO", "ALASSO"):
+        if (results.get("debias_accepted")
+                and results.get("debias_backend") in ("cpu_lsmr", "gpu_cgls")):
+            infos.append({"solver": "debias %s" % results["debias_backend"].upper()})
+    return [str(i.get("solver")) for i in infos if _is_iterative_solve(i)]
+
+
 def _iterative_solver_info(result, solver, scope=None):
     """Expose stopping diagnostics and warn when an iterative solve stops early.
 
@@ -5290,16 +5337,20 @@ def _exact_gram_budget_bytes():
     and the LASSO/ALASSO debias on operator / sparse input.
 
     PHEASY_EXACT_GRAM_GB overrides (0 disables and restores the iterative
-    solvers); default min(16 GB, 1/4 of the currently available RAM).
+    solvers); default 0.8 of the RAM available now (_available_memory_bytes:
+    MemAvailable, capped by the job's cgroup) -- the gate the RFE final exact
+    refit already uses.  [FIX F32-ITER] The old default, min(16 GB, avail/4),
+    refused every large system: Mg4C60 (p ~ 82-85k, 53-63 GB) went to the
+    float32 iterative solvers, whose precision floor left the delivered
+    force constants 24 % off on the softest acoustic branch.
     """
     raw = os.environ.get("PHEASY_EXACT_GRAM_GB")
     if raw is not None and raw.strip() != "":
         return max(0.0, float(raw)) * 1e9
-    budget = 16e9
     avail = _available_memory_bytes()
-    if avail is not None:
-        budget = min(budget, 0.25 * float(avail))
-    return budget
+    if avail is None:
+        return 16e9
+    return 0.8 * float(avail)
 
 
 def _exact_gram_input(A):
@@ -6357,14 +6408,22 @@ class _RFECVBase:
             # every ranking round.  Say so: a rejected large fit otherwise reads
             # like the (harmless) ranking warnings above it.
             _final_cap = _rfe_final_lsmr_maxiter()
+            try:
+                _f32_in = np.dtype(_array_precision(A)) == np.dtype(np.float32)
+            except Exception:
+                _f32_in = False
             print("[RFE] final refit: delivering a full-data LSMR solve on %d "
-                  "features (counted by the acceptance gate; iteration cap %s)"
+                  "features (counted by the acceptance gate; iteration cap %s)%s"
                   % (int(best_idx.size),
                      "PHEASY_RFE_FINAL_LSMR_MAXITER=%d" % _final_cap
                      if _final_cap is not None else
                      "PHEASY_LSQR_MAXITER=%s, shared with the ranking rounds; set "
                      "PHEASY_RFE_FINAL_LSMR_MAXITER to raise only this one"
-                     % os.environ.get("PHEASY_LSQR_MAXITER", str(self.lsmr_maxiter))),
+                     % os.environ.get("PHEASY_LSQR_MAXITER", str(self.lsmr_maxiter)),
+                     ".  float32 storage: this iterate stops at the precision floor "
+                     "and is NOT accepted unless PHEASY_ACCEPT_FLOAT32_ITERATIVE=1 (more "
+                     "iterations do not help); give the exact refit the memory it "
+                     "asked for" if _f32_in else ""),
                   flush=True)
             coef_final = solve(best_idx, maxiter=_final_cap)
         coef_full = np.zeros(n_features, dtype=np.float64)
@@ -7674,9 +7733,37 @@ class Optimizer(object):
                 if isinstance(_diag, dict) and _diag.get("fit_scope", "full") == "full":
                     _solver_infos.append(_diag)
         _nonconverged = [x for x in _solver_infos if x.get("converged") is False]
-        self._results["fit_accepted"] = not _nonconverged
-        self._results["status"] = ("fit_returned" if not _nonconverged
+        # [FIX F32-ITER] a converged float32 iterate is not a certified answer
+        for _k in ("not_accepted_reason", "float32_iterative_delivered",
+                   "float32_iterative_override"):
+            self._results.pop(_k, None)
+        _reasons = []
+        if _nonconverged:
+            _reasons.append("an iterative solve counted by the acceptance gate did "
+                            "not converge (%s)" % ", ".join(
+                                sorted({str(x.get("solver")) for x in _nonconverged})))
+        _f32_iter = _float32_iterative_deliveries(self._results, A, method)
+        if _f32_iter:
+            self._results["float32_iterative_delivered"] = _f32_iter
+            if _env_on("PHEASY_ACCEPT_FLOAT32_ITERATIVE", "0"):
+                self._results["float32_iterative_override"] = True
+                print("[accept] WARNING: delivered coefficients are a float32 iterative "
+                      "solve (%s); accepted only because PHEASY_ACCEPT_FLOAT32_ITERATIVE=1"
+                      % ", ".join(_f32_iter), flush=True)
+            else:
+                _reasons.append(
+                    "the delivered coefficients are a float32 iterative solve (%s), "
+                    "stopped at the float32 precision floor instead of the least-"
+                    "squares solution (the error sits in the soft, low-frequency "
+                    "directions).  Let the exact float64 solve run: free memory / a "
+                    "larger node or job --mem, or raise PHEASY_EXACT_GRAM_GB; "
+                    "PHEASY_ACCEPT_FLOAT32_ITERATIVE=1 accepts it knowingly"
+                    % ", ".join(_f32_iter))
+        self._results["fit_accepted"] = not _reasons
+        self._results["status"] = ("fit_returned" if not _reasons
                                      else "fit_returned_not_accepted")
+        if _reasons:
+            self._results["not_accepted_reason"] = "; ".join(_reasons)
 
         self._pred_cache = None
         F_pred = np.asarray(self.predict(A)).ravel()
