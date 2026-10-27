@@ -972,6 +972,12 @@ class WorkFlow(object):
                 SM3_prime = _SM_csc[:, ifc2_num:]
                 del _SM_csc
                 # FM -= SM2_prime @ Phi2 (small matrix-vector product, leave as-is)
+                # [FIX FIXFC2-TOTAL] keep the fixed FC2's force contribution
+                # (one vector): the anharmonic residual left in FM can be mostly
+                # noise, so the relative error and the per-config alignment gate
+                # are taken on the TOTAL forces, as in a joint fit.
+                self._fixfc2_harm_forces = np.asarray(
+                    SM2_prime.dot(Phi2), dtype=np.float64).ravel()
                 FM -= SM2_prime.dot(Phi2)
                 del SM2_prime  # release ifc2 columns
 
@@ -993,12 +999,16 @@ class WorkFlow(object):
                         _ns3 = spmat.csr_matrix(_ns3)
                     elif _ns3.format not in ('csr', 'csc'):
                         _ns3 = _ns3.tocsr()
-                    if _ns3.dtype != _np_p.float32:
-                        _ns3 = _ns3.astype(_np_p.float32)
+                    # [FIX FIXFC2-DTYPE] follow PHEASY_SM_DTYPE like the
+                    # simultaneous branch: a hard-coded float32 SM against the
+                    # float64 FM tripped assert_uniform_dtype
+                    _sm_dt = _np_p.dtype(_sm_dtype())
+                    if _ns3.dtype != _sm_dt:
+                        _ns3 = _ns3.astype(_sm_dt)
                     if spmat.issparse(SM3_prime) and SM3_prime.format not in ('csr', 'csc'):
                         SM3_prime = SM3_prime.tocsr()
-                    if SM3_prime.dtype != _np_p.float32:
-                        SM3_prime = SM3_prime.astype(_np_p.float32)
+                    if SM3_prime.dtype != _sm_dt:
+                        SM3_prime = SM3_prime.astype(_sm_dt)
                     print(f'[OLS-sparse fix_fc2] SM = SM3_prime @ NS_anharm  '
                           f'(sparse @ sparse, KEEP SPARSE)', flush=True)
                     print(f'[OLS-sparse fix_fc2]   SM3_prime: shape={SM3_prime.shape} '
@@ -1009,11 +1019,11 @@ class WorkFlow(object):
                           f'mem={_sp_mem_gb(_ns3):.2f} GB', flush=True)
                     _t0 = _ts.time()
                     SM = SM3_prime.dot(_ns3).tocsr()
-                    if SM.dtype != _np_p.float32:
-                        SM = SM.astype(_np_p.float32)
+                    if SM.dtype != _sm_dt:
+                        SM = SM.astype(_sm_dt)
                     _mem = _sp_mem_gb(SM)
                     _density = SM.nnz / float(SM.shape[0] * SM.shape[1])
-                    _dense_eq = SM.shape[0] * SM.shape[1] * 4 / 1e9
+                    _dense_eq = SM.shape[0] * SM.shape[1] * SM.dtype.itemsize / 1e9
                     print(f'[OLS-sparse fix_fc2] result: shape={SM.shape} '
                           f'nnz={SM.nnz} density={_density:.2%} '
                           f'mem={_mem:.2f} GB  (dense would be '
@@ -1027,6 +1037,11 @@ class WorkFlow(object):
                     # PATCH (fix_fc2 path): parallel sparse.dot + disk cache for
                     # SM = SM3_prime @ NS_anharm. Same logic as simultaneous path.
                     import numpy as _np_p, os as _os_p, json as _json_p
+                    # [FIX FIXFC2-SPP] _digest below reads _sp_p, which this
+                    # function otherwise imports only in the simultaneous branch
+                    # (a later line), so it was an unbound closure variable here
+                    import scipy.sparse as _sp_p
+                    _sm_dt = _np_p.dtype(_sm_dtype())   # [FIX FIXFC2-DTYPE]
                     _SM_F = 'sm_dense_fixfc2.npy'
                     _SM_META_F = _SM_F + '.meta.json'
                     _exp_fix = (SM3_prime.shape[0], NS_anharm.shape[1])
@@ -1071,7 +1086,7 @@ class WorkFlow(object):
                             'ns_shape': list(NS_anharm.shape),
                             'ns_digest': _digest(NS_anharm),
                             'excluded_configs': sorted(ex_set),
-                            'dtype': _np_p.dtype(_np_p.float32).name,
+                            'dtype': _sm_dt.name,
                             'ndata': int(settings.NDATA),
                         }
 
@@ -1080,9 +1095,9 @@ class WorkFlow(object):
                     if _hit_fix:
                         try:
                             _chk = _np_p.load(_SM_F, mmap_mode='r')
-                            if _chk.shape != _exp_fix or _chk.dtype != _np_p.float32:
+                            if _chk.shape != _exp_fix or _chk.dtype != _sm_dt:
                                 print(f'[SM-cache fix_fc2] mismatch '
-                                      f'{_chk.shape}/{_chk.dtype} vs {_exp_fix}/float32, '
+                                      f'{_chk.shape}/{_chk.dtype} vs {_exp_fix}/{_sm_dt.name}, '
                                       f'rebuild', flush=True)
                                 _hit_fix = False
                                 del _chk
@@ -1115,14 +1130,14 @@ class WorkFlow(object):
                     else:
                         # Materialize NS_anharm dense if sparse
                         if spmat.issparse(NS_anharm):
-                            _NS3 = NS_anharm.toarray().astype(_np_p.float32)
+                            _NS3 = NS_anharm.toarray().astype(_sm_dt)
                         else:
-                            _NS3 = NS_anharm.astype(_np_p.float32) if NS_anharm.dtype != _np_p.float32 else NS_anharm
+                            _NS3 = NS_anharm.astype(_sm_dt) if NS_anharm.dtype != _sm_dt else NS_anharm
                         _n_thr = int(_os_p.environ.get('PHEASY_DOT_THREADS',
                                                        _os_p.environ.get('OMP_NUM_THREADS','64')))
                         print(f'[PATCH fix_fc2] parallel sparse.dot: '
                               f'{SM3_prime.shape} x {_NS3.shape}, threads={_n_thr}', flush=True)
-                        SM = _np_p.empty((SM3_prime.shape[0], _NS3.shape[1]), dtype=_np_p.float32)
+                        SM = _np_p.empty((SM3_prime.shape[0], _NS3.shape[1]), dtype=_sm_dt)
                         _rs = SM3_prime.shape[0]
                         _cs = max(1, (_rs + _n_thr - 1) // _n_thr)
                         def _fc_fix(i):
@@ -1727,6 +1742,20 @@ class WorkFlow(object):
             optimizer.fit(SM, FM)
             fit_results = optimizer.results
             fit_metrics = optimizer.metrics
+            # [FIX FIXFC2-TOTAL] with --fix_fc2 the optimizer saw only the
+            # anharmonic residual forces, so its "re" is relative to those (it
+            # can sit near 1 when they are mostly noise).  Add the joint-fit
+            # equivalent: the same absolute error over the TOTAL forces.
+            _hf = getattr(self, "_fixfc2_harm_forces", None)
+            if settings.FIX_FC2 and _hf is not None and "re" in fit_metrics:
+                _fm64 = np.asarray(FM, dtype=np.float64).ravel()
+                _tot = float(np.linalg.norm(_fm64 + _hf))
+                if _tot > 0:
+                    fit_metrics["re_total_forces"] = float(
+                        fit_metrics["re"] * np.linalg.norm(_fm64) / _tot)
+                    logger.info("[fix_fc2] relative force error: %.6e of the total "
+                                "forces (%.6e of the anharmonic residual the fit saw)"
+                                % (fit_metrics["re_total_forces"], fit_metrics["re"]))
 
             # Persist a reproducibility manifest before any material output.
             # Numpy arrays are summarized; small ones (per-fold CV errors) also
@@ -1924,11 +1953,20 @@ class WorkFlow(object):
                     _n3 = 3 * natoms
                     _n_cfg = SM.shape[0] // _n3
                     _fit_prediction = np.asarray(optimizer.predict(SM)).ravel()
+                    _fm_gate = np.asarray(FM, dtype=np.float64).ravel()
+                    # [FIX FIXFC2-TOTAL] compare TOTAL forces, as in a joint fit:
+                    # the anharmonic residual alone can be noise-dominated (a
+                    # correct fit then "fails"), and the fixed FC2's own atom
+                    # order is only tested through the total
+                    _hf = getattr(self, "_fixfc2_harm_forces", None)
+                    if settings.FIX_FC2 and _hf is not None and _hf.size == _fm_gate.size:
+                        _fit_prediction = _fit_prediction + _hf
+                        _fm_gate = _fm_gate + _hf
                     _worst = 1.0
                     for _k in np.linspace(0, _n_cfg - 1, max(1, min(_align_n, _n_cfg))).astype(int):
                         _r = slice(int(_k) * _n3, (int(_k) + 1) * _n3)
                         _fp = _fit_prediction[_r]
-                        _fa = FM[_r]
+                        _fa = _fm_gate[_r]
                         _c = float(np.corrcoef(_fa, _fp)[0, 1])
                         _worst = min(_worst, _c)
                         if _c < _align_min:

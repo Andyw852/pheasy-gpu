@@ -78,6 +78,7 @@ their step from an upper bound on lambda_max of the reduced Gram (CPU: Lanczos
 above `PHEASY_LIPSCHITZ_LANCZOS_P`, default 1024 penalized columns, exact
 eigvalsh below), and lambda_max of the unreduced Grams is no longer computed.
 With `--fix_fc2` the harmonic block is not fitted at all and the flag is moot.
+With `--fix_fc2` the fit sees only the anharmonic residual forces (total minus the fixed FC2's), so its `re` is relative to that residual and can sit near 1 when the residual is mostly noise. The manifest therefore also carries `metrics.re_total_forces` (the same absolute error over the total forces, comparable with a joint fit's `re`), and the per-configuration alignment gate compares total forces (fixed-FC2 harmonic part + fitted anharmonic part), which also tests the atom order of the fixed FC2. The fixed FC2 is read in phonopy format (`fc.hdf5` / `FORCE_CONSTANTS`, mapped by atom index, so a different FC3 cutoff is fine) and is not rewritten: downstream steps must use that file. `dev/test_fix_fc2_cli.py` checks that fixing a joint fit's FC2 reproduces its force RMSE.
 `fit_manifest.json` records the effective state under `harm_dense`
 (`enabled`, `source` env|default, `applied`, `harmonic_columns`).
 See `dev/test_harm_dense.py` for the contract.
