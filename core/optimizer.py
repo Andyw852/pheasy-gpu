@@ -1244,12 +1244,13 @@ def _iterative_solver_info(result, solver, scope=None):
     return info
 
 
-def _solve_sparse_lsqr(A, y, info=None):
+def _solve_sparse_lsqr(A, y, info=None, scope=None, maxiter=None):
     """Iterative least squares (LSQR) for sparse / LinearOperator input.
 
     Only needs matvec / rmatvec, so peak memory is ~O(n_features) instead of
     densifying the sensing matrix (which for e.g. 685968 x 51590 would be
     ~280 GB). This is the same Krylov approach used by symfc / phonopy.
+    scope / maxiter: see _iterative_solver_info and _solve_subset.
     """
     from scipy.sparse.linalg import lsqr as _sp_lsqr
     # Pass the matrix: the floor is a property of the STORED data, so a sparse
@@ -1257,10 +1258,11 @@ def _solve_sparse_lsqr(A, y, info=None):
     # it would burn its whole iter_lim with istop=7 instead of converging.
     atol = float(_lsmr_tol("PHEASY_LSQR_ATOL", 1e-8, A))
     btol = float(_lsmr_tol("PHEASY_LSQR_BTOL", 1e-8, A))
-    iter_lim = int(os.environ.get("PHEASY_LSQR_MAXITER", "5000"))
+    iter_lim = (int(maxiter) if maxiter is not None
+                else int(os.environ.get("PHEASY_LSQR_MAXITER", "5000")))
     y64 = np.asarray(y, dtype=np.float64).ravel()
     res = _sp_lsqr(A, y64, atol=atol, btol=btol, iter_lim=iter_lim)
-    diagnostics = _iterative_solver_info(res, "LSQR")
+    diagnostics = _iterative_solver_info(res, "LSQR", scope=scope)
     if info is not None:
         info.update(diagnostics)
     return np.asarray(res[0], dtype=np.float64)
@@ -2795,6 +2797,24 @@ def _solve_subset(A, y, row_idx, col_idx, ridge_alpha=0.0, qr=False,
     y_sub = np.asarray(y, dtype=np.float64).ravel()
     if row_idx is not None:
         y_sub = y_sub[row_idx]
+
+    def _lstsq_recorded(A_sub, y_sub):
+        # [FIX RFE-LSQR-DIAG] a sparse subset too big to densify goes to LSQR.
+        # Record it in diag_sink like the operator branch's LSMR: unrecorded,
+        # its non-convergence never reached the acceptance gate and a float32
+        # LSQR iterate could be delivered as the final RFE answer unflagged.
+        if sp.issparse(A_sub) and not _should_densify_sparse(A_sub):
+            _info = {}
+            coef = _solve_sparse_lsqr(
+                A_sub, y_sub, info=_info,
+                scope=diag_scope if diag_sink is not None else None,
+                maxiter=maxiter_override)
+            if diag_sink is not None:
+                diag_sink.append(dict(_info, fit_scope=diag_scope,
+                                      n_features=int(len(col_idx))))
+            return coef
+        return _solve_lstsq(A_sub, y_sub)
+
     if _is_linear_operator(A):
         # LSMR on a masked operator: no materialization, memory ~O(n_features).
         op = _make_masked_op(A, row_idx, col_idx)
@@ -2872,10 +2892,10 @@ def _solve_subset(A, y, row_idx, col_idx, ridge_alpha=0.0, qr=False,
         _bytes = A_sub.shape[0] * A_sub.shape[1] * 8
         _thr = float(os.environ.get("PHEASY_TSQR_MIN_BYTES", "8e9"))
         if _bytes <= _thr and os.environ.get("PHEASY_TSQR_FORCE", "0") != "1":
-            return _solve_lstsq(A_sub, y_sub)
+            return _lstsq_recorded(A_sub, y_sub)
         return _solve_qr(A_sub, y_sub, block_rows=block_rows,
                          diag_floor=diag_floor)
-    return _solve_lstsq(A_sub, y_sub)
+    return _lstsq_recorded(A_sub, y_sub)
 
 
 def _predict_subset(A, col_idx, row_idx, coef):
@@ -6623,11 +6643,13 @@ class _RFECVBase:
             and not _should_densify_sparse(sp.csr_matrix((n_samples, int(best_idx.size)))))
         _exact_final = (_is_linear_operator(A) or _sparse_lsqr_final) and os.environ.get(
             "PHEASY_RFE_FINAL_TSQR", "1").lower() in ("1", "true", "yes", "on")
-        if _exact_final:
-            try:
-                np.save(os.path.join(".", "rfe_support.npy"), best_idx)
-            except Exception:
-                pass
+        # the selected support, for PHEASY_RFE_SUPPORT_NPY reuse (an exact refit
+        # elsewhere, a later rerun); written whatever the final solver
+        try:
+            np.save(os.path.join(".", "rfe_support.npy"), best_idx)
+            _support_file = "rfe_support.npy"
+        except Exception:
+            _support_file = None
         if _best_loc is not None:
             # [FIX RFE-GRAM] the selected support is inside the exact Gram: its
             # full-data normal equations are already in memory
@@ -6652,19 +6674,33 @@ class _RFECVBase:
                 _f32_in = np.dtype(_array_precision(A)) == np.dtype(np.float32)
             except Exception:
                 _f32_in = False
-            print("[RFE] final refit: delivering a full-data LSMR solve on %d "
-                  "features (counted by the acceptance gate; iteration cap %s)%s"
-                  % (int(best_idx.size),
-                     "PHEASY_RFE_FINAL_LSMR_MAXITER=%d" % _final_cap
-                     if _final_cap is not None else
-                     "PHEASY_LSQR_MAXITER=%s, shared with the ranking rounds; set "
-                     "PHEASY_RFE_FINAL_LSMR_MAXITER to raise only this one"
-                     % os.environ.get("PHEASY_LSQR_MAXITER", str(self.lsmr_maxiter)),
-                     ".  float32 storage: this iterate stops at the precision floor "
-                     "and is NOT accepted unless PHEASY_ACCEPT_FLOAT32_ITERATIVE=1 (more "
-                     "iterations do not help); give the exact refit the memory it "
-                     "asked for" if _f32_in else ""),
-                  flush=True)
+            # which solve() will run: dense (or densifiable sparse) input is a
+            # direct QR/SVD least squares -- exact, nothing to cap or reject
+            if resident_operator:
+                _final_kind = "resident GPU iterative"
+            elif _is_linear_operator(A):
+                _final_kind = "LSMR"
+            elif _sparse_lsqr_final:
+                _final_kind = "LSQR"
+            else:
+                _final_kind = None
+            if _final_kind is None:
+                print("[RFE] final refit: direct least-squares solve (dense QR/SVD) "
+                      "on %d features" % int(best_idx.size), flush=True)
+            else:
+                print("[RFE] final refit: delivering a full-data %s solve on %d "
+                      "features (counted by the acceptance gate; iteration cap %s)%s"
+                      % (_final_kind, int(best_idx.size),
+                         "PHEASY_RFE_FINAL_LSMR_MAXITER=%d" % _final_cap
+                         if _final_cap is not None else
+                         "PHEASY_LSQR_MAXITER=%s, shared with the ranking rounds; set "
+                         "PHEASY_RFE_FINAL_LSMR_MAXITER to raise only this one"
+                         % os.environ.get("PHEASY_LSQR_MAXITER", str(self.lsmr_maxiter)),
+                         ".  float32 storage: this iterate stops at the precision floor "
+                         "and is NOT accepted unless PHEASY_ACCEPT_FLOAT32_ITERATIVE=1 (more "
+                         "iterations do not help); give the exact refit the memory it "
+                         "asked for" if _f32_in else ""),
+                      flush=True)
             _n_diag = len(iterative_diagnostics)
             coef_final = solve(best_idx, maxiter=_final_cap)
             # [FIX LSMR-CERT] istop=2 is not a certificate on its own
@@ -6694,6 +6730,10 @@ class _RFECVBase:
         self.backend_metadata_ = {
             # [RFE-OLS] how the feature count was chosen (cv = CV + 1-SE rule)
             "criterion": criterion,
+            # the selected support: its size and the file it was saved to
+            "n_active": int(best_idx.size),
+            "n_candidates": int(n_features),
+            "support_file": _support_file,
             "ic_n_eff": (int(self._bic_n_eff(n_samples)[0])
                          if criterion in ("bic", "aic") else None),
             "subset_solver": "gpu_resident_iterative" if resident_operator else (

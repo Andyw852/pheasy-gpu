@@ -859,6 +859,90 @@ class LsmrCertificationTests(unittest.TestCase):
         self.assertIn("not gated", log)
 
 
+
+class RfeFinalSolveKindTests(unittest.TestCase):
+    """[FIX RFE-LSQR-DIAG] the final-solve log names the solver that runs, the
+    support is always saved, and a sparse LSQR subset solve is recorded."""
+
+    def _fit(self, A, y, **env):
+        import tempfile
+        import warnings
+        base = {"PHEASY_USE_GPU": "0", "PHEASY_GPU_SM": "0", "PHEASY_GPU_MODE": "cpu",
+                "PHEASY_CV_GROUP_SIZE": "12", "PHEASY_RFE_STEP": "0.2",
+                "PHEASY_RFE_GRAM_GB": "0"}
+        base.update(env)
+        clean = {k: v for k, v in os.environ.items()
+                 if k not in ("PHEASY_ACCEPT_FLOAT32_ITERATIVE", "PHEASY_MAX_DENSE")}
+        cwd = os.getcwd()
+        tmp = tempfile.mkdtemp(prefix="rfe_kind_")
+        os.chdir(tmp)
+        try:
+            o = opt.Optimizer("RFE-OLS", cv=3, rand_seed=0, use_gpu=False)
+            with patch.dict(os.environ, clean, clear=True), patch.dict(os.environ, base), \
+                    contextlib.redirect_stdout(io.StringIO()) as log, \
+                    warnings.catch_warnings(record=True) as w:
+                warnings.simplefilter("always")
+                o.fit(A, y)
+            saved = os.path.exists(os.path.join(tmp, "rfe_support.npy"))
+        finally:
+            os.chdir(cwd)
+        msgs = [str(x.message) for x in w if "did not converge" in str(x.message)]
+        return o.results, log.getvalue(), saved, msgs
+
+    @staticmethod
+    def _problem(seed=6, n=240, p=14):
+        rng = np.random.default_rng(seed)
+        A = rng.normal(size=(n, p)).astype(np.float32).astype(np.float64)
+        beta = np.zeros(p)
+        beta[:5] = rng.normal(size=5)
+        return A, A @ beta + 1e-3 * rng.normal(size=n)
+
+    def test_dense_input_logs_a_direct_solve_and_saves_the_support(self):
+        A, y = self._problem()
+        r, log, saved, _ = self._fit(A, y)
+        self.assertIn("final refit: direct least-squares solve", log)
+        self.assertNotIn("LSMR solve", log)
+        self.assertTrue(r["fit_accepted"])
+        self.assertTrue(saved)
+        meta = r["backend_metadata"]
+        self.assertEqual(meta["support_file"], "rfe_support.npy")
+        self.assertEqual(meta["n_active"], int(np.count_nonzero(r["coef"])))
+        self.assertEqual(meta["n_candidates"], A.shape[1])
+
+    def _sparse_fallback(self, **env):
+        import scipy.sparse as sp
+        A, y = self._problem()
+        A32 = sp.csr_matrix(A.astype(np.float32))
+        # never densify; the exact final refit is refused (no memory)
+        with patch.object(opt, "_available_memory_bytes", lambda: 1.0):
+            return self._fit(A32, y, PHEASY_MAX_DENSE="0", **env)
+
+    def test_sparse_lsqr_fallback_is_recorded_and_certified(self):
+        # scipy's float32 CSR times a float64 vector computes in float64, so
+        # this LSQR reaches the least-squares answer: the float64 optimality
+        # certificate passes and the fit is accepted on that evidence
+        r, log, saved, msgs = self._sparse_fallback()
+        self.assertIn("delivering a full-data LSQR solve", log)
+        diags = r["backend_metadata"]["iterative_diagnostics"]
+        full = [d for d in diags if d.get("fit_scope") == "full"]
+        self.assertTrue(full and full[-1]["solver"] == "LSQR", full)
+        self.assertLessEqual(full[-1]["optimality"], full[-1]["optimality_tol"])
+        self.assertTrue(r["fit_accepted"])
+        self.assertTrue(saved)
+        ranking = [d for d in diags if d.get("fit_scope") == "ranking"]
+        self.assertTrue(ranking and all(d["solver"] == "LSQR" for d in ranking))
+
+    def test_uncertified_sparse_lsqr_fallback_is_not_accepted(self):
+        # stopped early: not least-squares optimal, so not accepted (it used to
+        # be invisible to the gate and shipped as the RFE answer)
+        r, log, saved, msgs = self._sparse_fallback(PHEASY_LSQR_ATOL="1e-2",
+                                                    PHEASY_LSQR_BTOL="1e-2")
+        full = [d for d in r["backend_metadata"]["iterative_diagnostics"]
+                if d.get("fit_scope") == "full"]
+        self.assertGreater(full[-1]["optimality"], full[-1]["optimality_tol"])
+        self.assertIn("LSQR", r.get("float32_iterative_delivered", []))
+        self.assertFalse(r["fit_accepted"])
+
 class ManifestValueTests(unittest.TestCase):
     def test_small_array_keeps_values_and_metadata(self):
         rmse = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
