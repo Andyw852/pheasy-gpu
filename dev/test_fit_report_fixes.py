@@ -943,6 +943,48 @@ class RfeFinalSolveKindTests(unittest.TestCase):
         self.assertIn("LSQR", r.get("float32_iterative_delivered", []))
         self.assertFalse(r["fit_accepted"])
 
+
+class RfeDenseGramTests(unittest.TestCase):
+    """[FIX RFE-GRAM-DENSE] the per-fold Gram engine on dense input selects the
+    same support as the per-subset QR/SVD rounds; the final solve stays QR."""
+
+    def _fit(self, A, y, gram_dense):
+        import tempfile
+        import warnings
+        env = {"PHEASY_USE_GPU": "0", "PHEASY_GPU_SM": "0", "PHEASY_GPU_MODE": "cpu",
+               "PHEASY_CV_GROUP_SIZE": "12", "PHEASY_RFE_STEP": "0.1",
+               "PHEASY_RFE_GRAM_GB": "4", "PHEASY_RFE_GRAM_DENSE": gram_dense}
+        cwd = os.getcwd()
+        os.chdir(tempfile.mkdtemp(prefix="rfe_gram_dense_"))
+        try:
+            o = opt.Optimizer("RFE-OLS", cv=5, rand_seed=0, use_gpu=False)
+            with patch.dict(os.environ, env), warnings.catch_warnings(), \
+                    contextlib.redirect_stdout(io.StringIO()) as log:
+                warnings.simplefilter("ignore")
+                o.fit(A, y)
+        finally:
+            os.chdir(cwd)
+        return o.results, log.getvalue()
+
+    def test_same_support_and_coefficients_as_qr_rounds(self):
+        rng = np.random.default_rng(12)
+        n_cfg, rows, p = 50, 12, 40
+        A = rng.normal(size=(n_cfg * rows, p)) * np.geomspace(1.0, 30.0, p)
+        beta = np.zeros(p)
+        beta[rng.choice(p, 9, replace=False)] = rng.normal(size=9)
+        y = A @ beta + 0.05 * rng.normal(size=A.shape[0])
+        g, glog = self._fit(A, y, "1")
+        q, _ = self._fit(A, y, "0")
+        gm, qm = g["backend_metadata"], q["backend_metadata"]
+        self.assertGreater(gm["gram_exact_rounds"], 0)
+        self.assertEqual(qm["gram_exact_rounds"], 0)
+        self.assertEqual(gm["n_active"], qm["n_active"])
+        np.testing.assert_array_equal(np.flatnonzero(g["coef"]), np.flatnonzero(q["coef"]))
+        np.testing.assert_allclose(g["coef"], q["coef"], rtol=1e-9, atol=1e-12)
+        self.assertIn("final refit: direct least-squares solve", glog)
+        self.assertTrue(g["fit_accepted"])
+
+
 class ManifestValueTests(unittest.TestCase):
     def test_small_array_keeps_values_and_metadata(self):
         rmse = np.array([1.0, 2.0, 3.0, 4.0, 5.0])

@@ -5207,6 +5207,16 @@ def _rfe_row_source(A, cols):
         def rows(i0, i1):
             return base_rows(i0, i1) * d[None, :]
         return rows
+    if isinstance(A, np.ndarray):
+        # [FIX RFE-GRAM-DENSE] slice each row block; A[:, cols] as a whole is a
+        # copy of the dense SM (~27 GB at 30k columns of the Mg4C60 fix_fc2 SM)
+        full = bool(cols.size == A.shape[1]
+                    and np.array_equal(cols, np.arange(A.shape[1])))
+
+        def rows(i0, i1):
+            B = A[i0:i1] if full else A[i0:i1][:, cols]
+            return np.ascontiguousarray(B, dtype=np.float64)
+        return rows
     if isinstance(A, TwoLevelSM):
         NSs = A.NS[:, cols]
         NSs = (NSs if sp.issparse(NSs) else sp.csr_matrix(NSs)).astype(np.float64)
@@ -6138,16 +6148,24 @@ class _RFECVBase:
         _rfe_resident_on = os.environ.get(
             "PHEASY_GPU_RFE_RESIDENT",
             "1" if _resident_default() else "0").lower() in ("1", "true", "yes", "on")
-        # [FIX RFE-GRAM] exact per-fold Gram engine for operator / sparse input
-        # (dense input is already solved exactly by QR / SVD per subset).  When
-        # the whole feature set fits the budget it answers every round, so the
-        # resident iterative operator is not built at all.
+        # [FIX RFE-GRAM] exact per-fold Gram engine for operator / sparse input.
+        # When the whole feature set fits the budget it answers every round, so
+        # the resident iterative operator is not built at all.
+        # [FIX RFE-GRAM-DENSE] dense input too (PHEASY_RFE_GRAM_DENSE, default
+        # on): QR/SVD per subset is exact as well, but costs ~6 m p^2 per round
+        # (5 folds + full data) where the Gram engine pays m p^2 once and then
+        # ~6 p^3/3 per round -- ~30 min vs ~1 min per round at p = 10.5k on the
+        # Mg4C60 fix_fc2 SM (m ~ 2.3e5), days vs hours at p ~ 30k.  The
+        # delivered final solve of dense input stays the dense QR/SVD.
         gram = None
         gram_budget = _rfe_gram_budget_bytes()
         _fold_rows = np.concatenate([np.asarray(va, dtype=np.int64) for _tr, va in splits]) \
             if splits else np.zeros(0, dtype=np.int64)
         gram_eligible = bool(
-            gram_budget > 0 and (_is_linear_operator(A) or sp.issparse(A))
+            gram_budget > 0
+            and (_is_linear_operator(A) or sp.issparse(A)
+                 or (isinstance(A, np.ndarray)
+                     and _env_on("PHEASY_RFE_GRAM_DENSE", "1")))
             and _fold_rows.size == n_samples
             and np.array_equal(np.sort(_fold_rows), np.arange(n_samples))
             and not os.environ.get("PHEASY_RFE_SUPPORT_NPY"))
@@ -6650,9 +6668,10 @@ class _RFECVBase:
             _support_file = "rfe_support.npy"
         except Exception:
             _support_file = None
-        if _best_loc is not None:
+        if _best_loc is not None and not isinstance(A, np.ndarray):
             # [FIX RFE-GRAM] the selected support is inside the exact Gram: its
-            # full-data normal equations are already in memory
+            # full-data normal equations are already in memory.  Dense input
+            # keeps its QR/SVD final solve below (no squared condition number).
             coef_final = gram.round(_best_loc, want_cv=False, final=True)[0]
             iterative_diagnostics.append(dict(
                 solver="Gram-Cholesky", converged=True, stop_reason="normal_equations",
