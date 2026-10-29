@@ -984,6 +984,74 @@ class RfeDenseGramTests(unittest.TestCase):
         self.assertIn("final refit: direct least-squares solve", glog)
         self.assertTrue(g["fit_accepted"])
 
+    def test_fold_grams_released_before_the_dense_final_solve(self):
+        # [FIX RFE-GRAM-MEM] the dense final solve does not use the Grams
+        rng = np.random.default_rng(13)
+        A = rng.normal(size=(600, 40))
+        y = A[:, :6] @ rng.normal(size=6) + 0.05 * rng.normal(size=600)
+        calls = []
+        orig = opt._RFEGramCV.release
+
+        def spy(gram):
+            calls.append(gram.Gt is not None)
+            orig(gram)
+        with patch.object(opt._RFEGramCV, "release", spy):
+            g, _ = self._fit(A, y, "1")
+        self.assertEqual(calls, [True])
+        meta = g["backend_metadata"]
+        self.assertGreater(meta["gram_exact_rounds"], 0)
+        self.assertGreater(meta["gram_bytes"], 0)
+        self.assertTrue(g["fit_accepted"])
+
+
+class LstsqMemoryTests(unittest.TestCase):
+    """[FIX LSTSQ-MEM] a large dense gelsd solve makes one float64 copy, not two."""
+
+    def setUp(self):
+        rng = np.random.default_rng(14)
+        self.A = (rng.normal(size=(3000, 30)) * np.geomspace(1, 40, 30)).astype(np.float32)
+        self.y = rng.normal(size=3000)
+
+    def _solve(self, A, y, inplace):
+        env = {"PHEASY_USE_GPU": "0", "PHEASY_GPU_MODE": "cpu",
+               "PHEASY_LSTSQ_INPLACE_MIN_BYTES": "0" if inplace else "1e30"}
+        with patch.dict(os.environ, env):
+            return opt._solve_lstsq(A, y)
+
+    def test_same_solution_without_scipy_lstsq(self):
+        ref = self._solve(self.A, self.y, inplace=False)
+        A0 = self.A.copy()
+        with patch.object(opt.spla, "lstsq", side_effect=AssertionError("copied")):
+            got = self._solve(self.A, self.y, inplace=True)
+        np.testing.assert_allclose(got, ref, rtol=1e-12, atol=1e-15)
+        np.testing.assert_array_equal(self.A, A0)
+
+    def test_rank_deficient_min_norm_and_sparse(self):
+        import scipy.sparse as sps
+        B = np.hstack([self.A, self.A[:, :5]])
+        np.testing.assert_allclose(self._solve(B, self.y, True),
+                                   self._solve(B, self.y, False), rtol=1e-10, atol=1e-13)
+        S = sps.csr_matrix(B)
+        with patch.object(opt, "_should_densify_sparse", return_value=True):
+            np.testing.assert_allclose(self._solve(S, self.y, True),
+                                       self._solve(S, self.y, False), rtol=1e-10, atol=1e-13)
+
+    def test_caller_float64_fortran_array_is_not_overwritten(self):
+        F = np.asfortranarray(self.A, dtype=np.float64)
+        F0 = F.copy()
+        self._solve(F, self.y, inplace=True)
+        np.testing.assert_array_equal(F, F0)
+
+    def test_nonfinite_input_still_raises(self):
+        A = self.A.copy()
+        A[7, 3] = np.nan
+        with self.assertRaises(ValueError):
+            self._solve(A, self.y, inplace=True)
+        y = self.y.copy()
+        y[0] = np.inf
+        with self.assertRaises(ValueError):
+            self._solve(self.A, y, inplace=True)
+
 
 class ManifestValueTests(unittest.TestCase):
     def test_small_array_keeps_values_and_metadata(self):

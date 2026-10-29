@@ -1536,13 +1536,67 @@ def _solve_lstsq(A, y, driver="gelsd"):
         return np.asarray(_gpu().lstsq(_dense_for_gpu(A), y), dtype=np.float64)
     if sp.issparse(A) and not _should_densify_sparse(A):
         return _solve_sparse_lsqr(A, y)
-    A64 = _to_dense_f64(A)
     y64 = np.asarray(y, dtype=np.float64).ravel()
+    if driver == "gelsd":
+        coef = _gelsd_owned_copy(A, y64)
+        if coef is not None:
+            return coef
+    A64 = _to_dense_f64(A)
     try:
         coef, *_ = spla.lstsq(A64, y64, cond=None, lapack_driver=driver)
     except Exception:
         coef, *_ = spla.lstsq(A64, y64, cond=None, lapack_driver="gelsd")
     return np.asarray(coef, dtype=np.float64)
+
+
+def _gelsd_owned_copy(A, y64):
+    """[FIX LSTSQ-MEM] gelsd on one float64 Fortran copy of A, overwritten in place.
+
+    _to_dense_f64 hands spla.lstsq a C-ordered array, which LAPACK cannot use
+    in place, so lstsq copied it again: a dense m x k float64 solve peaked at
+    TWO float64 copies next to the caller's float32 block, 20 m k bytes in every
+    large RFE round and in the final refit.  This path makes the one copy in
+    LAPACK's layout and lets gelsd consume it (12 m k with the float32 block).
+    Same driver and cond as spla.lstsq.
+
+    None (caller falls back to spla.lstsq): below PHEASY_LSTSQ_INPLACE_MIN_BYTES
+    (default 2e8), when the float64 view would alias the caller's own array,
+    for a non-finite y, or when LAPACK reports an error or returns a non-finite
+    solution (the fallback then raises the way it always did).
+    """
+    if not (isinstance(A, np.ndarray) or sp.issparse(A)) or len(A.shape) != 2:
+        return None
+    m, n = A.shape
+    if 8.0 * m * n < float(os.environ.get("PHEASY_LSTSQ_INPLACE_MIN_BYTES", "2e8")):
+        return None
+    if not np.isfinite(y64).all():
+        return None
+    if sp.issparse(A):
+        A64 = A.astype(np.float64).toarray(order="F")
+    else:
+        A64 = np.asfortranarray(A, dtype=np.float64)
+        if np.shares_memory(A64, A):
+            return None
+    # as spla.lstsq's check_finite: a NaN reaching gelsd trips xerbla, which
+    # stops the process on a reference-LAPACK build (column blocks: small temp)
+    for j in range(0, n, 256):
+        if not np.isfinite(A64[:, j:j + 256]).all():
+            return None
+    from scipy.linalg import lapack as _lapack
+    b = np.zeros((max(m, n), 1), dtype=np.float64, order="F")
+    b[:m, 0] = y64
+    gelsd, gelsd_lwork = _lapack.get_lapack_funcs(("gelsd", "gelsd_lwork"), (A64, b))
+    cond = float(np.finfo(np.float64).eps)
+    work, iwork, info = gelsd_lwork(m, n, 1, cond)
+    if info != 0:
+        return None
+    x, _s, _rank, info = gelsd(A64, b, int(np.ceil(work)), int(iwork), cond,
+                               overwrite_a=True, overwrite_b=True)
+    del A64
+    coef = np.array(x[:n, 0], dtype=np.float64)
+    if info != 0 or not np.isfinite(coef).all():
+        return None
+    return coef
 
 
 def _tsqr_qless(A, y, block_rows=40000, diag_floor=1e-12):
@@ -5624,6 +5678,10 @@ class _RFEGramCV(object):
         # K fold Grams + their sum + three round-sized temporaries
         return budget > 0 and 8.0 * (K + 4) * float(p) * float(p) <= budget
 
+    def release(self):
+        """Drop the p x p arrays; keep what backend_metadata reports."""
+        self.G = self.b = self.Gt = self.bt = None
+
     def local(self, idx):
         """Positions of the global column indices idx in self.cols, or None."""
         idx = np.asarray(idx, dtype=np.int64)
@@ -6668,6 +6726,11 @@ class _RFECVBase:
             _support_file = "rfe_support.npy"
         except Exception:
             _support_file = None
+        if gram is not None and isinstance(A, np.ndarray):
+            # [FIX RFE-GRAM-MEM] dense input's final solve below is QR/SVD on
+            # the n x k subset, not the Gram: free the 8(K+1)p^2 bytes of fold
+            # Grams first instead of holding both at the peak.
+            gram.release()
         if _best_loc is not None and not isinstance(A, np.ndarray):
             # [FIX RFE-GRAM] the selected support is inside the exact Gram: its
             # full-data normal equations are already in memory.  Dense input
