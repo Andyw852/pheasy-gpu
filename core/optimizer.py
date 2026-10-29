@@ -1292,6 +1292,23 @@ def _read_int_file(path):
     return None if raw == "max" else int(raw)
 
 
+def _cgroup_inactive_file(base, keys):
+    """Reclaimable (inactive) page cache charged to the cgroup at base, in bytes;
+    0 when memory.stat is unreadable or has none of keys."""
+    try:
+        with open(os.path.join(base, "memory.stat")) as fh:
+            stat = dict(line.split(None, 1) for line in fh if line.strip())
+    except (OSError, ValueError):
+        return 0
+    for key in keys:
+        if key in stat:
+            try:
+                return int(stat[key])
+            except ValueError:
+                return 0
+    return 0
+
+
 def _cgroup_memory_headroom():
     """Bytes left under this process's cgroup memory limit, or None (no limit).
 
@@ -1299,6 +1316,13 @@ def _cgroup_memory_headroom():
     sizing an allocation by the node alone gets the job OOM-killed.  cgroup v2:
     the tightest limit on the path from the leaf up; v1: the memory controller's
     own limit.
+
+    [FIX CGROUP-CACHE] the cgroup's usage counter includes its page cache, which
+    the kernel reclaims before it OOM-kills: limit - usage was the MemFree
+    mistake [FIX MEMAVAIL] removed at node level, back inside a memory-limited
+    cgroup (a job that has read a 19-38 GB SM cache or a 29 GB fc3 looks that
+    much fuller).  The headroom is limit minus the working set, usage minus
+    inactive_file (the kubelet / cAdvisor definition).
     """
     try:
         with open(_PROC_CGROUP_PATH) as fh:
@@ -1313,9 +1337,12 @@ def _cgroup_memory_headroom():
         hier, controllers, path = parts
         if hier == "0" and controllers == "":               # cgroup v2
             root, files = _CGROUP_ROOT, ("memory.max", "memory.current")
+            cache_keys = ("inactive_file",)
         elif "memory" in controllers.split(","):            # cgroup v1
             root = os.path.join(_CGROUP_ROOT, "memory")
             files = ("memory.limit_in_bytes", "memory.usage_in_bytes")
+            # usage_in_bytes is hierarchical: so is total_inactive_file
+            cache_keys = ("total_inactive_file", "inactive_file")
         else:
             continue
         rel = path.strip("/")
@@ -1329,7 +1356,8 @@ def _cgroup_memory_headroom():
             except (OSError, ValueError):
                 continue
             if limit is not None and usage is not None and limit < (1 << 60):
-                room = max(limit - usage, 0)
+                working_set = max(usage - _cgroup_inactive_file(base, cache_keys), 0)
+                room = max(limit - working_set, 0)
                 best = room if best is None else min(best, room)
     return best
 

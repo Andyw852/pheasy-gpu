@@ -485,6 +485,32 @@ class AvailableMemoryTests(unittest.TestCase):
         self._write("cgroup/memory/job/memory.usage_in_bytes", str(2 * self.GB))
         self.assertEqual(self._avail(36, 166, "4:memory:/job\n"), 30 * self.GB)
 
+    def test_cgroup_page_cache_is_reclaimable(self):
+        # [FIX CGROUP-CACHE] usage counts page cache: headroom = limit - working set
+        self._write("cgroup/job/memory.max", str(64 * self.GB))
+        self._write("cgroup/job/memory.current", str(50 * self.GB))
+        self._write("cgroup/job/memory.stat",
+                    "anon %d\nfile %d\nactive_file %d\ninactive_file %d\n"
+                    % (15 * self.GB, 35 * self.GB, 5 * self.GB, 30 * self.GB))
+        self.assertEqual(self._avail(36, 166, "0::/job\n"), 44 * self.GB)
+
+    def test_cgroup_v1_total_inactive_file(self):
+        self._write("cgroup/memory/job/memory.limit_in_bytes", str(32 * self.GB))
+        self._write("cgroup/memory/job/memory.usage_in_bytes", str(20 * self.GB))
+        self._write("cgroup/memory/job/memory.stat",
+                    "inactive_file %d\ntotal_inactive_file %d\n"
+                    % (2 * self.GB, 12 * self.GB))
+        self.assertEqual(self._avail(36, 166, "4:memory:/job\n"), 24 * self.GB)
+
+    def test_cgroup_stat_inconsistent_or_missing(self):
+        # inactive_file above usage (racy reads) cannot make room above the limit
+        self._write("cgroup/job/memory.max", str(64 * self.GB))
+        self._write("cgroup/job/memory.current", str(10 * self.GB))
+        self._write("cgroup/job/memory.stat", "inactive_file %d\n" % (12 * self.GB))
+        self.assertEqual(self._avail(36, 166, "0::/job\n"), 64 * self.GB)
+        self._write("cgroup/job/memory.stat", "garbage\n")
+        self.assertEqual(self._avail(36, 166, "0::/job\n"), 54 * self.GB)
+
     def test_no_memavailable_falls_back_to_sysconf(self):
         got = self._avail(36, None)
         self.assertIsNotNone(got)
