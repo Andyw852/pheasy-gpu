@@ -213,6 +213,22 @@ Other method fixes in the same change:
   `PHEASY_GPU_RFE_RESIDENT=1` with `PHEASY_N_JOBS>1` serializes instead of
   failing, and RFE-OLS-TSQR no longer materializes a dense SM larger than
   `PHEASY_MAX_DENSE_GB`.
+* **Ridge solves are exact or recorded ([FIX RFE-RIDGE-EXACT], [FIX RIDGE-EXACT]):**
+  with `PHEASY_RFE_RIDGE_ALPHA > 0` every dense (or densified sparse) RFE
+  subset solve went to sklearn `Ridge(solver="lsqr")`: LSQR at tol 1e-4, in the
+  block's float32, with no stopping diagnostics. A tiny ridge (a driver's
+  1e-11) therefore silently replaced the exact gelsd rounds by early-stopped
+  iterates (35 % coefficient error at cond 2e3), which inflate the CV curve and
+  steer the elimination while `fit_accepted` stays True (observed on Mg4C60
+  `--fix_fc2` 3.0 A: round-0 CV 1.12e-2 under 1e-11 against 6.93e-3 from exact
+  rounds on the same support). Now gelsd on `[A; sqrt(alpha) I]`, or a damped
+  LSQR recorded for the acceptance gate when a sparse block is too large to
+  densify. `_ridge_solve` (RIDGE folds, the ALASSO initial estimate) had the
+  same hole through `solver="auto"` (float32 Cholesky / sparse_cg at 1e-4:
+  3.8 % / 55 % error): now float64 normal equations over row blocks, or the
+  recorded damped LSQR. The dense RFE final refit honours the delivered-refit
+  contract (unregularized unless `PHEASY_RFE_FINAL_RIDGE`); it used
+  `PHEASY_RFE_RIDGE_ALPHA`.
 * **ARDR / RVM with `--std` ([FIX ARD-YSTD], [FIX RVM-CYCLE]):** the pruning
   threshold lambda_t = 1e4 (hiphive / trainstation, Fransson et al. 2020) is
   defined with the columns AND the forces standardized; `--std` scaled only the

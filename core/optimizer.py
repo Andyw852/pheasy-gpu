@@ -1244,13 +1244,14 @@ def _iterative_solver_info(result, solver, scope=None):
     return info
 
 
-def _solve_sparse_lsqr(A, y, info=None, scope=None, maxiter=None):
+def _solve_sparse_lsqr(A, y, info=None, scope=None, maxiter=None, damp=0.0):
     """Iterative least squares (LSQR) for sparse / LinearOperator input.
 
     Only needs matvec / rmatvec, so peak memory is ~O(n_features) instead of
     densifying the sensing matrix (which for e.g. 685968 x 51590 would be
     ~280 GB). This is the same Krylov approach used by symfc / phonopy.
     scope / maxiter: see _iterative_solver_info and _solve_subset.
+    damp: sqrt(ridge alpha), i.e. min ||A x - y||^2 + damp^2 ||x||^2.
     """
     from scipy.sparse.linalg import lsqr as _sp_lsqr
     # Pass the matrix: the floor is a property of the STORED data, so a sparse
@@ -1261,7 +1262,7 @@ def _solve_sparse_lsqr(A, y, info=None, scope=None, maxiter=None):
     iter_lim = (int(maxiter) if maxiter is not None
                 else int(os.environ.get("PHEASY_LSQR_MAXITER", "5000")))
     y64 = np.asarray(y, dtype=np.float64).ravel()
-    res = _sp_lsqr(A, y64, atol=atol, btol=btol, iter_lim=iter_lim)
+    res = _sp_lsqr(A, y64, damp=float(damp), atol=atol, btol=btol, iter_lim=iter_lim)
     diagnostics = _iterative_solver_info(res, "LSQR", scope=scope)
     if info is not None:
         info.update(diagnostics)
@@ -1582,9 +1583,16 @@ def _gelsd_owned_copy(A, y64):
     for j in range(0, n, 256):
         if not np.isfinite(A64[:, j:j + 256]).all():
             return None
+    return _gelsd_fortran_inplace(A64, y64)
+
+
+def _gelsd_fortran_inplace(A64, rhs):
+    """argmin ||A64 x - rhs|| by gelsd (spla.lstsq's driver and cond), consuming
+    the float64 Fortran array A64.  None on a LAPACK error or a non-finite x."""
     from scipy.linalg import lapack as _lapack
+    m, n = A64.shape
     b = np.zeros((max(m, n), 1), dtype=np.float64, order="F")
-    b[:m, 0] = y64
+    b[:m, 0] = rhs
     gelsd, gelsd_lwork = _lapack.get_lapack_funcs(("gelsd", "gelsd_lwork"), (A64, b))
     cond = float(np.finfo(np.float64).eps)
     work, iwork, info = gelsd_lwork(m, n, 1, cond)
@@ -1592,10 +1600,39 @@ def _gelsd_owned_copy(A, y64):
         return None
     x, _s, _rank, info = gelsd(A64, b, int(np.ceil(work)), int(iwork), cond,
                                overwrite_a=True, overwrite_b=True)
-    del A64
     coef = np.array(x[:n, 0], dtype=np.float64)
     if info != 0 or not np.isfinite(coef).all():
         return None
+    return coef
+
+
+def _ridge_lstsq_exact(A, y64, alpha):
+    """[FIX RFE-RIDGE-EXACT] min ||A x - y||^2 + alpha ||x||^2, exactly: gelsd on
+    the augmented [A; sqrt(alpha) I] (one float64 Fortran array, 8 (m+k) k bytes).
+
+    The dense ridge subset solve of RFE was sklearn Ridge(solver="lsqr"): LSQR
+    at sklearn's tol=1e-4, in the precision of the block (float32 for a float32
+    SM), with no stopping diagnostics.  A driver's tiny PHEASY_RFE_RIDGE_ALPHA
+    (1e-11) therefore silently replaced every exact gelsd round by an
+    early-stopped iterate (35 % coefficient error at cond 2e3 measured), which
+    inflated the CV curve and steered the elimination while fit_accepted stayed
+    True (observed on Mg4C60 --fix_fc2 3.0 A: round-0 CV 1.12e-2 under the
+    driver's 1e-11 against 6.93e-3 from exact rounds, same 10540-column support).
+    """
+    m, k = A.shape
+    y64 = np.asarray(y64, dtype=np.float64).ravel()
+    A64 = np.zeros((m + k, k), dtype=np.float64, order="F")
+    A64[:m] = A.toarray() if sp.issparse(A) else A
+    for j in range(0, k, 256):
+        if not np.isfinite(A64[:m, j:j + 256]).all():
+            raise ValueError("ridge subset solve: the sensing matrix block contains "
+                             "infs or NaNs")
+    if not np.isfinite(y64).all():
+        raise ValueError("ridge subset solve: the forces contain infs or NaNs")
+    A64[m + np.arange(k), np.arange(k)] = np.sqrt(float(alpha))
+    coef = _gelsd_fortran_inplace(A64, np.concatenate([y64, np.zeros(k)]))
+    if coef is None:
+        raise np.linalg.LinAlgError("ridge subset solve: gelsd did not converge")
     return coef
 
 
@@ -2829,10 +2866,47 @@ def _ridge_solve(A, y, alpha, x0=None):
     if _gpu_dense(A):
         return np.asarray(_gpu().ridge_solve(_dense_for_gpu(A), y64, alpha), dtype=np.float64)
     if alpha > 0:
-        ridge = Ridge(alpha=alpha, fit_intercept=False, solver="auto")
-        ridge.fit(A, y64)
-        return ridge.coef_
+        # [FIX RIDGE-EXACT] was sklearn Ridge(solver="auto"): Cholesky in the
+        # block's float32 for a dense float32 SM (3.8 % coefficient error at
+        # cond 2e3) and sparse_cg at tol=1e-4 for a sparse one (55 %), with no
+        # diagnostics -- e.g. the ALASSO initial estimate behind its weights.
+        if sp.issparse(A) and not _should_densify_sparse(A):
+            _info = {}
+            coef = _solve_sparse_lsqr(A, y64, info=_info, damp=float(np.sqrt(alpha)))
+            try:
+                A._ridge_solver_info = dict(_info, alpha=float(alpha),
+                                            backend="cpu_lsqr_ridge")
+            except AttributeError:
+                pass
+            return coef
+        return _ridge_normal_f64(A, y64, alpha)
     return _solve_lstsq(A, y64)
+
+
+def _ridge_normal_f64(A, y64, alpha, block_rows=20000):
+    """[FIX RIDGE-EXACT] min ||A x - y||^2 + alpha ||x||^2 (alpha > 0) from float64
+    normal equations accumulated over row blocks (dense or densifiable sparse A):
+    p^2 memory like the GPU ridge_solve, never a full float64 copy of A."""
+    if sp.issparse(A) and A.format not in ("csr", "csc"):
+        A = A.tocsr()
+    m, n = A.shape
+    G = np.zeros((n, n), dtype=np.float64)
+    b = np.zeros(n, dtype=np.float64)
+    for i0 in range(0, m, block_rows):
+        i1 = min(i0 + block_rows, m)
+        B = A[i0:i1]
+        B = np.asarray(B.toarray() if sp.issparse(B) else B, dtype=np.float64)
+        G += B.T @ B
+        b += B.T @ y64[i0:i1]
+    if not (np.isfinite(G).all() and np.isfinite(b).all()):
+        raise ValueError("ridge solve: the sensing matrix or the forces contain "
+                         "infs or NaNs")
+    G.flat[:: n + 1] += float(alpha)
+    try:
+        return spla.cho_solve(spla.cho_factor(G, check_finite=False), b,
+                              check_finite=False)
+    except np.linalg.LinAlgError:
+        return spla.lstsq(G, b, cond=None, lapack_driver="gelsd")[0]
 
 
 
@@ -2852,7 +2926,7 @@ def _solve_subset(A, y, row_idx, col_idx, ridge_alpha=0.0, qr=False,
     if row_idx is not None:
         y_sub = y_sub[row_idx]
 
-    def _lstsq_recorded(A_sub, y_sub):
+    def _lstsq_recorded(A_sub, y_sub, ridge=0.0):
         # [FIX RFE-LSQR-DIAG] a sparse subset too big to densify goes to LSQR.
         # Record it in diag_sink like the operator branch's LSMR: unrecorded,
         # its non-convergence never reached the acceptance gate and a float32
@@ -2862,11 +2936,13 @@ def _solve_subset(A, y, row_idx, col_idx, ridge_alpha=0.0, qr=False,
             coef = _solve_sparse_lsqr(
                 A_sub, y_sub, info=_info,
                 scope=diag_scope if diag_sink is not None else None,
-                maxiter=maxiter_override)
+                maxiter=maxiter_override, damp=float(np.sqrt(ridge)))
             if diag_sink is not None:
                 diag_sink.append(dict(_info, fit_scope=diag_scope,
                                       n_features=int(len(col_idx))))
             return coef
+        if ridge > 0:
+            return _ridge_lstsq_exact(A_sub, y_sub, ridge)
         return _solve_lstsq(A_sub, y_sub)
 
     if _is_linear_operator(A):
@@ -2928,9 +3004,9 @@ def _solve_subset(A, y, row_idx, col_idx, ridge_alpha=0.0, qr=False,
         # Dense subset ridge solves use the CUDA backend when the block fits.
         if _gpu_dense(A_sub):
             return np.asarray(_gpu().ridge_solve(_dense_for_gpu(A_sub), y_sub, ridge_alpha), dtype=np.float64)
-        ridge = Ridge(alpha=ridge_alpha, fit_intercept=False, solver="lsqr")
-        ridge.fit(A_sub, y_sub)
-        return ridge.coef_
+        # [FIX RFE-RIDGE-EXACT] exact augmented gelsd (or recorded damped LSQR
+        # for a sparse block too big to densify), not sklearn's silent LSQR
+        return _lstsq_recorded(A_sub, y_sub, ridge_alpha)
     if _gpu_dense(A_sub):
         # RFE ranks features by |coef|*||col||; QR (gels) is backward-stable for
         # full-rank subsets and ~50x faster than the SVD on the 3090. The SVD
@@ -6381,7 +6457,8 @@ class _RFECVBase:
                 resident_norms = torch.as_tensor(col_norms, dtype=_resident_value_dtype(resident_A, torch), device=resident_A.device)
             return resident_norms.index_select(0, cached_column_tensor)
 
-        def solve(col_idx, row_idx=None, download=True, scope=None, maxiter=None):
+        def solve(col_idx, row_idx=None, download=True, scope=None, maxiter=None,
+                  ridge=None):
             nonlocal gpu_subset_solves, full_fit_coef, resident_subset_builds
             if resident_operator:
                 columns = resident_columns(col_idx)
@@ -6431,14 +6508,22 @@ class _RFECVBase:
                     return coef
                 full_fit_coef = coef
                 return resident_backend._to_numpy(coef, np.float64) if download else None
-            if not _is_linear_operator(A):
+            if isinstance(A, np.ndarray):
+                # [FIX RFE-GRAM-MEM] judge the GPU footprint from the shape: the
+                # A[:, col_idx] probe was a 4 n k byte copy alive through the solve
+                _gb = _gpu()
+                if _gb is not None and _gpu_footprint_ok(
+                        _gb, A.shape[0] if row_idx is None else len(row_idx), len(col_idx)):
+                    gpu_subset_solves += 1
+            elif not _is_linear_operator(A):
                 _probe = A[:, col_idx]
                 if row_idx is not None:
                     _probe = _probe[row_idx]
                 if _gpu_dense(_probe):
                     gpu_subset_solves += 1
+                del _probe
             return _solve_subset(A, y, row_idx, col_idx,
-                                 self.ridge_alpha, _qr,
+                                 self.ridge_alpha if ridge is None else ridge, _qr,
                                  lsmr_atol=self.lsmr_atol,
                                  lsmr_btol=self.lsmr_btol,
                                  lsmr_maxiter=self.lsmr_maxiter,
@@ -6784,7 +6869,12 @@ class _RFECVBase:
                          "asked for" if _f32_in else ""),
                       flush=True)
             _n_diag = len(iterative_diagnostics)
-            coef_final = solve(best_idx, maxiter=_final_cap)
+            # [FIX RFE-CONTRACT] a host (dense / densified) final solve is the
+            # delivered refit too: unregularized unless PHEASY_RFE_FINAL_RIDGE,
+            # as the exact and Gram refits; PHEASY_RFE_RIDGE_ALPHA was applied here
+            coef_final = solve(best_idx, maxiter=_final_cap,
+                               ridge=(None if _is_linear_operator(A) or resident_operator
+                                      or resident_A is not None else _rfe_final_ridge()))
             # [FIX LSMR-CERT] istop=2 is not a certificate on its own
             _final = [d for d in iterative_diagnostics[_n_diag:]
                       if isinstance(d, dict) and d.get("fit_scope") == "full"]

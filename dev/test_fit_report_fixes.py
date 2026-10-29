@@ -984,6 +984,46 @@ class RfeDenseGramTests(unittest.TestCase):
         self.assertIn("final refit: direct least-squares solve", glog)
         self.assertTrue(g["fit_accepted"])
 
+    def test_ridge_rounds_match_the_gram_engine(self):
+        # [FIX RFE-RIDGE-EXACT] PHEASY_RFE_RIDGE_ALPHA > 0 sent every QR round of
+        # dense input to sklearn's LSQR: a different CV curve and support than
+        # the (exact) Gram engine on the same data
+        rng = np.random.default_rng(16)
+        Z = rng.normal(size=(600, 20))
+        A = np.hstack([Z, Z + 0.05 * rng.normal(size=Z.shape)]) * np.geomspace(1.0, 40.0, 40)
+        y = A @ (rng.normal(size=40) * (rng.random(40) < 0.3)) + 0.5 * rng.normal(size=600)
+        A = A.astype(np.float32)
+        import re
+        with patch.dict(os.environ, {"PHEASY_RFE_RIDGE_ALPHA": "1e-11"}):
+            g, glog = self._fit(A, y, "1")
+            q, qlog = self._fit(A, y, "0")
+        self.assertGreater(g["backend_metadata"]["gram_exact_rounds"], 0)
+        self.assertEqual(q["backend_metadata"]["gram_exact_rounds"], 0)
+        np.testing.assert_array_equal(np.flatnonzero(g["coef"]), np.flatnonzero(q["coef"]))
+        curve = lambda log: [float(v) for v in re.findall(r"CV_RMSE=([0-9.e+-]+)", log)]
+        self.assertGreater(len(curve(glog)), 3)
+        np.testing.assert_allclose(curve(glog), curve(qlog), rtol=1e-5)
+
+    def test_dense_final_refit_is_unregularized(self):
+        # [FIX RFE-CONTRACT] PHEASY_RFE_RIDGE_ALPHA regularizes ranking and CV
+        # only; the delivered dense refit is OLS (PHEASY_RFE_FINAL_RIDGE opts in)
+        rng = np.random.default_rng(17)
+        A = rng.normal(size=(600, 30)) * np.geomspace(1.0, 30.0, 30)
+        y = A[:, :8] @ rng.normal(size=8) + 0.05 * rng.normal(size=600)
+        for gram_dense in ("0", "1"):
+            with patch.dict(os.environ, {"PHEASY_RFE_RIDGE_ALPHA": "100"}):
+                r, _ = self._fit(A, y, gram_dense)
+            sup = np.flatnonzero(r["coef"])
+            ols = np.linalg.lstsq(A[:, sup], y, rcond=None)[0]
+            np.testing.assert_allclose(r["coef"][sup], ols, rtol=1e-8, atol=1e-12)
+            with patch.dict(os.environ, {"PHEASY_RFE_RIDGE_ALPHA": "100",
+                                         "PHEASY_RFE_FINAL_RIDGE": "100"}):
+                r, _ = self._fit(A, y, gram_dense)
+            sup = np.flatnonzero(r["coef"])
+            As = A[:, sup]
+            rdg = np.linalg.solve(As.T @ As + 100.0 * np.eye(sup.size), As.T @ y)
+            np.testing.assert_allclose(r["coef"][sup], rdg, rtol=1e-8, atol=1e-12)
+
     def test_fold_grams_released_before_the_dense_final_solve(self):
         # [FIX RFE-GRAM-MEM] the dense final solve does not use the Grams
         rng = np.random.default_rng(13)
@@ -1002,6 +1042,99 @@ class RfeDenseGramTests(unittest.TestCase):
         self.assertGreater(meta["gram_exact_rounds"], 0)
         self.assertGreater(meta["gram_bytes"], 0)
         self.assertTrue(g["fit_accepted"])
+
+
+class RidgeSubsetExactTests(unittest.TestCase):
+    """[FIX RFE-RIDGE-EXACT] a ridge subset solve is exact (or a recorded LSQR),
+    never sklearn's silent tol=1e-4 LSQR in the block's float32."""
+
+    def setUp(self):
+        rng = np.random.default_rng(15)
+        m, p = 4000, 120
+        Z = rng.normal(size=(m, p // 3))
+        A = np.hstack([Z, Z + 0.05 * rng.normal(size=Z.shape),
+                       Z + 0.02 * rng.normal(size=Z.shape)]) * np.geomspace(1.0, 40.0, p)
+        self.A32 = A.astype(np.float32)
+        self.A = self.A32.astype(np.float64)
+        self.y = self.A @ (rng.normal(size=p) * (rng.random(p) < 0.3)) + 0.5 * rng.normal(size=m)
+        self.cols = np.arange(p)
+
+    def _ridge(self, A, y, alpha):
+        return np.linalg.solve(A.T @ A + alpha * np.eye(A.shape[1]), A.T @ y)
+
+    def _solve(self, alpha, **kw):
+        env = {"PHEASY_USE_GPU": "0", "PHEASY_GPU_MODE": "cpu"}
+        with patch.dict(os.environ, env), \
+                patch.object(opt, "Ridge", side_effect=AssertionError("sklearn Ridge")):
+            return opt._solve_subset(self.A32, self.y, kw.pop("rows", None), self.cols,
+                                     alpha, **kw)
+
+    def test_tiny_ridge_is_the_least_squares_solution(self):
+        x = self._solve(1e-11)
+        ref = np.linalg.lstsq(self.A, self.y, rcond=None)[0]
+        self.assertLess(np.linalg.norm(x - ref) / np.linalg.norm(ref), 1e-8)
+
+    def test_large_ridge_and_row_subset(self):
+        rows = np.arange(0, 4000, 3)
+        x = self._solve(50.0, rows=rows)
+        ref = self._ridge(self.A[rows], self.y[rows], 50.0)
+        np.testing.assert_allclose(x, ref, rtol=1e-8, atol=1e-12)
+
+    def test_sparse_too_big_to_densify_is_a_recorded_damped_lsqr(self):
+        import scipy.sparse as sps
+        sink = []
+        with patch.object(opt, "_should_densify_sparse", return_value=False), \
+                patch.dict(os.environ, {"PHEASY_USE_GPU": "0", "PHEASY_GPU_MODE": "cpu",
+                                        "PHEASY_LSQR_MAXITER": "20000"}):
+            x = opt._solve_subset(sps.csr_matrix(self.A), self.y, None, self.cols, 50.0,
+                                  diag_sink=sink, diag_scope="fold")
+        self.assertEqual(len(sink), 1)
+        self.assertEqual(sink[0]["solver"], "LSQR")
+        self.assertEqual(sink[0]["fit_scope"], "fold")
+        ref = self._ridge(self.A, self.y, 50.0)
+        self.assertLess(np.linalg.norm(x - ref) / np.linalg.norm(ref), 1e-4)
+
+    def test_nonfinite_block_raises(self):
+        self.A32[5, 7] = np.nan
+        with self.assertRaises(ValueError):
+            self._solve(1e-11)
+
+
+class RidgeSolveExactTests(RidgeSubsetExactTests):
+    """[FIX RIDGE-EXACT] _ridge_solve (RIDGE folds, the ALASSO initial estimate)
+    on dense / sparse float32 input: float64 normal equations or a recorded
+    damped LSQR, not sklearn's float32 Cholesky / tol=1e-4 sparse_cg."""
+
+    def _rs(self, M, alpha, **env):
+        env = dict({"PHEASY_USE_GPU": "0", "PHEASY_GPU_MODE": "cpu"}, **env)
+        with patch.dict(os.environ, env), \
+                patch.object(opt, "Ridge", side_effect=AssertionError("sklearn Ridge")):
+            return opt._ridge_solve(M, self.y, alpha)
+
+    def test_dense_and_densifiable_sparse(self):
+        import scipy.sparse as sps
+        for alpha in (1e-6, 10.0):
+            ref = self._ridge(self.A, self.y, alpha)
+            for M in (self.A32, sps.coo_matrix(self.A32)):
+                x = self._rs(M, alpha)
+                self.assertLess(np.linalg.norm(x - ref) / np.linalg.norm(ref), 1e-8)
+
+    def test_sparse_too_big_to_densify_records_its_lsqr(self):
+        import scipy.sparse as sps
+        M = sps.csr_matrix(self.A)      # float32 storage would stop at its floor
+        with patch.object(opt, "_should_densify_sparse", return_value=False):
+            x = self._rs(M, 10.0, PHEASY_LSQR_MAXITER="20000")
+        info = M._ridge_solver_info
+        self.assertEqual(info["solver"], "LSQR")
+        self.assertEqual(info["backend"], "cpu_lsqr_ridge")
+        self.assertEqual(info["alpha"], 10.0)
+        ref = self._ridge(self.A, self.y, 10.0)
+        self.assertLess(np.linalg.norm(x - ref) / np.linalg.norm(ref), 1e-4)
+
+    def test_nonfinite_block_raises(self):
+        self.A32[5, 7] = np.inf
+        with self.assertRaises(ValueError):
+            self._rs(self.A32, 1.0)
 
 
 class LstsqMemoryTests(unittest.TestCase):
