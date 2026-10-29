@@ -44,9 +44,10 @@ python -m venv .venv
 ```
 
 For CUDA, add the `[gpu]` extra: `.venv/bin/python -m pip install -e '.[gpu]'`.
-Each fit writes a `fit_manifest.json` recording the method, resolved GPU
-environment variables, dependency versions, backend, convergence diagnostics and
-`fit_accepted`/`status`; an unaccepted fit refuses to write force constants
+Each fit writes a `fit_manifest.json` recording the method, every `PHEASY_*`
+variable the fit process saw (`environment`), the path and md5 of the
+`core/optimizer.py` and `run_pheasy.py` it actually loaded (`code`), dependency
+versions, backend, convergence diagnostics and `fit_accepted`/`status`; an unaccepted fit refuses to write force constants
 unless `PHEASY_ALLOW_UNACCEPTED_FIT=1` is set.
 
 ## Fitting methods (`-l`)

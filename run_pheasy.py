@@ -1782,8 +1782,22 @@ class WorkFlow(object):
                     _versions[_pkg] = _imeta.version(_pkg) if _imeta is not None else "unknown"
                 except Exception:
                     _versions[_pkg] = "unavailable"
+            # [FIX PROVENANCE] which pheasy files this fit actually ran: a driver
+            # probing its own interpreter can load a different copy than the fit
+            _code = {}
+            for _cname, _cmod in (("optimizer", "pheasy_gpu.core.optimizer"),
+                                  ("run_pheasy", __name__)):
+                try:
+                    import hashlib as _hl
+                    import sys as _csys
+                    _cfile = os.path.abspath(_csys.modules[_cmod].__file__)
+                    with open(_cfile, "rb") as _cf:
+                        _code[_cname] = {"path": _cfile,
+                                         "md5": _hl.md5(_cf.read()).hexdigest()}
+                except Exception as _cexc:
+                    _code[_cname] = {"error": type(_cexc).__name__}
             with open("fit_manifest.json", "w") as _mf:
-                _fit_json.dump({"model": settings.MODEL, "python": _fit_platform.python_version(), "platform": _fit_platform.platform(), "versions": _versions, "environment": _gpu_env, "results": _manifest_value(fit_results), "metrics": _manifest_value(fit_metrics),
+                _fit_json.dump({"model": settings.MODEL, "python": _fit_platform.python_version(), "platform": _fit_platform.platform(), "versions": _versions, "environment": _gpu_env, "code": _code, "results": _manifest_value(fit_results), "metrics": _manifest_value(fit_metrics),
                                 # the symmetry that constrained this fit (+ the
                                 # looser-tolerance probe) and the effective
                                 # [HARM_DENSE] state, which the environment

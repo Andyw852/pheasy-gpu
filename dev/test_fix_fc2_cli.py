@@ -125,6 +125,14 @@ class FixFc2CliTests(unittest.TestCase):
         self.assertGreater(fm["re"], 0.5)              # residual is mostly noise ...
         self.assertAlmostEqual(fm["rmse"] / jm["rmse"], 1.0, delta=rtol)
         self.assertAlmostEqual(fm["re_total_forces"] / jm["re"], 1.0, delta=rtol)
+        # [FIX PROVENANCE] the manifest names the files the fit actually ran
+        import hashlib
+        for name, rel in (("optimizer", "core/optimizer.py"), ("run_pheasy", "run_pheasy.py")):
+            code = fixed["code"][name]
+            self.assertEqual(Path(code["path"]).resolve(), (ROOT / rel).resolve())
+            self.assertEqual(code["md5"], hashlib.md5((ROOT / rel).read_bytes()).hexdigest())
+        self.assertEqual(fixed["environment"]["PHEASY_SM_DTYPE"],
+                         "float32" if rtol > 1e-6 else "float64")
 
     def test_ols_float64_reproduces_the_joint_fit(self):
         self._check(*self._case("OLS", "float64"), rtol=1e-9, sparse=False)
