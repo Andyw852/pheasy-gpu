@@ -1050,6 +1050,49 @@ class RfeDenseGramTests(unittest.TestCase):
             rdg = np.linalg.solve(As.T @ As + 100.0 * np.eye(sup.size), As.T @ y)
             np.testing.assert_allclose(r["coef"][sup], rdg, rtol=1e-8, atol=1e-12)
 
+    def test_support_override_cv_reproduces_the_selected_round(self):
+        # [FIX RFE-SUPPORT-CV] PHEASY_RFE_SUPPORT_CV=1 scores a saved support
+        # with the rounds' grouped folds: the selected support scores what its
+        # round scored, through the Gram engine and through QR folds alike
+        import re
+        import tempfile
+        import warnings
+        rng = np.random.default_rng(18)
+        A = rng.normal(size=(600, 40)) * np.geomspace(1.0, 30.0, 40)
+        y = A[:, :9] @ rng.normal(size=9) + 0.05 * rng.normal(size=600)
+        base = {"PHEASY_USE_GPU": "0", "PHEASY_GPU_SM": "0", "PHEASY_GPU_MODE": "cpu",
+                "PHEASY_CV_GROUP_SIZE": "12", "PHEASY_RFE_STEP": "0.1",
+                "PHEASY_RFE_GRAM_GB": "4"}
+
+        def fit(extra):
+            o = opt.Optimizer("RFE-OLS", cv=5, rand_seed=0, use_gpu=False)
+            with patch.dict(os.environ, dict(base, **extra)), warnings.catch_warnings(), \
+                    contextlib.redirect_stdout(io.StringIO()) as log:
+                warnings.simplefilter("ignore")
+                o.fit(A, y)
+            return o.results, log.getvalue()
+
+        cwd = os.getcwd()
+        os.chdir(tempfile.mkdtemp(prefix="rfe_support_cv_"))
+        try:
+            r0, log0 = fit({})
+            sup = os.path.abspath("rfe_support.npy")
+            sel = re.search(r"\[RFE\] selected: n_active=(\d+), CV=([0-9.e+-]+)", log0)
+            n_sel, cv_sel = int(sel.group(1)), float(sel.group(2))
+            for gram_gb, engine in (("4", "gram"), ("0", "qr")):
+                r, log = fit({"PHEASY_RFE_SUPPORT_NPY": sup, "PHEASY_RFE_SUPPORT_CV": "1",
+                              "PHEASY_RFE_GRAM_GB": gram_gb})
+                cv = r["backend_metadata"]["support_override_cv"]
+                self.assertEqual(cv["engine"], engine)
+                self.assertEqual(cv["n_active"], n_sel)
+                self.assertAlmostEqual(cv["cv_mean"] / cv_sel, 1.0, delta=2e-6)
+                self.assertIn("support override CV", log)
+                np.testing.assert_allclose(r["coef"], r0["coef"], rtol=1e-9, atol=1e-12)
+            r, _ = fit({"PHEASY_RFE_SUPPORT_NPY": sup})      # default: no CV, as before
+            self.assertIsNone(r["backend_metadata"]["support_override_cv"])
+        finally:
+            os.chdir(cwd)
+
     def test_fold_grams_released_before_the_dense_final_solve(self):
         # [FIX RFE-GRAM-MEM] the dense final solve does not use the Grams
         rng = np.random.default_rng(13)

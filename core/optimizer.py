@@ -6780,6 +6780,7 @@ class _RFECVBase:
             round_num += 1
 
         # --- selection (each criterion prints its own summary, once) ---
+        _override_cv = None
         if _support_override is not None:
             best_support = np.zeros(n_features, dtype=bool)
             best_support[_support_override] = True
@@ -6788,6 +6789,31 @@ class _RFECVBase:
             if self.verbose:
                 print("[RFE] support override: n_active=%d (rounds skipped)" % n_best,
                       flush=True)
+            if _env_on("PHEASY_RFE_SUPPORT_CV", "0"):
+                # [FIX RFE-SUPPORT-CV] score a saved support with the same grouped
+                # folds the rounds use (report only; the refit below is unchanged),
+                # so two supports of one data set can be compared by CV +- SE
+                _sel = np.where(best_support)[0]
+                _engine = "qr"
+                _g = None
+                if _RFEGramCV.fits(_sel.size, len(splits), gram_budget):
+                    try:
+                        _g = _RFEGramCV(A, y, _sel, splits, ridge_alpha=self.ridge_alpha)
+                    except (MemoryError, ValueError, np.linalg.LinAlgError):
+                        _g = None
+                if _g is not None:
+                    _, best_mean, best_se, _ = _g.round(np.arange(_sel.size))
+                    _engine = "gram"
+                    del _g
+                else:
+                    best_mean, best_se, _ = _cv_rmse(
+                        A, y, _sel, solve, splits, n_jobs=self.n_jobs,
+                        predict=predict_subset,
+                        score=score_subset if resident_A is not None else None)
+                _override_cv = {"cv_mean": float(best_mean), "cv_se": float(best_se),
+                                "n_active": int(_sel.size), "engine": _engine}
+                print("[RFE] support override CV: n_active=%d  CV_RMSE=%.6e (+-%.2e)  [%s]"
+                      % (_sel.size, best_mean, best_se, _engine), flush=True)
         elif criterion in ("bic", "aic") and history_bic:
             best_round = int(np.argmin([h[1] for h in history_bic]))
             n_best = history_bic[best_round][0]
@@ -6922,7 +6948,7 @@ class _RFECVBase:
         # for a fit in which no cross-validation ever ran -- reachable whenever
         # n_features <= min_features (RFE-OLS-TSQR defaults to min_features=100).
         # Report it as not-evaluated instead of as a perfect score.
-        self.cv_evaluated = bool(round_num > 0)
+        self.cv_evaluated = bool(round_num > 0 or _override_cv is not None)
         self.best_rmse_cv_ = float(best_mean) if self.cv_evaluated else float("nan")
         self.ridge_alpha = self.ridge_alpha
         self.alphas_ = np.array([self.ridge_alpha])
@@ -6933,6 +6959,8 @@ class _RFECVBase:
             # the selected support: its size and the file it was saved to
             "n_active": int(best_idx.size),
             "n_candidates": int(n_features),
+            # PHEASY_RFE_SUPPORT_CV=1 with a support override: its grouped CV
+            "support_override_cv": _override_cv,
             "support_file": _support_file,
             "ic_n_eff": (int(self._bic_n_eff(n_samples)[0])
                          if criterion in ("bic", "aic") else None),
