@@ -1079,6 +1079,7 @@ class RfeDenseGramTests(unittest.TestCase):
             sup = os.path.abspath("rfe_support.npy")
             sel = re.search(r"\[RFE\] selected: n_active=(\d+), CV=([0-9.e+-]+)", log0)
             n_sel, cv_sel = int(sel.group(1)), float(sel.group(2))
+            folds = {}
             for gram_gb, engine in (("4", "gram"), ("0", "qr")):
                 r, log = fit({"PHEASY_RFE_SUPPORT_NPY": sup, "PHEASY_RFE_SUPPORT_CV": "1",
                               "PHEASY_RFE_GRAM_GB": gram_gb})
@@ -1086,8 +1087,13 @@ class RfeDenseGramTests(unittest.TestCase):
                 self.assertEqual(cv["engine"], engine)
                 self.assertEqual(cv["n_active"], n_sel)
                 self.assertAlmostEqual(cv["cv_mean"] / cv_sel, 1.0, delta=2e-6)
+                self.assertEqual(len(cv["fold_rmse"]), 5)
+                self.assertAlmostEqual(np.mean(cv["fold_rmse"]), cv["cv_mean"], places=12)
+                folds[engine] = cv["fold_rmse"]
                 self.assertIn("support override CV", log)
                 np.testing.assert_allclose(r["coef"], r0["coef"], rtol=1e-9, atol=1e-12)
+            # the same folds in the same order through both engines
+            np.testing.assert_allclose(folds["gram"], folds["qr"], rtol=1e-7)
             r, _ = fit({"PHEASY_RFE_SUPPORT_NPY": sup})      # default: no CV, as before
             self.assertIsNone(r["backend_metadata"]["support_override_cv"])
         finally:

@@ -5827,6 +5827,7 @@ class _RFEGramCV(object):
             mse = (self.yy[k] - 2.0 * float(xk @ bk) + float(xk @ (Gk @ xk))) / max(int(self.nk[k]), 1)
             rm[k] = np.sqrt(max(mse, 0.0))
         se = float(rm.std(ddof=1) / np.sqrt(self.K)) if self.K > 1 else 0.0
+        self.last_fold_rmse = rm
         return x, float(rm.mean()), se, rss
 
 
@@ -6803,14 +6804,18 @@ class _RFECVBase:
                         _g = None
                 if _g is not None:
                     _, best_mean, best_se, _ = _g.round(np.arange(_sel.size))
+                    _folds = _g.last_fold_rmse
                     _engine = "gram"
                     del _g
                 else:
-                    best_mean, best_se, _ = _cv_rmse(
+                    best_mean, best_se, _folds = _cv_rmse(
                         A, y, _sel, solve, splits, n_jobs=self.n_jobs,
                         predict=predict_subset,
                         score=score_subset if resident_A is not None else None)
+                # per-fold values: two supports scored on the same folds are
+                # compared by their paired fold differences, not by two SEs
                 _override_cv = {"cv_mean": float(best_mean), "cv_se": float(best_se),
+                                "fold_rmse": [float(v) for v in np.ravel(_folds)],
                                 "n_active": int(_sel.size), "engine": _engine}
                 print("[RFE] support override CV: n_active=%d  CV_RMSE=%.6e (+-%.2e)  [%s]"
                       % (_sel.size, best_mean, best_se, _engine), flush=True)
