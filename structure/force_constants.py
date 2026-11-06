@@ -329,8 +329,11 @@ class ForceConstants(object):
         elif order == 3:
             shengbte.write_ifc3(self._ifcs[3], self._scell, clusters)
             if settings.HDF5:
+                # [FIX FC3-COMPACT] --fc3_compact overrides --full_ifc for the
+                # anharmonic hdf5 files only (fc2 stays as requested)
                 phono23py.write_ifc3(
-                    self._ifcs[3], self._scell, clusters, settings.FULL_IFC
+                    self._ifcs[3], self._scell, clusters,
+                    settings.FULL_IFC and not getattr(settings, "FC3_COMPACT", False)
                 )
             if settings.GPU_PBTE:
                 gpu_pbte.write_ifc3(self._ifcs[3], self._scell, clusters)
@@ -342,7 +345,8 @@ class ForceConstants(object):
             _na4 = self._scell.get_global_number_of_atoms()
             if settings.HDF5 and _na4 <= 80:
                 phono23py.write_ifc4(
-                    self._ifcs[4], self._scell, clusters, settings.FULL_IFC
+                    self._ifcs[4], self._scell, clusters,
+                    settings.FULL_IFC and not getattr(settings, "FC3_COMPACT", False)
                 )
             elif settings.HDF5:
                 logger.info(

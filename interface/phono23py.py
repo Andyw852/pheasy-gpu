@@ -173,6 +173,10 @@ def write_ifc2(Phi, scell, clusters, hdf5=False, full=False):
 
         with h5py.File("fc2.hdf5", "w") as fd:
             fd.create_dataset("fc2", data=ifc2, compression="gzip")
+            if not full:
+                # [FIX FC3-COMPACT] phonopy checks a compact file against its
+                # own primitive cell through this table
+                fd.create_dataset("p2s_map", data=np.asarray(scell.pmap, dtype="int64"))
 
 
 def write_ifc3(Phi, scell, clusters, full=False):
@@ -227,6 +231,11 @@ def write_ifc3(Phi, scell, clusters, full=False):
 
     with h5py.File("fc3.hdf5", "w") as fd:
         fd.create_dataset("fc3", data=ifc3, compression="gzip")
+        if not full:
+            # [FIX FC3-COMPACT] phono3py's read_fc3_from_hdf5 validates the
+            # compact first axis against its primitive cell with this table;
+            # without it a different primitive choice is read silently wrong
+            fd.create_dataset("p2s_map", data=first_atoms.astype("int64"))
 
 
 def write_ifc4(Phi, scell, clusters, full=False):

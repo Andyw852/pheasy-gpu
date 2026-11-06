@@ -301,6 +301,14 @@ pheasy-gpu --dim 3 3 3 -w 3 -f --c3 5.2 --ndata 45 -l OLS --full_ifc --hdf5
 
 ## Notes
 
+- `--fc3_compact` writes `fc3.hdf5` (and `fc4.hdf5`) in the phono3py compact
+  layout `(n_patom, natoms, natoms, 3, 3, 3)` with a `p2s_map` dataset, even
+  together with `--full_ifc` (which then only applies to fc2).  The full fc3
+  takes `natoms^3*27*8` bytes of memory when written and read (41 GB at 576
+  atoms) although gzip keeps the file small.  phono3py must use the same unit
+  cell as its primitive cell (`primitive_matrix=None`, `--pa P`); `p2s_map`
+  makes it refuse any other choice.  ShengBTE files are unaffected.
+
 - The `pheasy-gpu` CLI has no `--use-gpu` flag: GPU activation is via the
   `PHEASY_GPU_MODE=auto|cpu|required` (`auto` is the default). Legacy
   `PHEASY_USE_GPU=1/0` maps to `required/cpu`. `required` is the production

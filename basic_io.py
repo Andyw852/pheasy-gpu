@@ -712,6 +712,20 @@ class InputParser(argparse.ArgumentParser):
                     Only support Phonopy force constant format.""",
         )
         self.add_argument(
+            "--fc3_compact",
+            dest="FC3_COMPACT",
+            action="store_true",
+            default=False,
+            help="""Write fc3.hdf5 (and fc4.hdf5) in the phono3py compact format
+                    (n_patom, natoms, natoms, 3, 3, 3) with a p2s_map dataset,
+                    even when --full_ifc is given (which then applies to fc2
+                    only).  The full fc3 needs natoms^3*27*8 bytes in memory
+                    while it is written and read (41 GB for 576 atoms); the
+                    compact one is n_patom/natoms of that.  phono3py must then
+                    use the same unit cell as primitive cell
+                    (primitive_matrix=None / --pa P), which p2s_map enforces.""",
+        )
+        self.add_argument(
             "-o",
             "--log",
             dest="LOG_FILE",
