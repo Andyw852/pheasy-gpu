@@ -106,8 +106,11 @@ class TestPinnedAlphaFallback(unittest.TestCase):
     def test_sparse_problem_is_a_no_op(self):
         A, y, b = self._problem("sparse")
         with patch.dict(os.environ, {"PHEASY_LASSO_DEBIAS": "0"}):
+            # a seeded CV split: unseeded, the shuffled 2-fold split moved
+            # alpha* enough to lose to OLS now and then (flaky, ~1 run in 5)
             model = opt.Optimizer("LASSO", nalpha=20, alpha_auto=True, cv=2,
-                                  tol=1e-10, max_iter=20000, use_gpu=False)
+                                  tol=1e-10, max_iter=20000, use_gpu=False,
+                                  rand_seed=0)
             model.fit(A, y)
             res = model.results
             self.assertFalse(res["alpha_at_grid_edge"])
