@@ -215,6 +215,29 @@ Other method fixes in the same change:
   `PHEASY_GPU_RFE_RESIDENT=1` with `PHEASY_N_JOBS>1` serializes instead of
   failing, and RFE-OLS-TSQR no longer materializes a dense SM larger than
   `PHEASY_MAX_DENSE_GB`.
+* **`--rasr BH/H/BHH` and skewed supercells ([FIX RASR-RANK], [FIX WS-IMAGES]):**
+  two independent faults, both reproduced by `dev/test_ws_images.py` with an
+  exact central-spring FC2 (which satisfies Born-Huang and Huang).
+  (1) The invariance rows were folded into the null space one 9-row atom block
+  at a time; once a few blocks were in, the rest were already satisfied and
+  `null_space_dense` ranked their rounding noise against its own largest
+  singular value, removing random directions: 918 instead of 954 free FC2
+  parameters on a 7-atom R-3m 4x4x1 cell, the exact FC2 10 % outside the null
+  space, every BH/BHH fit refused by the alignment gate (correlation 0.989) or
+  12 % off, in reduced and skewed cells alike.  H alone (one block) was right.
+  All rows are now folded at once and ranked against the raw rows' scale
+  (logged as `[RASR] ... rank r ... -> n free parameters`).
+  (2) `NeighborList.wigner_seitz` searched only the 27 supercell translations
+  {-1,0,1}^3, which finds the nearest image only for a nearly reduced basis.
+  A rhombohedral primitive cell repeated N x N x 1 (here 54/54/13.5 A at
+  17 deg) got farther images for 198 of 784 pairs, truly from 4.6 A up: wrong
+  cutoff selection (66 FC2 pairs inside 7 A dropped), wrong r_ij in BH/H, wrong
+  ShengBTE fc3 vectors.  The search is now exact (bounded by the reciprocal
+  basis; same images in the same order wherever the old one was right), a
+  `[WS-IMAGES]` warning names affected cells, `fit_manifest.json` records
+  `geometry.ws_extended_pairs`, and caches built by the old search are rebuilt
+  only for affected cells.  `tools/ws_audit.py POSCAR --dim ... --c2 --c3`
+  checks a past run's cell without fitting.
 * **Ridge solves are exact or recorded ([FIX RFE-RIDGE-EXACT], [FIX RIDGE-EXACT]):**
   with `PHEASY_RFE_RIDGE_ALPHA > 0` every dense (or densified sparse) RFE
   subset solve went to sklearn `Ridge(solver="lsqr")`: LSQR at tol 1e-4, in the

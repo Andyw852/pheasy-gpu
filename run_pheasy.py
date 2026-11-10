@@ -378,6 +378,11 @@ class WorkFlow(object):
             # shaped the cache, so they must not gate it.
             "poscar": _content_sig("POSCAR"),
             "sposcar": _content_sig("SPOSCAR"),
+            # [FIX WS-IMAGES] pairs the pre-fix image search got wrong for this
+            # cell: a sidecar without the key predates the fix, which equals the
+            # fixed search exactly when this is 0 (see _check_cache_fingerprint)
+            "ws_extended_pairs": int(getattr(getattr(self, "nn_list", None),
+                                             "ws_extended_pairs", None) or 0),
         }
 
     def _check_cache_fingerprint(self, path, what):
@@ -407,7 +412,11 @@ class WorkFlow(object):
         # earlier version carries extra keys (e.g. rasr/do_rasr/nac used to be
         # fingerprinted), which made the plain dict comparison fail with an EMPTY
         # diff list -- a false "stale cache" refusal on every run.
-        diff = [k for k in now if old.get(k) != now[k]]
+        # [FIX WS-IMAGES] a sidecar from before the fix has no ws_extended_pairs:
+        # read it as 0, so the cache stays valid exactly where the old search was
+        # right, and a cell it got wrong rebuilds cs.pkl / the null space
+        diff = [k for k in now
+                if (old.get(k, 0) if k == "ws_extended_pairs" else old.get(k)) != now[k]]
         if diff:
             logger.error(
                 "%s (%s) was built for DIFFERENT settings: %s changed. Refusing "
@@ -1803,7 +1812,12 @@ class WorkFlow(object):
                                 # [HARM_DENSE] state, which the environment
                                 # block no longer shows once it is a default
                                 "symmetry": _manifest_value(getattr(self, "_symmetry_info", None)),
-                                "harm_dense": _manifest_value(getattr(self, "_harm_dense_info", None))}, _mf, indent=2, sort_keys=True)
+                                "harm_dense": _manifest_value(getattr(self, "_harm_dense_info", None)),
+                                # [FIX WS-IMAGES] pairs whose nearest image the
+                                # pre-fix search missed (0 = unaffected cell)
+                                "geometry": {"ws_extended_pairs": getattr(
+                                    getattr(self, "nn_list", None), "ws_extended_pairs", None)}},
+                               _mf, indent=2, sort_keys=True)
 
             # warn when alpha_opt sits at a grid edge (the CV wanted a value
             # outside the grid); this replaces the old shell retry loop.

@@ -521,11 +521,39 @@ class SymmetryConstraints(object):
                             ns_mat = normalize(ns_mat, axis=0)
                 ns_mat = spmat.coo_matrix(ns_mat)
             if order == 2 and self._rasr is not None:
+                # [FIX RASR-RANK] the invariance rows used to be folded in one
+                # 9-row block per atom: ns <- ns . null(B_k . ns).  Once a few
+                # blocks are in, the others are already satisfied, so B_k . ns
+                # is rounding noise (~1e-14) -- and null_space_dense's SVD branch
+                # (n_free > 500) ranks against ITS OWN largest singular value,
+                # so it counted ~9 noise directions per block as constraints.
+                # Measured on a 7-atom R-3m 4x4x1 cell with an exact
+                # central-spring FC2 (which satisfies BH and Huang): the 63 BH
+                # rows have rank 12 in the 966-column null space, the folded
+                # one kept 918 columns instead of 954 and left 10 % of the
+                # exact FC2 outside it, so every --rasr BH/BHH fit was refused
+                # by the alignment gate or 12 % off.  All rows are now folded
+                # at once, ranked against the scale of the raw rows.
                 ns_mat = ns_mat.toarray()
-                for cons_mat in cons_rasr:
-                    ns_mat_tmp = null_space_dense(cons_mat.dot(ns_mat), self._eps)
-                    ns_mat = ns_mat.dot(ns_mat_tmp)
-                    ns_mat = normalize(ns_mat, axis=0)
+                blocks = [np.asarray(cm.toarray() if spmat.issparse(cm) else cm)
+                          for cm in cons_rasr]
+                blocks = [b for b in blocks if b.size and np.any(b)]
+                if blocks:
+                    raw = np.vstack(blocks)
+                    prod = raw.dot(ns_mat)
+                    _, sv, vh = np.linalg.svd(prod, full_matrices=True)
+                    scale = float(np.linalg.norm(raw, axis=1).max())
+                    tol = max(float(sv[0]) * self._eps if sv.size else 0.0,
+                              scale * 1e-10)
+                    rank = int(np.sum(sv > tol))
+                    logger.info(
+                        "- [RASR] {} invariance rows, rank {} in the {}-column "
+                        "null space -> {} free parameters".format(
+                            raw.shape[0], rank, ns_mat.shape[1],
+                            ns_mat.shape[1] - rank))
+                    if rank:
+                        ns_mat = ns_mat.dot(vh[rank:].conj().T)
+                        ns_mat = normalize(ns_mat, axis=0)
                 ns_mat = spmat.coo_matrix(ns_mat)
             # [PATCH ns-rank] 丢弃数值上线性相关的列。
             # 实测 ns_harm(1296x608) 有 8 个近零奇异值 (4 个 ~2.5e-10 + 4 个 ~1e-15),

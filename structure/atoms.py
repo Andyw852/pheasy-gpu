@@ -15,6 +15,11 @@ from ase import Atoms as aseAtoms
 
 from pheasy_gpu.basic_io import logger
 
+# [FIX WS-IMAGES] version of the minimum-image search stored in NeighborList
+# pickles: 1 (implicit, before the fix) searched only the 27 neighbouring
+# supercell translations; 2 searches every translation that can be nearer.
+WS_ALGO = 2
+
 
 class Atoms(aseAtoms):
     """Pheasy-adapted version of Atoms class inheriting from aseAtoms class.
@@ -516,6 +521,9 @@ class NeighborList(object):
         """
         self._eps = eps
         self._cell = scell.cell.real
+        # |b_j| of the reciprocal basis (a_i . b_j = delta_ij): bounds how many
+        # supercell translations along a_j can bring an image nearer
+        self._recip_norms = np.linalg.norm(np.linalg.inv(self._cell), axis=0)
         self._supercell = scell.supercell
         self._positions = scell.scaled_positions
         self._central_atoms = [
@@ -692,13 +700,37 @@ class NeighborList(object):
             scaleds position for the atom in supercell.
 
         """
-        trans_vecs = np.array(list(itertools.product(np.arange(-1.0, 2.0), repeat=3)))
+        # [FIX WS-IMAGES] the search used to cover only the 27 translations in
+        # {-1,0,1}^3 of the supercell basis.  That finds the nearest image only
+        # when the basis is nearly reduced: a 4x4x1 supercell of a symmetric
+        # rhombohedral cell (vectors 54/54/13.5 A, 17 deg apart) got a farther
+        # image for 198 of 784 pairs, up to 8.6 A too far, including pairs
+        # truly closer than 8 A.  Cutoff selection, the Born-Huang / Huang
+        # constraints (built from these r_ij) and the ShengBTE fc3 export all
+        # used those wrong images.  Every image nearer than the wrapped one,
+        # d = atom2 - atom1 - round(atom2 - atom1) with length r0, has
+        # |(d + n)_j| = |b_j . v| <= |b_j| r0, which bounds n along each axis;
+        # the box below is that bound, so the search is exact (and still 3^3
+        # for a reduced basis).  Offsets are sorted as itertools.product would
+        # have ordered them, so a basis the old search handled gives the same
+        # images in the same order.
+        atom1 = np.asarray(atom1, dtype=float)
+        atom2 = np.asarray(atom2, dtype=float)
+        base = -np.round(atom2 - atom1)
+        r0 = np.linalg.norm(np.dot(self._cell.T, atom2 + base - atom1))
+        recip = getattr(self, "_recip_norms", None)
+        if recip is None:                 # unpickled from before the fix
+            recip = self._recip_norms = np.linalg.norm(np.linalg.inv(self._cell), axis=0)
+        reach = np.ceil(recip * (r0 + self._eps) + 0.5).astype(int)
+        axes = [np.arange(-n, n + 1, dtype=float) + b for n, b in zip(reach, base)]
+        trans_vecs = np.array(list(itertools.product(*axes)))
         images = atom2 + trans_vecs
         rr = images - atom1
         dists = np.linalg.norm(np.dot(self._cell.T, rr.T), axis=0)
         min_dist = np.amin(dists)
-        min_images = images[np.where(abs(dists - min_dist) < self._eps)]
-        offsets = trans_vecs[np.where(abs(dists - min_dist) < self._eps)]
+        sel = np.where(abs(dists - min_dist) < self._eps)[0]
+        min_images = images[sel]
+        offsets = trans_vecs[sel]
         weight = len(min_images)
 
         return (weight, min_dist, min_images, offsets)
@@ -719,6 +751,7 @@ class NeighborList(object):
         nn_dists = []
         offset_list = []
         neighbor_list = []
+        extended = 0
         for _, atom1 in enumerate(self._central_atoms):
             dists = []
             trans = []
@@ -737,6 +770,8 @@ class NeighborList(object):
                 )
                 if True not in np.isclose(min_dist, dists, atol=self._eps):
                     dists.append(min_dist)
+                if np.any(np.abs(offsets) > 1.5):
+                    extended += 1     # the old 27-translation search got this wrong
                 trans.append(offsets)
                 neighbors.append(atom_tuple)
             nn_dists.append(sorted(dists)[1:])
@@ -756,6 +791,24 @@ class NeighborList(object):
             self._nn_dists = nn_dists
             self._neighbor_list = neighbor_list
         self._ws_offsets = np.array(offset_list, dtype=object)
+        self._ws_algo = WS_ALGO
+        self._ws_extended_pairs = int(extended)
+        if extended:
+            logger.warning(
+                "[WS-IMAGES] %d of %d (central atom, supercell atom) pairs have a "
+                "nearest periodic image outside the 27 neighbouring supercell "
+                "translations: the supercell basis is far from reduced (e.g. a "
+                "rhombohedral primitive cell repeated N x N x 1).  pheasy before "
+                "[FIX WS-IMAGES] used a farther image for these pairs: its cutoff "
+                "selection, --rasr BH/H/BHH constraints and ShengBTE fc3 export "
+                "were wrong for this cell.  Choosing a reduced primitive cell "
+                "(e.g. hexagonal-like axes) avoids the issue altogether."
+                % (extended, sum(len(o) for o in offset_list)))
+
+    @property
+    def ws_extended_pairs(self):
+        """Pairs whose nearest image the pre-fix 27-translation search missed."""
+        return getattr(self, "_ws_extended_pairs", None)
 
     def get_neighbor_cutoff_distance(self, nth):
         """Find nearest neighbor up to the maximum allowed one.
@@ -823,6 +876,9 @@ class NeighborList(object):
         nn_dists are per-atom.
         """
         try:
+            # [FIX WS-IMAGES] a pickle from the old image search is not reused
+            if getattr(self, "_ws_algo", 1) != WS_ALGO:
+                return False
             if (list(np.asarray(self._supercell).ravel())
                     != list(np.asarray(scell.supercell).ravel())):
                 return False
