@@ -160,6 +160,89 @@ class ScipyAdjointViewTest(unittest.TestCase):
         np.testing.assert_allclose(dirty.data, [5., 1.])
 
 
+def _narrow(m):
+    """The core.sparse_io layout: int32 indices + int64 indptr (direct assignment)."""
+    out = sp.csr_matrix(m.shape, dtype=m.dtype)
+    out.data = m.data.copy()
+    out.indices = m.indices.astype(np.int32)
+    out.indptr = m.indptr.astype(np.int64)
+    return out
+
+
+def _big_nnz_scipy():
+    """Make scipy re-derive int64 for every CSC built from (data, indices, indptr),
+    exactly what it does when the indptr holds values beyond int32 (nnz > 2**31),
+    which no unit test can allocate."""
+    return mock.patch.object(sp.csc_matrix, "_get_index_dtype",
+                             lambda self, *a, **k: np.int64)
+
+
+class NarrowLayoutAdjointTest(unittest.TestCase):
+    """[FIX LAZY-ADJ-NARROW] Mg4C60 c3=3.5 (26 GB factors, nnz > 2**31): csr.T of
+    the int32/int64 layout copies the indices, the lazy adjoint raised, the
+    resident operator could not be built and the column norms fell back to a
+    ~55 h CPU loop."""
+
+    def setUp(self):
+        m = _sparse(37, 23, 0.3, 11)
+        m = m.tolil()
+        m[5, :] = 0                      # an empty row
+        m[:, 7] = 0                      # an empty column
+        m = m.tocsr()
+        m.eliminate_zeros()
+        m.sum_duplicates()
+        m.sort_indices()
+        self.m = m
+        self.n = _narrow(m)
+
+    def test_scipy_transpose_of_the_big_narrow_layout_copies(self):
+        with _big_nnz_scipy():
+            t = self.n.T
+        self.assertFalse(np.shares_memory(t.indices, self.n.indices))
+
+    def test_lazy_adjoint_is_built_and_exact_on_the_big_narrow_layout(self):
+        with _big_nnz_scipy():
+            adj = GB._AdjointBlocks(self.n)          # used to raise RuntimeError
+            dense = self.m.toarray()
+            self.assertEqual(adj.shape, (23, 37))
+            self.assertEqual(adj.resident_bytes, 0)
+            for c0, c1 in ((0, 23), (0, 1), (6, 9), (7, 8), (20, 23), (4, 4)):
+                blk = adj[c0:c1]
+                self.assertEqual(blk.shape, (c1 - c0, 37))
+                self.assertEqual(blk.indices.dtype, np.int32)
+                self.assertTrue(blk.has_canonical_format)
+                np.testing.assert_array_equal(blk.toarray(), dense[:, c0:c1].T)
+            np.testing.assert_array_equal(adj.materialize().toarray(), dense.T)
+        # the blocks really are canonical: sorted, duplicate-free rows
+        blk = GB._csr_column_block_t(self.n, 0, 23)
+        for r in range(blk.shape[0]):
+            row = blk.indices[blk.indptr[r]:blk.indptr[r + 1]]
+            self.assertTrue(np.all(np.diff(row) > 0))
+
+    def test_block_is_independent_of_the_chunk_size(self):
+        ref = GB._csr_column_block_t(self.n, 2, 19).toarray()
+        for chunk in (1, 2, 5, 13, 10 ** 6):
+            blk = GB._csr_column_block_t(self.n, 2, 19, chunk_elems=chunk)
+            np.testing.assert_array_equal(blk.toarray(), ref)
+        np.testing.assert_array_equal(ref, self.m.toarray()[:, 2:19].T)
+
+    def test_shared_view_is_still_used_when_scipy_shares(self):
+        adj = GB._AdjointBlocks(self.m)              # int32/int32: plain view
+        self.assertIsNotNone(adj._view)
+        with _big_nnz_scipy():
+            self.assertIsNone(GB._AdjointBlocks(self.n)._view)
+
+    def test_host_factors_lazy_policy_survives_the_big_narrow_layout(self):
+        ns = sp.csr_matrix(np.random.default_rng(2).normal(size=(23, 6)))
+        A = O.TwoLevelSM(self.n, ns)
+        with _big_nnz_scipy(), mock.patch.dict(os.environ,
+                                               {"PHEASY_TWOLEVEL_ADJOINT": "lazy"}):
+            pc, _ns, adj = GB._canonical_twolevel_host(A)
+            self.assertIsInstance(adj, GB._AdjointBlocks)
+            np.testing.assert_array_equal(adj.materialize().toarray(),
+                                          self.m.toarray().T)
+
+
 class LazyAdjointTest(unittest.TestCase):
     def test_lazy_adjoint_is_the_true_transpose(self):
         A = _operator()

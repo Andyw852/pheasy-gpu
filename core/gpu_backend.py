@@ -419,15 +419,32 @@ class _AdjointBlocks:
         if not sp.issparse(prime_c):
             raise TypeError("_AdjointBlocks requires a sparse prime")
         self._prime = prime_c
-        self._view = prime_c.T
-        # A scipy that copied here would silently double the host footprint, so
-        # fail loudly instead of pretending the fix applied.
-        if not (np.shares_memory(self._view.data, prime_c.data)
-                and np.shares_memory(self._view.indices, prime_c.indices)):
-            raise RuntimeError(
-                "scipy materialises csr.T (buffers are not shared), so the lazy "
-                "adjoint cannot save host memory; set PHEASY_TWOLEVEL_ADJOINT=eager")
-        self.shape = tuple(int(x) for x in self._view.shape)
+        # [FIX LAZY-ADJ-NARROW] scipy shares the buffers in csr.T only when the
+        # index dtype it re-derives (from max(shape) AND the indptr contents)
+        # equals the one stored.  The narrow layout of core.sparse_io (int32
+        # indices + int64 indptr, every factor with nnz > 2**31) never does:
+        # the CSC constructor sees an indptr beyond int32 and upcasts the
+        # indices to int64, i.e. a full extra copy.  The old code then raised,
+        # GpuTwoLevelOperator construction failed, and the column norms fell
+        # back to a CPU loop measured at ~55 h on Mg4C60 c3=3.5 (26 GB
+        # factors); the same happens for an int64/int64 factor with
+        # nnz < 2**31 (downcast).  When the view does not share, blocks are cut
+        # straight from the CSR arrays instead (_csr_column_block_t: chunked
+        # passes, temporaries of one chunk plus the block itself), so the lazy
+        # adjoint keeps its zero-extra-resident-bytes contract on every layout.
+        view = prime_c.T
+        if (np.shares_memory(view.data, prime_c.data)
+                and np.shares_memory(view.indices, prime_c.indices)):
+            self._view = view
+        else:
+            del view
+            self._view = None
+            print("[host] lazy adjoint: csr.T would copy the index arrays "
+                  "(indices %s, indptr %s, nnz %d); cutting adjoint blocks from "
+                  "the CSR arrays directly" % (prime_c.indices.dtype,
+                                              prime_c.indptr.dtype, prime_c.nnz),
+                  flush=True)
+        self.shape = (int(prime_c.shape[1]), int(prime_c.shape[0]))
         self.dtype = prime_c.dtype
         self.nnz = int(prime_c.nnz)
 
@@ -438,6 +455,8 @@ class _AdjointBlocks:
 
     def block(self, c0, c1):
         """Canonical CSR for rows [c0, c1) of the adjoint (a PRIVATE copy)."""
+        if self._view is None:
+            return _csr_column_block_t(self._prime, int(c0), int(c1))
         b = self._view[int(c0):int(c1)].tocsr()
         if not b.has_canonical_format:
             b.sum_duplicates()
@@ -446,6 +465,8 @@ class _AdjointBlocks:
 
     def materialize(self):
         """The whole adjoint as a canonical CSR (one full copy; single replica only)."""
+        if self._view is None:
+            return _csr_column_block_t(self._prime, 0, self.shape[0])
         adj = self._view.tocsr()
         if not adj.has_canonical_format:
             adj.sum_duplicates()
@@ -467,6 +488,76 @@ class _AdjointBlocks:
 
     def __repr__(self):
         return "<lazy adjoint blocks shape=%s nnz=%d>" % (self.shape, self.nnz)
+
+
+_ADJ_CHUNK_ELEMS = 1 << 24
+
+
+def _csr_column_block_t(prime, c0, c1, chunk_elems=None):
+    """prime[:, c0:c1].T as a canonical CSR, without touching scipy's index casts.
+
+    [FIX LAZY-ADJ-NARROW] Two passes over prime's arrays in chunks of
+    ``chunk_elems`` nonzeros: a bincount of the selected columns (the output
+    indptr), then a placement pass in prime's row order, so every output row
+    (= prime column) receives its entries with increasing prime-row index and
+    the block is canonical by construction (prime is canonical: no duplicates).
+    Temporaries are one chunk; the result is the block itself.  Output indices
+    (prime rows) are int32 when they fit, the indptr int32 when the block nnz
+    fits and int64 otherwise -- the same narrow layout core.sparse_io uses.
+    """
+    import scipy.sparse as sp
+    n_rows = int(prime.shape[0])
+    c0, c1 = int(c0), int(c1)
+    w = max(c1 - c0, 0)
+    step = max(1, int(chunk_elems or _ADJ_CHUNK_ELEMS))
+    indices, indptr, data = prime.indices, prime.indptr, prime.data
+    nnz = int(indptr[-1])
+    counts = np.zeros(w, dtype=np.int64)
+    for a in range(0, nnz, step):
+        ch = indices[a:min(a + step, nnz)]
+        sel = (ch >= c0) & (ch < c1)
+        if sel.any():
+            counts += np.bincount(ch[sel] - c0, minlength=w)
+    out_ptr = np.zeros(w + 1, dtype=np.int64)
+    np.cumsum(counts, out=out_ptr[1:])
+    nnz_b = int(out_ptr[-1])
+    i32 = np.iinfo(np.int32).max
+    idx_dtype = np.int32 if n_rows <= i32 else np.int64
+    out_idx = np.empty(nnz_b, dtype=idx_dtype)
+    out_dat = np.empty(nnz_b, dtype=data.dtype)
+    cursor = out_ptr[:-1].copy()
+    row_lo = 0
+    while row_lo < n_rows:
+        # rows [row_lo, row_hi) hold about `step` nonzeros (at least one row)
+        start = int(indptr[row_lo])
+        row_hi = int(np.searchsorted(indptr, start + step, side="right")) - 1
+        row_hi = min(max(row_hi, row_lo + 1), n_rows)
+        stop = int(indptr[row_hi])
+        if stop > start:
+            ch = indices[start:stop]
+            sel = (ch >= c0) & (ch < c1)
+            if sel.any():
+                lens = np.diff(np.asarray(indptr[row_lo:row_hi + 1], dtype=np.int64))
+                rows = np.repeat(np.arange(row_lo, row_hi, dtype=idx_dtype), lens)[sel]
+                cols = (ch[sel] - c0).astype(np.int64, copy=False)
+                vals = data[start:stop][sel]
+                order = np.argsort(cols, kind="stable")      # keeps row order
+                cols, rows, vals = cols[order], rows[order], vals[order]
+                uniq, first, cnt = np.unique(cols, return_index=True, return_counts=True)
+                pos = cursor[cols] + (np.arange(cols.size) - np.repeat(first, cnt))
+                out_idx[pos] = rows
+                out_dat[pos] = vals
+                cursor[uniq] += cnt
+        row_lo = row_hi
+    ptr_dtype = np.int32 if (nnz_b <= i32 and idx_dtype == np.int32) else np.int64
+    block = sp.csr_matrix((w, n_rows), dtype=data.dtype)
+    # direct assignment, as in core.sparse_io: the (data, indices, indptr)
+    # constructor would re-derive ONE index dtype and copy the indices
+    block.data = out_dat
+    block.indices = out_idx
+    block.indptr = out_ptr.astype(ptr_dtype, copy=False)
+    block.has_canonical_format = True
+    return block
 
 
 def _make_adjoint(prime_c, mode):
