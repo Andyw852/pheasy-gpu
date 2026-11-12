@@ -357,6 +357,80 @@ def _is_linear_operator(A):
     return (not isinstance(A, np.ndarray)) and (not sp.issparse(A)) and hasattr(A, "matvec")
 
 
+_COLNORM_CPU_MAX_WORK = 1e10   # sparse products; ~2e7/s measured -> ~8 min
+
+
+def _colnorm_cpu_work(A, gb=None):
+    """Sparse multiply-adds of the CPU column-norm loop: sum_j nnz(prime[:, j]) *
+    nnz(NS[j, :]).  One O(nnz) count of prime's columns (cached on prime)."""
+    prime, ns = A.SM_prime, A.NS
+    if not sp.issparse(prime):
+        return float(np.prod(prime.shape)) * float(ns.shape[1])
+    counts = None
+    if gb is not None:
+        try:
+            counts = gb._col_nnz_cached(prime)
+        except Exception:
+            counts = None
+    if counts is None:
+        counts = np.zeros(prime.shape[1], dtype=np.int64)
+        step = 1 << 24
+        for a in range(0, int(prime.nnz), step):
+            counts += np.bincount(prime.indices[a:a + step], minlength=prime.shape[1])
+    if sp.issparse(ns):
+        ns = ns.tocsr()
+        per_row = np.diff(ns.indptr).astype(np.float64)
+    else:
+        per_row = np.full(ns.shape[0], float(ns.shape[1]))
+    return float(np.asarray(counts, dtype=np.float64) @ per_row)
+
+
+def _colnorm_cpu_fallback(gb, exc, A):
+    """Decide what a failed GPU column-norm pass does.  Returns None (= use the
+    bounded CPU loop) or raises.
+
+    [FIX COLNORM-FAILFAST] Under PHEASY_GPU_MODE=required a CPU loop that runs
+    for hours is not a fallback but a silent change of the run: on Mg4C60 c3=3.5
+    (26 GB factors) the job kept running on the host while holding its GPUs, and
+    no hang check notices (it never stalls).  In required mode the fit now fails
+    here, within minutes and with the reason, whenever the loop is larger than
+    PHEASY_COLNORM_CPU_MAX_WORK sparse products (default 1e10, ~8 min at the
+    measured ~2e7/s; 0 = fail on every fallback).  Small operators (unit tests,
+    the in-memory exact Gram engines) keep the seconds-long CPU loop, and
+    PHEASY_COLNORM_CPU_FALLBACK=1 accepts it at any size.  Outside required
+    mode the loop stays the fallback, as before.
+    """
+    try:
+        required = bool(gb.gpu_mode_required())
+    except Exception:
+        required = False
+    allow = os.environ.get("PHEASY_COLNORM_CPU_FALLBACK", "0").strip().lower() in (
+        "1", "true", "yes", "on")
+    work = None
+    if required and not allow:
+        limit = float(os.environ.get("PHEASY_COLNORM_CPU_MAX_WORK",
+                                     repr(_COLNORM_CPU_MAX_WORK)))
+        try:
+            work = _colnorm_cpu_work(A, gb)
+        except Exception:
+            work = float("inf")
+        if not work <= limit:
+            raise RuntimeError(
+                "GPU column norms unavailable under PHEASY_GPU_MODE=required "
+                "(%s: %s); refusing the CPU column-norm loop for the %d x %d "
+                "operator: %.2e sparse products > PHEASY_COLNORM_CPU_MAX_WORK=%.0e "
+                "(~%.1f h at 2e7/s).  Fix the GPU path (free/more cards; for the "
+                "adjoint message use a pheasy-gpu with [FIX LAZY-ADJ-NARROW] or "
+                "PHEASY_TWOLEVEL_ADJOINT=eager) or set PHEASY_COLNORM_CPU_FALLBACK=1 "
+                "to accept the CPU loop."
+                % (type(exc).__name__, exc, int(A.shape[0]), int(A.shape[1]),
+                   work, limit, work / 2e7 / 3600.0)) from exc
+    print("[optimizer] GPU column norms unavailable (%s); using the bounded CPU "
+          "column-norm loop instead%s"
+          % (exc, (" (%.2e sparse products)" % work) if work is not None else ""),
+          flush=True)
+    return None
+
 def _col_norms(A):
     """Exact ||A[:, j]|| in float64."""
     if isinstance(A, TwoLevelSM):
@@ -3274,15 +3348,9 @@ class TwoLevelSM(LinearOperator):
                     host_factors=_gb.twolevel_host_factors(self))
             except Exception as _e:
                 # [FIX colnorms-A] The GPU path here only accelerates a
-                # preprocessing step; the solve itself still runs on the GPU.
-                # Aborting the whole fit because this optional resident operator
-                # does not fit (it is budgeted as a per-CARD replica while the
-                # sharded two-level factors already occupy that card) made every
-                # large third-order fit die under required GPU mode.  Use the
-                # bounded CPU loop this method exists to accelerate instead.
-                print("[optimizer] GPU column norms unavailable (%s); using the "
-                      "bounded CPU column-norm loop instead" % _e, flush=True)
-                return None
+                # preprocessing step, so outside required mode the bounded CPU
+                # loop below is an acceptable fallback.
+                return _colnorm_cpu_fallback(_gb, _e, self)
             try:
                 self._gpu_ridge_op = op
             except Exception:
@@ -3291,11 +3359,8 @@ class TwoLevelSM(LinearOperator):
             norms = op.col_norms()
             return np.asarray(norms.detach().cpu().numpy(), dtype=np.float64).ravel()
         except Exception as _e:
-            # [FIX colnorms-B] Same rationale as [FIX colnorms-A]: an
-            # accelerator that cannot be allocated must not abort the fit.
-            print("[optimizer] GPU column norms unavailable (%s); using the "
-                  "bounded CPU column-norm loop instead" % _e, flush=True)
-            return None
+            # [FIX colnorms-B] Same rule as [FIX colnorms-A].
+            return _colnorm_cpu_fallback(_gb, _e, self)
 
     def col_norms(self, block_rows=None, gpu_op=None):
         """Exact column norms from bounded row blocks of SM_prime @ NS.
