@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
-"""[FIX COLNORM-FAILFAST] a failed GPU column-norm pass under required mode.
+"""[FIX COLNORM-NO-CPU-FALLBACK] a failed GPU column-norm pass is a hard error.
 
-Mg4C60 c3=3.5: the resident operator could not be built, the column norms fell
-back to the bounded CPU loop (~55 h estimated) and the job kept running on the
-host while holding its GPUs.  Under PHEASY_GPU_MODE=required that must now be a
-fast, explicit failure whenever the CPU loop is larger than
-PHEASY_COLNORM_CPU_MAX_WORK (0 = always); small operators, auto mode and
-PHEASY_COLNORM_CPU_FALLBACK=1 keep the CPU loop.  CPU-only: the GPU backend is
-patched.
+History: on Mg4C60 c3=3.5 (26 GB factors) the resident operator could not be
+built, the column norms fell back to the bounded CPU loop (~55 h estimated) and
+the job kept running on the host while holding its GPUs.  0008 then made that a
+fast failure only when the loop exceeded PHEASY_COLNORM_CPU_MAX_WORK, and added
+an opt-in (PHEASY_COLNORM_CPU_FALLBACK=1) for the rest.  Measured again on
+Mg2C60 c3=4.0: the loop still ran >6 h before being killed by hand.
+
+Both escape hatches are now gone.  Under PHEASY_GPU_MODE=required a GPU
+column-norm failure always raises: either the resident operator fits and the
+norms are exact and fast, or the fit stops with the size of the problem.  Auto
+mode and CPU-only runs are unaffected -- they never select the GPU operator.
 
     python -m unittest dev.test_colnorm_failfast
 """
@@ -26,10 +30,13 @@ from core import gpu_backend as GB      # noqa: E402
 from core import optimizer as O         # noqa: E402
 
 
-def _op():
+def _op(big=False):
     rng = np.random.default_rng(0)
-    prime = sp.random(60, 15, density=0.4, format="csr", random_state=1)
-    ns = sp.csr_matrix(rng.normal(size=(15, 6)))
+    if big:
+        prime = sp.random(400, 3000, density=0.02, format="csr", random_state=1)
+    else:
+        prime = sp.random(60, 15, density=0.4, format="csr", random_state=1)
+    ns = sp.csr_matrix(rng.normal(size=(prime.shape[1], 6)))
     A = O.TwoLevelSM(prime, ns)
     exact = np.linalg.norm(prime.toarray() @ ns.toarray(), axis=0)
     return A, exact
@@ -40,10 +47,9 @@ class _BrokenOp:
         raise RuntimeError("CUDA out of memory (simulated)")
 
 
-class ColNormFailFastTests(unittest.TestCase):
-    def _patched(self, mode, extra=None, build_error=True):
+class ColNormNoCpuFallbackTests(unittest.TestCase):
+    def _patched(self, mode, build_error=True):
         env = {"PHEASY_GPU_MODE": mode}
-        env.update(extra or {})
         boom = mock.Mock(side_effect=RuntimeError(
             "scipy materialises csr.T (buffers are not shared) (simulated)"))
         stack = contextlib.ExitStack()
@@ -56,34 +62,45 @@ class ColNormFailFastTests(unittest.TestCase):
             stack.enter_context(mock.patch.object(GB, "GpuTwoLevelOperator", boom))
         return stack
 
-    def test_required_mode_fails_fast_when_the_operator_cannot_be_built(self):
+    def test_required_mode_raises_when_the_operator_cannot_be_built(self):
         A, _ = _op()
-        with self._patched("required", {"PHEASY_COLNORM_CPU_MAX_WORK": "0"}):
+        with self._patched("required"):
             with self.assertRaises(RuntimeError) as cm:
                 A.col_norms()
         msg = str(cm.exception)
-        self.assertIn("PHEASY_GPU_MODE=required", msg)
-        self.assertIn("PHEASY_COLNORM_CPU_FALLBACK=1", msg)
+        self.assertIn("CPU column-norm fallback", msg)
+        self.assertIn("has been removed", msg)
         self.assertIn("buffers are not shared", msg)
-        self.assertIn("PHEASY_COLNORM_CPU_MAX_WORK", msg)
+        self.assertIn("Make the resident two-level operator fit", msg)
 
-    def test_required_mode_fails_fast_when_the_gpu_pass_itself_fails(self):
+    def test_required_mode_raises_when_the_gpu_pass_itself_fails(self):
         A, _ = _op()
-        with self._patched("required", {"PHEASY_COLNORM_CPU_MAX_WORK": "0"},
-                           build_error=False):
+        with self._patched("required", build_error=False):
             with self.assertRaises(RuntimeError) as cm:
                 A.col_norms(gpu_op=_BrokenOp())
         self.assertIn("out of memory", str(cm.exception))
 
-    def test_explicit_opt_in_keeps_the_cpu_loop(self):
-        A, exact = _op()
-        out = io.StringIO()
-        with self._patched("required", {"PHEASY_COLNORM_CPU_FALLBACK": "1",
-                                        "PHEASY_COLNORM_CPU_MAX_WORK": "0"}), \
-                contextlib.redirect_stdout(out):
-            cn = A.col_norms()
-        np.testing.assert_allclose(cn, exact, rtol=1e-12)
-        self.assertIn("bounded CPU column-norm loop", out.getvalue())
+    def test_required_mode_raises_even_for_a_tiny_operator(self):
+        """There is no size exemption any more: small or large, no CPU loop."""
+        A, _ = _op()
+        with self._patched("required"):
+            with self.assertRaises(RuntimeError):
+                A.col_norms()
+
+    def test_required_mode_raises_for_a_large_operator(self):
+        A, _ = _op(big=True)
+        with self._patched("required"):
+            with self.assertRaises(RuntimeError) as cm:
+                A.col_norms()
+        self.assertIn("sparse products", str(cm.exception))
+
+    def test_the_cpu_loop_size_is_still_reported(self):
+        A, _ = _op(big=True)
+        prime = (A.SM_prime != 0).astype(np.float64)
+        ns = (A.NS != 0).astype(np.float64)
+        work = float((prime @ ns).sum())
+        self.assertEqual(O._colnorm_cpu_work(A), work)
+        self.assertEqual(O._colnorm_cpu_work(A, GB), work)
 
     def test_auto_mode_keeps_the_cpu_loop(self):
         A, exact = _op()
@@ -91,32 +108,11 @@ class ColNormFailFastTests(unittest.TestCase):
             cn = A.col_norms()
         np.testing.assert_allclose(cn, exact, rtol=1e-12)
 
-    def test_small_operator_keeps_the_cpu_loop_under_the_default_limit(self):
-        A, exact = _op()
-        with self._patched("required"), contextlib.redirect_stdout(io.StringIO()):
-            cn = A.col_norms()
-        np.testing.assert_allclose(cn, exact, rtol=1e-12)
-
-    def test_the_limit_is_compared_with_the_real_loop_size(self):
-        A, _ = _op()
-        prime = (A.SM_prime != 0).astype(np.float64)
-        ns = (A.NS != 0).astype(np.float64)
-        work = float((prime @ ns).sum())
-        self.assertEqual(O._colnorm_cpu_work(A), work)
-        self.assertEqual(O._colnorm_cpu_work(A, GB), work)
-        with self._patched("required", {"PHEASY_COLNORM_CPU_MAX_WORK": repr(work)}), \
-                contextlib.redirect_stdout(io.StringIO()):
-            A.col_norms()                                   # == limit: allowed
-        A2, _ = _op()
-        with self._patched("required", {"PHEASY_COLNORM_CPU_MAX_WORK": repr(work - 1)}):
-            with self.assertRaises(RuntimeError):
-                A2.col_norms()
-
     def test_no_gpu_at_all_is_not_this_failure(self):
         # enabled()/available() false (or raising) is handled by the solver's own
         # error surface; the column-norm pass just uses the CPU definition.
         A, exact = _op()
-        with mock.patch.dict(os.environ, {"PHEASY_GPU_MODE": "auto"}), \
+        with mock.patch.dict(os.environ, {"PHEASY_GPU_MODE": "required"}), \
                 mock.patch.object(GB, "available", return_value=False):
             np.testing.assert_allclose(A.col_norms(), exact, rtol=1e-12)
 

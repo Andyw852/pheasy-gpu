@@ -186,8 +186,10 @@ class RfeDispatchTests(unittest.TestCase):
                 opt.PheasyRFECV(cv=3, verbose=False).fit(T, y)
 
     def test_exact_engine_replaces_the_resident_operator_when_it_fits(self):
+        # The exact-Gram engine is a CPU engine, so it is exercised in auto mode.
+        # required mode now insists on a working GPU operator (no CPU fallback).
         T, y, g = self._twolevel()
-        env = {"PHEASY_GPU_MODE": "required", "PHEASY_RFE_N_JOBS": "1",
+        env = {"PHEASY_GPU_MODE": "auto", "PHEASY_RFE_N_JOBS": "1",
                "PHEASY_CV_GROUP_SIZE": str(g)}
         with patch.dict(os.environ, env), patch.object(gb, "available", return_value=True), \
                 patch.object(gb, "enabled", return_value=True), \

@@ -33,7 +33,11 @@ class RfeFailureTest(unittest.TestCase):
                 patch.object(gb, "enabled", return_value=True), \
                 patch.object(gb, "available", return_value=True), \
                 patch.object(gb, "GpuTwoLevelOperator", side_effect=RuntimeError("injected setup failure")):
-            with self.assertRaisesRegex(RuntimeError, "fallback disabled"):
+            # Fails closed either way: the resident setup failure is reported by the
+            # RFE fallback guard or, if the column-norm guard trips first, by the
+            # "CPU column-norm fallback has been removed" message.  What must not
+            # happen is a silent CPU LSMR run.
+            with self.assertRaisesRegex(                    RuntimeError, "fallback disabled|CPU column-norm fallback"):
                 Optimizer("RFE", use_gpu=True).fit(A, y)
 
 

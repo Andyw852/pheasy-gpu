@@ -357,9 +357,6 @@ def _is_linear_operator(A):
     return (not isinstance(A, np.ndarray)) and (not sp.issparse(A)) and hasattr(A, "matvec")
 
 
-_COLNORM_CPU_MAX_WORK = 1e10   # sparse products; ~2e7/s measured -> ~8 min
-
-
 def _colnorm_cpu_work(A, gb=None):
     """Sparse multiply-adds of the CPU column-norm loop: sum_j nnz(prime[:, j]) *
     nnz(NS[j, :]).  One O(nnz) count of prime's columns (cached on prime)."""
@@ -386,50 +383,55 @@ def _colnorm_cpu_work(A, gb=None):
 
 
 def _colnorm_cpu_fallback(gb, exc, A):
-    """Decide what a failed GPU column-norm pass does.  Returns None (= use the
-    bounded CPU loop) or raises.
+    """A failed GPU column-norm pass is a HARD ERROR: there is no CPU fallback.
 
-    [FIX COLNORM-FAILFAST] Under PHEASY_GPU_MODE=required a CPU loop that runs
-    for hours is not a fallback but a silent change of the run: on Mg4C60 c3=3.5
-    (26 GB factors) the job kept running on the host while holding its GPUs, and
-    no hang check notices (it never stalls).  In required mode the fit now fails
-    here, within minutes and with the reason, whenever the loop is larger than
-    PHEASY_COLNORM_CPU_MAX_WORK sparse products (default 1e10, ~8 min at the
-    measured ~2e7/s; 0 = fail on every fallback).  Small operators (unit tests,
-    the in-memory exact Gram engines) keep the seconds-long CPU loop, and
-    PHEASY_COLNORM_CPU_FALLBACK=1 accepts it at any size.  Outside required
-    mode the loop stays the fallback, as before.
+    Returning None here used to mean "use the bounded CPU column-norm loop".  On a
+    large third-order fit that is not a fallback but a silent change of the run:
+    on Mg4C60 c3=3.5 (26 GB factors) the job kept running on the host while still
+    holding its GPUs, for hours, and no hang check notices it because it never
+    stalls.  Measured again on Mg2C60 c3=4.0: the loop ran >6 h before being
+    killed by hand.
+
+    So a GPU column-norm failure now stops the fit with the reason and the size of
+    the problem, and the operator has to be made to fit instead.  The earlier
+    escape hatches PHEASY_COLNORM_CPU_FALLBACK / PHEASY_COLNORM_CPU_MAX_WORK are
+    gone: they only ever served to keep such a run alive on the wrong hardware.
+
+    This is only reached when the GPU path was selected; a pure CPU run returns
+    None from _col_norms_on_gpu before it ever builds the operator.
     """
+    # A missing torch/CUDA is "there is no GPU on this host", not "the operator did
+    # not fit": probing the backend must never become the failure (same rule as the
+    # enabled()/available() guard above).  Fall through to the CPU definition.
+    if isinstance(exc, ImportError):
+        return None
+    # Auto mode means "use the GPU when it fits, otherwise the CPU definition is
+    # the answer", so the CPU loop stays legitimate there.  Only required mode --
+    # where a GPU result was requested -- must not quietly become a host run.
     try:
         required = bool(gb.gpu_mode_required())
     except Exception:
         required = False
-    allow = os.environ.get("PHEASY_COLNORM_CPU_FALLBACK", "0").strip().lower() in (
-        "1", "true", "yes", "on")
-    work = None
-    if required and not allow:
-        limit = float(os.environ.get("PHEASY_COLNORM_CPU_MAX_WORK",
-                                     repr(_COLNORM_CPU_MAX_WORK)))
-        try:
-            work = _colnorm_cpu_work(A, gb)
-        except Exception:
-            work = float("inf")
-        if not work <= limit:
-            raise RuntimeError(
-                "GPU column norms unavailable under PHEASY_GPU_MODE=required "
-                "(%s: %s); refusing the CPU column-norm loop for the %d x %d "
-                "operator: %.2e sparse products > PHEASY_COLNORM_CPU_MAX_WORK=%.0e "
-                "(~%.1f h at 2e7/s).  Fix the GPU path (free/more cards; for the "
-                "adjoint message use a pheasy-gpu with [FIX LAZY-ADJ-NARROW] or "
-                "PHEASY_TWOLEVEL_ADJOINT=eager) or set PHEASY_COLNORM_CPU_FALLBACK=1 "
-                "to accept the CPU loop."
-                % (type(exc).__name__, exc, int(A.shape[0]), int(A.shape[1]),
-                   work, limit, work / 2e7 / 3600.0)) from exc
-    print("[optimizer] GPU column norms unavailable (%s); using the bounded CPU "
-          "column-norm loop instead%s"
-          % (exc, (" (%.2e sparse products)" % work) if work is not None else ""),
-          flush=True)
-    return None
+    if not required:
+        print("[optimizer] GPU column norms unavailable (%s); using the bounded "
+              "CPU column-norm loop instead (auto mode)" % exc, flush=True)
+        return None
+    try:
+        work = _colnorm_cpu_work(A, gb)
+        detail = "%.2e sparse products (about %.1f h on the CPU loop)" % (
+            work, work / 2e7 / 3600.0)
+    except Exception:
+        detail = "loop size unavailable"
+    raise RuntimeError(
+        "GPU column norms unavailable (%s: %s) and the CPU column-norm fallback "
+        "has been removed; operator %d x %d, %s.  Make the resident two-level "
+        "operator fit on one device instead (free up or add cards -- the budget is "
+        "read from device[0], so put the card with the most free VRAM first), lower "
+        "the third-order cutoff, or use a build with [FIX LAZY-ADJ-NARROW] so the "
+        "adjoint does not need a second copy."
+        % (type(exc).__name__, exc, int(A.shape[0]), int(A.shape[1]), detail)
+    ) from exc
+
 
 def _col_norms(A):
     """Exact ||A[:, j]|| in float64."""
