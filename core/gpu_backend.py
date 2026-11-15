@@ -212,6 +212,116 @@ def _csr_device_bytes(matrix, value_bytes, n_shards=1):
             + 8 * (sum(int(x) for x in matrix.shape) + 2))
 
 
+def col_norms_streaming(A, device_id=None, block_bytes=None):
+    """Exact column norms of SM_prime @ NS by streaming row blocks to ONE GPU.
+
+    The resident operator keeps SM_prime on the device for the whole fit, and at
+    a large third-order cutoff that no longer fits: at c3=5.0 the sharded
+    estimate is 27.6 GB per card against a 24.9 GB budget on a 23.68 GiB card,
+    and at c3=4.5 four cards are the bare minimum.  The norms themselves need no
+    residency at all -- they are a sum of per-row-block squares -- so this path
+    keeps ONE block on the device, computes block @ NS, accumulates the squares
+    and drops the block again.
+
+    GPU memory is therefore O(NS + one block), independent of nnz(SM_prime).
+    The result is the same exact quantity the CPU definition computes: the block
+    loop, the float64 product and the float64 square accumulation all mirror
+    TwoLevelSM.col_norms; only the sparse-dense product runs on the GPU.
+    torch.sparse.mm(CSR, dense) is exact in float64, so the two agree to
+    rounding (verified against the CPU loop on synthetic and real matrices).
+
+    The resident path is untouched: callers only reach this after the resident
+    operator could not be built.
+    """
+    import scipy.sparse as sp
+    if not enabled() or not available():
+        raise RuntimeError("streaming column norms require enabled CUDA")
+    torch = _torch()
+    base = getattr(A, "_twolevel_base", A)
+    if not (hasattr(base, "SM_prime") and hasattr(base, "NS")):
+        raise TypeError("col_norms_streaming requires TwoLevelSM")
+    prime, ns = base.SM_prime, base.NS
+    if not sp.issparse(prime):
+        raise TypeError("col_norms_streaming requires a scipy sparse SM_prime")
+    if sp.issparse(ns):
+        ns = ns.toarray()
+    ns = np.ascontiguousarray(ns, dtype=np.float64)
+    if ns.ndim != 2:
+        raise ValueError("NS must be two-dimensional")
+    k, n_cols = int(ns.shape[0]), int(ns.shape[1])
+    if k != int(prime.shape[1]):
+        raise ValueError("NS rows (%d) must match SM_prime columns (%d)"
+                         % (k, int(prime.shape[1])))
+
+    if device_id is None:
+        try:
+            dev = _resident_cv_devices()[0]
+        except Exception:
+            dev = device()
+    else:
+        dev = device_id if isinstance(device_id, torch.device) else torch.device(device_id)
+
+    # NS is replicated whole on the device (the resident layout does the same).
+    # Refuse rather than half-run when it alone would not fit.
+    ns_bytes = 8 * k * n_cols
+    _dev_index = getattr(dev, "index", None)
+    free = _device_free_bytes(_dev_index if _dev_index is not None else dev)
+    if free is not None and ns_bytes > 0.85 * float(free):
+        raise RuntimeError(
+            "streaming column norms: NS alone needs %.1f GB but only %.1f GB is "
+            "free on %s; the two-level factors cannot be streamed there either"
+            % (ns_bytes / 1e9, float(free) / 1e9, dev))
+
+    if block_bytes is not None:
+        budget = int(block_bytes)
+    else:
+        budget = max(1, int(os.environ.get("PHEASY_COL_NORM_STREAM_BLOCK_MB", "256"))) << 20
+    n_rows = int(prime.shape[0])
+    if not n_rows or not n_cols:
+        return np.zeros(n_cols, dtype=np.float64)
+
+    # Rows per block: the device holds the block's values+indices (16 B per
+    # nonzero in float64+int64) followed by the dense product (8 B per entry).
+    # The boundary is found from indptr, NOT by slicing and shrinking: a row
+    # count derived from n_cols alone can exceed the whole matrix when NS is
+    # narrow, and materialising that block just to discover it is oversized
+    # copied all of SM_prime once per attempt.
+    _indptr = np.asarray(prime.indptr, dtype=np.int64)
+    ns_gpu = torch.as_tensor(ns, dtype=torch.float64, device=dev)
+    squares = torch.zeros(n_cols, dtype=torch.float64, device=dev)
+    i0 = 0
+    while i0 < n_rows:
+        lo, hi = i0 + 1, n_rows
+        _base = int(_indptr[i0])
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if 16 * (int(_indptr[mid]) - _base) + 8 * (mid - i0) * n_cols <= budget:
+                lo = mid
+            else:
+                hi = mid - 1
+        i1 = lo
+        blk = prime[i0:i1]
+        if not sp.isspmatrix_csr(blk):
+            blk = blk.tocsr()
+        n_blk = int(blk.shape[0])
+        crow = torch.as_tensor(np.ascontiguousarray(blk.indptr),
+                               dtype=torch.int32, device=dev).to(torch.int64)
+        colix = torch.as_tensor(np.ascontiguousarray(blk.indices),
+                                dtype=torch.int32, device=dev).to(torch.int64)
+        val = torch.as_tensor(np.ascontiguousarray(blk.data), device=dev)
+        if val.dtype != torch.float64:
+            val = val.to(torch.float64)
+        csr = torch.sparse_csr_tensor(crow, colix, val, size=(n_blk, k),
+                                      dtype=torch.float64, device=dev)
+        prod = torch.sparse.mm(csr, ns_gpu)
+        squares += torch.einsum("ij,ij->j", prod, prod)
+        del csr, prod, crow, colix, val
+        i0 += n_blk
+    out = torch.sqrt(squares).detach().cpu().numpy().astype(np.float64)
+    del ns_gpu, squares
+    return out
+
+
 def resident_twolevel_estimate(A, device_id=None, extra_workspace_bytes=0, n_shards=1):
     """Estimate the resident two-level footprint WITHOUT uploading anything.
 

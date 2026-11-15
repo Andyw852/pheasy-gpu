@@ -412,6 +412,21 @@ def _colnorm_cpu_fallback(gb, exc, A):
         required = bool(gb.gpu_mode_required())
     except Exception:
         required = False
+    # Second GPU attempt: the resident operator only exists to ACCELERATE the
+    # norms.  The quantity itself is a sum of per-row-block squares, so it can be
+    # streamed through one device with O(NS + block) memory instead of O(nnz) --
+    # that is what lets a c3=4.5/5.0 fit run on cards whose resident estimate is
+    # 11 % over budget.  This is still the GPU path, not the CPU loop.
+    _stream_exc = None
+    try:
+        _streamed = gb.col_norms_streaming(A)
+    except Exception as _e2:
+        _stream_exc = _e2
+    else:
+        print("[optimizer] resident column norms unavailable (%s); streamed row "
+              "blocks through one device instead (O(block) device memory)"
+              % (exc,), flush=True)
+        return np.asarray(_streamed, dtype=np.float64)
     if not required:
         print("[optimizer] GPU column norms unavailable (%s); using the bounded "
               "CPU column-norm loop instead (auto mode)" % exc, flush=True)
@@ -424,12 +439,15 @@ def _colnorm_cpu_fallback(gb, exc, A):
         detail = "loop size unavailable"
     raise RuntimeError(
         "GPU column norms unavailable (%s: %s) and the CPU column-norm fallback "
-        "has been removed; operator %d x %d, %s.  Make the resident two-level "
-        "operator fit on one device instead (free up or add cards -- the budget is "
-        "read from device[0], so put the card with the most free VRAM first), lower "
-        "the third-order cutoff, or use a build with [FIX LAZY-ADJ-NARROW] so the "
-        "adjoint does not need a second copy."
-        % (type(exc).__name__, exc, int(A.shape[0]), int(A.shape[1]), detail)
+        "has been removed; operator %d x %d, %s.  A streamed block pass was tried "
+        "as well and failed (%s).  Make the resident two-level operator fit on one "
+        "device (free up or add cards -- the budget is read from device[0], so put "
+        "the card with the most free VRAM first), lower the third-order cutoff, or "
+        "use a build with [FIX LAZY-ADJ-NARROW] so the adjoint does not need a "
+        "second copy."
+        % (type(exc).__name__, exc, int(A.shape[0]), int(A.shape[1]), detail,
+           ("%s: %s" % (type(_stream_exc).__name__, _stream_exc))
+           if _stream_exc is not None else "not attempted")
     ) from exc
 
 
