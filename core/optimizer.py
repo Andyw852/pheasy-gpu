@@ -3399,6 +3399,26 @@ class TwoLevelSM(LinearOperator):
         cached = getattr(self, "_col_norms_cache", None)
         if cached is not None and gpu_op is None:
             return cached.copy()
+        # Opt-in: a column-norm vector computed elsewhere (e.g. a parallel CPU
+        # job on a CPU cluster) can be handed over as a .npy file.  The norms only
+        # depend on the factors, so they are portable, and a 77063-float file is
+        # 600 KB -- far cheaper than requiring one device to hold NS (56.8 GB at
+        # c3=4.5, more than an RTX3090 has).  Off unless the variable is set, so
+        # every existing path is untouched.
+        _cnf = os.environ.get("PHEASY_COL_NORMS_FILE", "").strip()
+        if _cnf:
+            try:
+                _pre = np.load(_cnf)
+                if _pre.shape == (self.shape[1],) and np.all(np.isfinite(_pre))                         and np.all(_pre > 0):
+                    print("[optimizer] column norms loaded from %s (%d values)"
+                          % (_cnf, _pre.size), flush=True)
+                    self._col_norms_cache = np.asarray(_pre, dtype=np.float64)
+                    return self._col_norms_cache.copy()
+                print("[optimizer] %s has shape %s, expected (%d,); ignoring"
+                      % (_cnf, _pre.shape, self.shape[1]), flush=True)
+            except Exception as _e:
+                print("[optimizer] could not load PHEASY_COL_NORMS_FILE %s: %s"
+                      % (_cnf, _e), flush=True)
         norms = self._col_norms_on_gpu(gpu_op)
         if norms is not None and norms.shape == (self.shape[1],):
             try:

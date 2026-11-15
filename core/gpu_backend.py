@@ -2498,6 +2498,14 @@ class GpuSparseMV(object):
         self._cs = _col_shard_edges(sm_prime, G)
         _mem_trace("GpuSparseMV nnz-balanced row edges %s (N=%d)"
                    % ([int(x) for x in self._rs], int(self._rs[-1])))
+        # [low-mem] Optional half-memory layout: keep ONLY the row blocks and
+        # derive the adjoint from them.  torch CSRs expose .t() as a CSC VIEW
+        # that shares the same buffers (verified: same data_ptr, exact results),
+        # so R_i.t() @ u[row shard] summed over shards IS SM_prime.T @ u.  The
+        # default stays the stored-transpose layout; this is opt-in because the
+        # CSC SpMV can be slower than a stored CSR transpose.
+        self._lowmem = os.environ.get("PHEASY_GPU_SM_LOWMEM", "0").strip().lower() in (
+            "1", "true", "yes", "on")
         self._R = []
         self._T = []
         # [low-mem] per-block column slices instead of one full transpose:
@@ -2525,9 +2533,14 @@ class GpuSparseMV(object):
                 # Pre-flight from COUNTS, before either block exists: at c3=5.0
                 # they are 10.7 GB each, so building both just to measure doubled
                 # this loop's transient for no benefit.
-                required = _cuda_spmv_block_budget_counts(
-                    (r1 - r0, M), _row_nnz, (c1 - c0, N), _col_nnz,
-                    self._value_itemsize)
+                if self._lowmem:
+                    required = _cuda_spmv_block_budget_counts(
+                        (r1 - r0, M), _row_nnz, (0, 0), 0,
+                        self._value_itemsize)
+                else:
+                    required = _cuda_spmv_block_budget_counts(
+                        (r1 - r0, M), _row_nnz, (c1 - c0, N), _col_nnz,
+                        self._value_itemsize)
                 free = _device_free_bytes(d)
                 if free is not None and required > free:
                     raise MemoryError(
@@ -2545,10 +2558,11 @@ class GpuSparseMV(object):
                     _check_cuda_csr_indices(Ri)
                     self._R.append(self._csr_to_torch(Ri, dev))
                     del Ri
-                    Ti = sm_prime[:, c0:c1].T.tocsr()
-                    _check_cuda_csr_indices(Ti)
-                    self._T.append(self._csr_to_torch(Ti, dev))
-                    del Ti
+                    if not self._lowmem:
+                        Ti = sm_prime[:, c0:c1].T.tocsr()
+                        _check_cuda_csr_indices(Ti)
+                        self._T.append(self._csr_to_torch(Ti, dev))
+                        del Ti
         except Exception:
             # A failure on card k must release cards 0..k before CPU fallback.
             self.close()
@@ -2633,7 +2647,36 @@ class GpuSparseMV(object):
 
     def rmatvec(self, u):
         """SM_prime.T @ u -> (M,) numpy f64. u: (N,) numpy."""
-        return self._mv_blocks(self._T, np.ascontiguousarray(u, dtype=np.float64))
+        u = np.ascontiguousarray(u, dtype=np.float64)
+        if not getattr(self, "_lowmem", False):
+            return self._mv_blocks(self._T, u)
+        return self._rmatvec_from_row_blocks(u)
+
+    def _rmatvec_from_row_blocks(self, u):
+        """SM_prime.T @ u using ONLY the row blocks, via the zero-copy CSC view.
+
+        R_i is SM_prime[r0:r1, :]; R_i.t() shares its buffers (torch returns a
+        sparse CSC view), and (SM_prime.T @ u)[:] is the SUM over shards of
+        R_i.t() @ u[r0:r1] -- not a concatenation, unlike matvec.
+        """
+        t = self._t
+        np = self._np
+        ys = []
+        for i, R in enumerate(self._R):
+            r0 = int(self._rs[i])
+            r1 = int(self._rs[i + 1])
+            with t.cuda.device(self._devs[i]):
+                ui = t.as_tensor(u[r0:r1], dtype=self._dt64, device=self._devs[i])
+                ys.append((self._devs[i], R.t() @ ui, ui))
+        acc = None
+        for _d, _y, _keep in ys:
+            with t.cuda.device(_d):
+                part = _y.cpu().numpy().astype(np.float64)
+            acc = part if acc is None else acc + part
+        self._n_calls = getattr(self, "_n_calls", 0) + 1
+        if self._n_calls % 50 == 0:
+            t.cuda.empty_cache()
+        return acc
 
     def close(self):
         """Release the GPU tensors (clear the lists, not just loop vars)."""
