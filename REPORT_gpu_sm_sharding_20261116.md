@@ -241,6 +241,11 @@ fallback outside required mode. The required-mode test fails on the previous
 4. Existing scripts that printed `[GPU-SM] SpMV on N device(s)` still work; with
    more shards than cards the log line reports the *card* count, and the
    `_mem_trace` line reports `<shard>/<n_shards> on gpu<id>`.
+5. **`FCFIT_REUSE_SM=1` is required for any sensing-matrix reuse.** Without it
+   `fc_fit_driver` calls `_clear_pheasy_sm_cache()` before the `-s` probe and
+   deletes `sm_prime.npz` (4-5 h to rebuild), so the md5/`touch` guard in the
+   submit script never gets a chance. The 2026-11-16 production run lost its
+   19:33 matrix this way and started rebuilding at 20:34.
 
 ---
 

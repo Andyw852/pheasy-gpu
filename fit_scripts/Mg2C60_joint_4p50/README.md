@@ -66,6 +66,7 @@ below), so a restart after a crash costs ~40 min (`-c`) instead of ~5 h.
 | `PHEASY_GPU_FALLBACK` | **`0`** | rule 2: a GPU problem must abort, not silently run on one CPU core |
 | `PHEASY_COL_NORMS_FILE` | `colnorms_4p50.npy` | skip the in-fit column-norm pass; exported **only** when `sm_prime.npz` is reused (rule 4) |
 | `PHEASY_GPU_MEM_FRACTION` | `1.0` | the box is shared; the free-VRAM pre-flight is the real guard |
+| `FCFIT_REUSE_SM` | **`1`** | without it the driver calls `_clear_pheasy_sm_cache()` **before** the `-s` probe and deletes `sm_prime.npz`, so the md5/touch guard never applies and `-d` runs again (rule 4) |
 | `PHEASY_TWOLEVEL_ADJOINT` | `lazy` | no eager 38.5 GB transpose copy |
 | `PHEASY_CV_GROUP_SIZE` | `1488` | one displaced configuration (496 atoms x 3) per CV group |
 
@@ -103,6 +104,10 @@ below), so a restart after a crash costs ~40 min (`-c`) instead of ~5 h.
    `touch`es `sm_prime.npz` when the bytes are identical. Never bypass this by
    `touch`ing unconditionally: a sensing matrix in a different atom order is
    silently wrong (documented drift 6.9% -> 11% in an earlier job).
+   **The guard is only reachable with `FCFIT_REUSE_SM=1`**: without it the
+   driver wipes `sm_prime.npz` before the `-s` probe, which is exactly what
+   happened to the 2026-11-16 production run (job 7619 rebuilt at 20:34 after
+   the earlier job had already written the matrix at 19:33).
    `colnorms_4p50.npy` has the same problem one level down: the loader checks
    only its shape, so norms of an old matrix would be accepted. The script
    exports `PHEASY_COL_NORMS_FILE` only when `sm_prime.npz` is reused, and

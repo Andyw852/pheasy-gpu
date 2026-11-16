@@ -189,6 +189,9 @@ python dev/check_gpu_sm_shards.py --npz $CASE/sm_prime.npz \
    （原子顺序记录）。之后驱动会正确拒绝缓存并重建（约 4–5 小时）。做法是 prep 前后各
    取一次 md5，只有相同才 `touch` 该 npz。无条件 `touch` 会得到一个原子顺序不同的
    感知矩阵，即静默错误的结果（早先一个作业因此从 6.9% 漂到 11%）。
+   **这个守卫只有设了 `FCFIT_REUSE_SM=1` 才够得着**：否则驱动会在 `-s` 探测**之前**调用
+   `_clear_pheasy_sm_cache()` 把 `sm_prime.npz` 删掉（重建要 4–5 小时）——
+   2026-11-16 的生产作业（7619）正是这样丢了 19:33 写好的矩阵、20:34 重新开始建。
    **`colnorms_4p50.npy` 同理**：它的加载器只检查形状，所以每次重建后都要重跑
    `submit_colnorm.sh`。
 

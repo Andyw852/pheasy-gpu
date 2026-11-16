@@ -58,6 +58,11 @@ export PHEASY_COLNORM_CPU_MAX_WORK=200000000000
 export PHEASY_HARM_DENSE=1
 export PHEASY_CV_GROUP_SIZE=1488
 export PHEASY_SM_DTYPE=float32
+# Without this the driver calls _clear_pheasy_sm_cache() BEFORE the -s probe and
+# deletes the 57.8 GB sm_prime.npz, so the md5/touch guard below never gets a
+# chance and the -d pass runs again (4-5 h).  The 2026-11-16 production run
+# (job 7619) lost the reuse exactly this way: env unset -> rebuild at 20:34.
+export FCFIT_REUSE_SM=1
 # PHEASY_COL_NORMS_FILE is exported below, only when sm_prime.npz is reused.
 COLNORMS=$CASE/colnorms_4p50.npy
 unset PHEASY_COL_NORMS_FILE
