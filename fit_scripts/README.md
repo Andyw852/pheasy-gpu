@@ -53,6 +53,14 @@ GPU 求解因显存预算不足被 fail-closed 拒绝——那是配置问题，
 刻意**不**设 `PHEASY_GPU_TSQR`：流式 TSQR 要求矩阵是高的，小 NDATA 下 SM 是宽的
 （实测 NDATA=24 为 36864x69487），开了它 OLS 会被正确拒绝（"gpu_tsqr requires a tall matrix"）。
 
+## 大截断（c3 >= 4.5 A）的 GPU 实操模板
+
+`Mg2C60_joint_4p50/` 是一套完整可复用的实操脚本（Mg2C60 联合数据集，c3=4.5，
+nnz=4.8e9，RTX 3090）：按实测空闲显存选卡、`PHEASY_GPU_FALLBACK=0` 失败即停、
+md5 校验后复用 57.8 GB 的 `sm_prime.npz`、32 进程并行预算列范数。里面逐条记录了
+「卡数 != 分块数（int32 索引上限）」「共享机器上 SLURM GRES 会骗人」等坑；
+代码侧的修复说明见 [REPORT_gpu_sm_sharding_20261116.md](../REPORT_gpu_sm_sharding_20261116.md)。
+
 ## 用别的源码树跑（验证改动）
 
 `PHEASY_SRC=<含 run_pheasy.py 的树>` 会让模板用那棵树而不是已安装的 `pheasy-gpu`：它写一个
