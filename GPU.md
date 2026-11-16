@@ -1622,6 +1622,106 @@ Verify any new dataset with the per-config residual check
   `SequentialBlockBuildTest` pins the build/upload call order -- the uploaded
   tensors look identical either way, so only the order catches a regression.
 
+## Streaming exact RFE-OLS (`PHEASY_RFE_GRAM_CV`, [RFE-GRAM-STREAM])
+
+Implements D2 of `SPEC_gpu_sm_streaming.md`: RFE-OLS without the resident
+GPU-SM operator, on 0 or 1 GPU.  Opt-in (`PHEASY_RFE_GRAM_CV=1`); without it
+nothing changes.
+
+**Why.** The exact per-fold Gram engine (`_RFEGramCV`, [FIX RFE-GRAM]) already
+answers RFE rounds exactly, but it keeps K+1 float64 Grams and three round
+temporaries in RAM, `8 (K+4) p^2` bytes: 427.6 GB at the c3=4.5 Mg2C60 joint
+`p = 77,063` and still 152.3 GB at the final ~46k.  Its budget gate
+(`PHEASY_RFE_GRAM_GB`, default 16 GB) therefore never opens there, so every
+round runs the capped LSMR (5000 iterations, istop=7) on a resident `SM_prime`
+spread over 3-5 cards.
+
+**What the streaming engine does** (`_RFEStreamGramCV`, `core/optimizer.py`):
+
+* builds the K fold Grams **one at a time**, each from its own fold's rows only,
+  so the K folds together are one pass over `SM_prime @ NS`.  One float64
+  `p x p` accumulator is in RAM; the accumulation is a host `dsyrk` or, with
+  `PHEASY_RFE_GRAM_GPU=1`, float64 GEMM on column panels of the upper triangle
+  (`gpu_backend.GpuGramAccumulator`);
+* stores the finished Grams in RAM or in `.npy` memmaps on disk, float64 by
+  default;
+* answers each round from column panels of the stored `G_k[S, S]`, with at most
+  two `s x s` float64 buffers and in-place Jacobi-scaled Cholesky.  The rule is
+  the same as `_gram_solve`, including the eigh minimum-norm fallback, so the
+  results match the in-RAM engine (tested to ~1e-13);
+* takes the column norms from the Gram diagonal (no separate pass, no
+  `PHEASY_COL_NORMS_FILE`), the final refit from the same Grams (unregularized
+  unless `PHEASY_RFE_FINAL_RIDGE`), and deletes the store at the end.
+
+**No silent fallback.** The plan (store, buffers, sizes, budget) is computed
+before anything is allocated and printed as one `[RFE-GRAM-STREAM] p=... K=...`
+line.  If it doesn't fit, it raises `MemoryError` with every layout it tried.
+The fit also raises on any of these:
+
+* a fold whose accumulated row count or `||y_k||^2` differs from the CV split
+  (a dropped or duplicated row block);
+* a GPU that was requested but cannot hold one panel;
+* a float32 store that is too coarse (below).
+
+With `PHEASY_RFE_GRAM_CV=1` the iterative and serial-matvec paths cannot be
+reached.
+
+| variable | default | meaning |
+|---|---|---|
+| `PHEASY_RFE_GRAM_CV` | `0` | `1` = use the streaming engine for every round |
+| `PHEASY_RFE_GRAM_GB` | 0.8 x available RAM | host budget of the plan (shared name with the in-RAM engine, whose default is 16 GB) |
+| `PHEASY_RFE_GRAM_STORE` | `auto` | `ram`, `disk`, or `auto` = RAM if it fits, else disk |
+| `PHEASY_RFE_GRAM_DIR` | `./rfe_gram_store` | disk store directory; `PHEASY_RFE_GRAM_KEEP=1` keeps the files |
+| `PHEASY_RFE_GRAM_DTYPE` | `float64` | storage dtype; `float32` is guarded (below) |
+| `PHEASY_RFE_GRAM_TOTAL` | `auto` | also store `sum_k G_k` (one read per round instead of K) when it fits |
+| `PHEASY_RFE_GRAM_ROUND_BUFFERS` | `auto` | `2` = keep `sum_k G_k[S,S]` while the K fold systems are solved; `1` = rebuild each from the other folds (half the RAM, K-1 reads per fold) |
+| `PHEASY_RFE_GRAM_BLOCK_GB` / `_BLOCK_ROWS` | `1` / derived | dense row block size (`1 GB / 8p` rows: 1622 at c3=4.5) |
+| `PHEASY_RFE_GRAM_PANEL_GB`, `PHEASY_RFE_GRAM_THREADS` | `0.25`, `min(8, cores)` | panel size and threads of the store reads |
+| `PHEASY_RFE_GRAM_GPU` | `0` | `1` = accumulate on the GPU |
+| `PHEASY_RFE_GRAM_GPU_DEVICES` | resident devices | CUDA indices, or `cpu` (the same torch code on the host; needs `PHEASY_RFE_GRAM_GPU_GB`) |
+| `PHEASY_RFE_GRAM_GPU_DTYPE` | `float64` | `float32` multiplies in float32 and flushes to the float64 host accumulator every `PHEASY_RFE_GRAM_GPU_FLUSH_ROWS` (65536) rows |
+| `PHEASY_RFE_GRAM_GPU_PANEL` / `_GB` / `_FRACTION` / `_MAX_WAVES` | `2048` / unset / `0.9` / `4` | panel width, per-device byte cap, fraction of free VRAM, max passes per fold |
+| `PHEASY_RFE_GRAM_F32_MAXERR` | `1e-4` | largest predicted float32 storage error accepted |
+
+**float32 storage is guarded twice.** With float32 storage the solution moves
+by about `cond(scaled system) x 2^-24`; LAPACK `dpocon` estimates the condition
+number after every factorization.  The validation SSE
+`||y_k||^2 - 2 x.b_k + x.G_k.x` is also a difference of terms
+`x.G_k.x / SSE_k` times larger than the result, which amplifies the storage
+rounding in CV_RMSE by that factor.  On the test problem (condition number
+~1e3, 1% noise) float32 storage gave 2e-7 coefficient error but **1.6e-4
+CV_RMSE error**, outside the 1e-4 tolerance even though the coefficient guard
+passes.  The engine therefore refuses float32 when either estimate exceeds
+`PHEASY_RFE_GRAM_F32_MAXERR`.  On a high-SNR fit, use float64.
+
+**Sizes at c3=4.5** (`n = 1,040,112`, `p = 77,063`, K = 5, float64):
+
+| item | value |
+|---|---|
+| one fold Gram | 47.5 GB (float32: 23.75 GB) |
+| store, 5 folds | 237.5 GB (disk: needs ~242 GB free; the total slot is dropped automatically when a 6th does not fit) |
+| host peak | 97 GB with 2 round buffers, 50.5 GB with 1, plus the ~38.5 GB `SM_prime` the driver holds: `--mem=200G` |
+| accumulation | `n p^2 = 6.2e15` flops: ~2.9 h at the ~600 GFLOPS the spec infers from the final refit, plus the host SpGEMM that forms the dense row blocks (not measured) |
+| dense rows streamed | 641 GB float64 (not the 38.5 GB of the sparse `SM_prime`) |
+| round solves | (K+1) Cholesky of `s^3/3`: 25 min at round 0, ~2.2 h over 9 rounds (77,063 -> 53,125) at 600 GFLOPS |
+| store reads per round | 15 Gram reads (11 with the total slot): seconds from RAM, minutes from disk |
+| GPU accumulation | upper triangle 23.8 GB float64 (11.9 GB float32): 2-3 passes per fold on one 24 GB card, 1 on two cards or one A800 80 GB; FP64 GEMM on a 3090 (~0.5 TFLOPS) is ~3 h per pass, an A800 (~9.7 TFLOPS) ~11 min |
+
+**Validation.**
+* `dev/test_rfe_gram_stream.py` (16 tests): every store layout against
+  `_RFEGramCV`, scattered fold rows, CSR and dense input, the plan arithmetic at
+  production size, a dropped row block, disk round-trip and `KEEP`, both float32
+  guards, the GPU accumulator (waves, panels, refusals) on the torch CPU device,
+  and the end-to-end RFE gate.
+* `dev/proto_rfe_gram.py` is the spec's Phase-0 gate: LSMR, the in-RAM engine
+  and every streaming layout on a synthetic two-level operator, compared for the
+  same round sequence, CV_RMSE and coefficients to 1e-6.
+* **Not run yet:** any CUDA device, and the c3=4.5 data (Phase 4).  For Phase 4,
+  `fit_scripts/Mg2C60_joint_4p50/submit_4p50_stream.sh`.  Compare against an
+  *exact* reference rather than the resident run: that run's rounds are LSMR
+  iterates at the 5000-iteration cap, and [FIX RFE-GRAM] measured CV_RMSE moving
+  2.505e-01 -> 3.401e-01 with the solver tolerance alone.
+
 ## RFE operator preconditioning
 
 `PHEASY_RFE_JACOBI=1` enables right column scaling for operator RFE subset

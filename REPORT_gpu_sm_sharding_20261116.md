@@ -312,3 +312,15 @@ Corrections after review of the first version:
   directory.
 * Not fixable without rewriting published history: the `8b1e331` commit
   message says "CSP .t() view" where it means the CSC view.
+
+---
+
+## 10. Follow-up: RFE-OLS without the resident operator
+
+The sharding above keeps `SM_prime` resident on 2-5 cards because every RFE
+round runs ~5000 LSMR matvec pairs per fold.  `PHEASY_RFE_GRAM_CV=1` (GPU.md
+"Streaming exact RFE-OLS", `SPEC_gpu_sm_streaming.md` section 9) removes that
+need.  The per-fold Grams are built in one pass on the host or on one GPU, and
+every round is an exact dense solve, so a c3=4.5 fit needs 0-1 cards, ~242 GB
+of disk and `--mem=200G` instead of 3 free cards.  It is opt-in and has not
+yet run on the c3=4.5 data.

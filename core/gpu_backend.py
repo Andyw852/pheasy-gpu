@@ -2736,6 +2736,209 @@ class GpuSparseMV(object):
             pass
 
 
+class GpuGramAccumulator(object):
+    """[RFE-GRAM-STREAM] Upper triangle of sum_blocks B^T B, accumulated on GPUs.
+
+    Used by optimizer._RFEStreamGramCV with PHEASY_RFE_GRAM_GPU=1 to build one
+    fold Gram from streamed dense row blocks B (rows x p, float64 on the host).
+
+    The p x p Gram is cut into column panels [c0, c1); a panel holds the
+    upper-triangle part G[:c1, c0:c1] (so all panels together are ~p^2/2
+    values) and lives on one device.  Panels are packed onto the devices by
+    their measured free memory; panels that do not fit at the same time form
+    further waves, each of which is one more pass over the fold's rows (the
+    caller re-streams them).  Per block every panel does one GEMM,
+    G[:c1, c0:c1] += B[:, :c1]^T B[:, c0:c1], i.e. n p^2 flops per pass -- the
+    same count as a host dsyrk.
+
+    float64 (PHEASY_RFE_GRAM_GPU_DTYPE, default) accumulates on the device.
+    float32 multiplies in float32 and flushes the panels into the caller's
+    float64 host accumulator every PHEASY_RFE_GRAM_GPU_FLUSH_ROWS rows (default
+    65536), so the float32 error grows with the flush length, not with the fold
+    size.  TF32 is switched off for the duration.  Nothing here falls back to
+    the host: a device that cannot hold one panel raises.
+
+    Devices: PHEASY_RFE_GRAM_GPU_DEVICES (comma-separated CUDA indices, or
+    "cpu" to run the same torch code on the host for testing) > the resident
+    device list (resident_device_ids()).  PHEASY_RFE_GRAM_GPU_GB caps the bytes
+    used per device (required for "cpu").
+    """
+
+    def __init__(self, p, block_rows, device_ids=None, dtype=None, panel_cols=None):
+        t = _torch()
+        if t is None:
+            raise RuntimeError("[RFE-GRAM-STREAM] PHEASY_RFE_GRAM_GPU=1 but torch is not "
+                               "importable (set PHEASY_RFE_GRAM_GPU=0 for host dsyrk)")
+        self._t = t
+        self.p = int(p)
+        self.block_rows = max(1, int(block_rows))
+        name = (dtype or os.environ.get("PHEASY_RFE_GRAM_GPU_DTYPE", "float64")).strip().lower()
+        if name not in ("float64", "float32"):
+            raise ValueError("PHEASY_RFE_GRAM_GPU_DTYPE must be float64 or float32, got %r" % name)
+        self.np_dtype = np.dtype(name)
+        self.dtype = t.float64 if name == "float64" else t.float32
+        self.item = self.np_dtype.itemsize
+        self.flush_rows = (int(os.environ.get("PHEASY_RFE_GRAM_GPU_FLUSH_ROWS", "65536"))
+                           if name == "float32" else 0)
+        self.panel_cols = max(1, int(panel_cols or os.environ.get("PHEASY_RFE_GRAM_GPU_PANEL",
+                                                                  "2048")))
+        self.devices = self._devices(device_ids)
+        self.waves = self._plan(self.devices)
+        self.n_waves = len(self.waves)
+        self._live = []
+        self._width = {}
+        self._host = None
+        self._rows = 0
+        self._tf32 = None
+
+    # -- planning -----------------------------------------------------------
+    def _devices(self, device_ids):
+        t = self._t
+        cap_raw = os.environ.get("PHEASY_RFE_GRAM_GPU_GB", "").strip()
+        cap = float(cap_raw) * 1e9 if cap_raw else None
+        frac = float(os.environ.get("PHEASY_RFE_GRAM_GPU_FRACTION", "0.9"))
+        if device_ids is None:
+            raw = os.environ.get("PHEASY_RFE_GRAM_GPU_DEVICES", "").strip()
+            if raw:
+                device_ids = [x.strip() for x in raw.split(",") if x.strip()]
+            else:
+                if not t.cuda.is_available():
+                    raise RuntimeError("[RFE-GRAM-STREAM] PHEASY_RFE_GRAM_GPU=1 but CUDA is "
+                                       "unavailable (set PHEASY_RFE_GRAM_GPU=0 for host dsyrk)")
+                device_ids = resident_device_ids()
+        out = []
+        for tok in device_ids:
+            if str(tok).lower() == "cpu":
+                if cap is None:
+                    raise ValueError("PHEASY_RFE_GRAM_GPU_DEVICES=cpu needs PHEASY_RFE_GRAM_GPU_GB")
+                out.append((t.device("cpu"), int(cap)))
+                continue
+            idx = int(tok)
+            if not t.cuda.is_available() or idx >= t.cuda.device_count():
+                raise RuntimeError("[RFE-GRAM-STREAM] CUDA device %d is not available" % idx)
+            free = _device_free_bytes(idx)
+            if free is None:
+                raise RuntimeError("[RFE-GRAM-STREAM] cannot read the free memory of "
+                                   "CUDA device %d" % idx)
+            free = free * frac
+            if cap is not None:
+                free = min(free, cap)
+            out.append((t.device("cuda:%d" % idx), int(free)))
+        if not out:
+            raise RuntimeError("[RFE-GRAM-STREAM] no device for the GPU Gram accumulation")
+        return out
+
+    def _plan(self, devices):
+        p, w = self.p, self.panel_cols
+        panels = [(c0, min(c0 + w, p)) for c0 in range(0, p, w)]
+        # the uploaded row block (up to p columns) + kernel scratch, per device
+        fixed = self.block_rows * p * self.item + (256 << 20)
+        max_waves = int(os.environ.get("PHEASY_RFE_GRAM_GPU_MAX_WAVES", "4"))
+        waves = []
+        i = 0
+        while i < len(panels):
+            wave = []
+            for dev, free in devices:
+                room = free - fixed
+                while i < len(panels) and room > 0:
+                    c0, c1 = panels[i]
+                    need = c1 * (c1 - c0) * self.item
+                    if need > room:
+                        break
+                    wave.append((dev, c0, c1))
+                    room -= need
+                    i += 1
+            if not wave:
+                c0, c1 = panels[i]
+                raise MemoryError(
+                    "[RFE-GRAM-STREAM] GPU Gram panel [%d, %d) needs %.2f GB plus %.2f GB "
+                    "for the row block, devices offer %s; lower PHEASY_RFE_GRAM_GPU_PANEL "
+                    "or PHEASY_RFE_GRAM_BLOCK_GB, or use PHEASY_RFE_GRAM_GPU=0"
+                    % (c0, c1, c1 * (c1 - c0) * self.item / 1e9, fixed / 1e9,
+                       ", ".join("%s %.2f GB" % (d, f / 1e9) for d, f in devices)))
+            waves.append(wave)
+            if len(waves) > max_waves:
+                raise MemoryError(
+                    "[RFE-GRAM-STREAM] the %s GPU Gram (p=%d, %.1f GB upper triangle) needs "
+                    "more than PHEASY_RFE_GRAM_GPU_MAX_WAVES=%d passes over each fold on %s"
+                    % (self.np_dtype.name, p, p * (p + 1) / 2.0 * self.item / 1e9,
+                       max_waves, ", ".join(str(d) for d, _f in devices)))
+        return waves
+
+    def describe(self):
+        per = {}
+        for wave in self.waves[:1]:
+            for dev, c0, c1 in wave:
+                per[str(dev)] = per.get(str(dev), 0) + c1 * (c1 - c0) * self.item
+        return ("GPU %s GEMM on %s: %d panels of <= %d columns in %d wave(s) "
+                "(wave-1 panels %s)%s"
+                % (self.np_dtype.name, ",".join(str(d) for d, _f in self.devices),
+                   sum(len(w) for w in self.waves), self.panel_cols, self.n_waves,
+                   ", ".join("%s %.2f GB" % (k, v / 1e9) for k, v in per.items()),
+                   ", float64 host flush every %d rows" % self.flush_rows
+                   if self.flush_rows else ""))
+
+    # -- accumulation -------------------------------------------------------
+    def begin_wave(self, wave, host_acc):
+        """Allocate this wave's panels (zeros); results land in host_acc."""
+        t = self._t
+        self._host = host_acc
+        self._live = []
+        self._width = {}
+        if self._tf32 is None:
+            self._tf32 = bool(t.backends.cuda.matmul.allow_tf32)
+            t.backends.cuda.matmul.allow_tf32 = False
+        for dev, c0, c1 in self.waves[wave]:
+            self._live.append((dev, c0, c1, t.zeros((c1, c1 - c0), dtype=self.dtype, device=dev)))
+            self._width[str(dev)] = max(self._width.get(str(dev), 0), c1)
+        self._rows = 0
+
+    def add(self, B):
+        """Accumulate one dense row block B (rows x p) into the live panels."""
+        t = self._t
+        Bc = np.asarray(B, dtype=self.np_dtype)
+        uploaded = {}
+        for dev, c0, c1, T in self._live:
+            key = str(dev)
+            Bd = uploaded.get(key)
+            if Bd is None:
+                wmax = self._width[key]
+                Bd = t.as_tensor(np.ascontiguousarray(Bc[:, :wmax]), device=dev)
+                uploaded[key] = Bd
+            T.addmm_(Bd[:, :c1].t(), Bd[:, c0:c1])
+        self._rows += int(Bc.shape[0])
+        if self.flush_rows and self._rows >= self.flush_rows:
+            self._flush()
+
+    def _flush(self):
+        for _dev, c0, c1, T in self._live:
+            self._host[:c1, c0:c1] += T.cpu().numpy()
+            T.zero_()
+        self._rows = 0
+
+    def end_wave(self):
+        """Download the wave's panels into the host accumulator and free them."""
+        self._flush()
+        self._live = []
+        self._release_cache()
+
+    def _release_cache(self):
+        t = self._t
+        try:
+            if t.cuda.is_available():
+                t.cuda.empty_cache()
+        except Exception:
+            pass
+
+    def close(self):
+        self._live = []
+        self._host = None
+        if self._tf32 is not None:
+            self._t.backends.cuda.matmul.allow_tf32 = self._tf32
+            self._tf32 = None
+        self._release_cache()
+
+
 class GpuTwoLevelOperator:
     """CUDA-resident SM_prime @ NS, without a product or Gram matrix.
 

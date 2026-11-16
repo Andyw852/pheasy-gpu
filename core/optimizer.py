@@ -5940,6 +5940,655 @@ class _RFEGramCV(object):
         return x, float(rm.mean()), se, rss
 
 
+# ---------------------------------------------------------------------------
+# [RFE-GRAM-STREAM] streaming per-fold Gram engine (SPEC_gpu_sm_streaming.md, D2)
+#
+# _RFEGramCV above is the same algorithm, but it holds K+1 float64 Grams plus
+# three round temporaries in RAM: 8 (K+4) p^2 bytes, 427 GB at the c3=4.5
+# p = 77,063 and still 152 GB at the final ~46k, so its budget gate never opens
+# there and every round falls back to the iterative LSMR.  This engine is the
+# opt-in layout that fits (PHEASY_RFE_GRAM_CV=1):
+#   * the folds are accumulated ONE AT A TIME (each fold reads only its own
+#     rows, so the K folds together are still one pass over the matrix), with
+#     one float64 p x p accumulator in RAM -- dsyrk on the host, or column
+#     panels on the GPU (gpu_backend.GpuGramAccumulator);
+#   * the finished fold Grams go to a store: RAM or .npy memmaps on disk, in
+#     float64 (default) or float32 (opt-in; refused when the measured condition
+#     number makes the storage rounding visible);
+#   * a round reads G_k[S, S] in column panels into at most two s x s float64
+#     buffers and solves in place (same Jacobi-scaled Cholesky / eigh min-norm
+#     rule as _gram_solve), so no third copy and no K+1 resident Grams.
+# Every size is checked against the RAM / disk budget BEFORE anything is
+# allocated, the decision is printed, and any failure raises: there is no
+# fallback to the iterative or serial-matvec path from here.
+# ---------------------------------------------------------------------------
+_F32_UNIT = float(np.finfo(np.float32).eps) / 2.0      # 2**-24
+
+
+def _rfe_stream_requested():
+    """PHEASY_RFE_GRAM_CV=1: use the streaming Gram engine for every RFE round."""
+    return _env_on("PHEASY_RFE_GRAM_CV", "0")
+
+
+def _rfe_stream_budget_bytes():
+    """Host RAM the streaming engine may use: PHEASY_RFE_GRAM_GB, else 0.8 of
+    the RAM available now (_available_memory_bytes: MemAvailable capped by the
+    job's cgroup).  The in-RAM engine's min(16 GB, avail/4) default is for its
+    opportunistic gate; this engine is an explicit request."""
+    raw = os.environ.get("PHEASY_RFE_GRAM_GB")
+    if raw is not None and raw.strip() != "":
+        return max(0.0, float(raw)) * 1e9
+    avail = _available_memory_bytes()
+    if avail is None:
+        raise RuntimeError("[RFE-GRAM-STREAM] cannot detect the available RAM; set "
+                           "PHEASY_RFE_GRAM_GB to the budget in GB")
+    return 0.8 * float(avail)
+
+
+def _rfe_stream_choice(name, allowed, default):
+    raw = os.environ.get(name, default).strip().lower()
+    if raw not in allowed:
+        raise ValueError("%s must be one of %s, got %r" % (name, "|".join(allowed), raw))
+    return raw
+
+
+def _rfe_row_take(A, cols):
+    """take(idx): dense float64 rows A[idx][:, cols] for a sorted index array.
+
+    Contiguous index ranges (the default contiguous CV folds) are one
+    _rfe_row_source slice; scattered rows (interleaved / ungrouped folds) are
+    read run by run and stacked.
+    """
+    rows = _rfe_row_source(A, cols)
+    if rows is None:
+        return None
+    width = int(np.asarray(cols).size)
+
+    def take(idx):
+        idx = np.asarray(idx, dtype=np.int64)
+        if idx.size == 0:
+            return np.zeros((0, width), dtype=np.float64)
+        i0, i1 = int(idx[0]), int(idx[-1]) + 1
+        if i1 - i0 == idx.size:
+            return rows(i0, i1)
+        brk = np.flatnonzero(np.diff(idx) != 1) + 1
+        starts = np.r_[0, brk]
+        ends = np.r_[brk, idx.size]
+        return np.vstack([rows(int(idx[a]), int(idx[b - 1]) + 1)
+                          for a, b in zip(starts, ends)])
+    return take
+
+
+def _rfe_stream_blocks(take, rows_k, blk):
+    """(row indices, dense block) over the sorted rows of one fold.
+
+    Module-level on purpose: dev/test_rfe_gram_stream.py drops a block here to
+    prove that the row accounting catches it."""
+    for j0 in range(0, int(rows_k.size), int(blk)):
+        idx = rows_k[j0:j0 + int(blk)]
+        yield idx, take(idx)
+
+
+def _rfe_stream_threads():
+    raw = os.environ.get("PHEASY_RFE_GRAM_THREADS", "").strip()
+    if raw:
+        return max(1, int(raw))
+    return max(1, min(8, os.cpu_count() or 1))
+
+
+class _GramStore(object):
+    """n_slots symmetric p x p matrices, Fortran order, in RAM or .npy memmaps."""
+
+    def __init__(self, n_slots, p, dtype, kind, directory=None, keep=False):
+        import weakref
+        self.p = int(p)
+        self.dtype = np.dtype(dtype)
+        self.kind = kind
+        self.paths = []
+        self.slots = []
+        self.directory = directory
+        if kind == "disk":
+            os.makedirs(directory, exist_ok=True)
+            for s in range(int(n_slots)):
+                path = os.path.join(directory, "rfe_gram_%d_%d.npy" % (os.getpid(), s))
+                self.paths.append(path)
+                self.slots.append(np.lib.format.open_memmap(
+                    path, mode="w+", dtype=self.dtype, shape=(self.p, self.p),
+                    fortran_order=True))
+        else:
+            self.slots = [np.empty((self.p, self.p), dtype=self.dtype, order="F")
+                          for _ in range(int(n_slots))]
+        # crash / early-exit safety: never leave 100+ GB of memmaps behind
+        self._finalizer = weakref.finalize(self, _GramStore._cleanup, list(self.paths), keep)
+
+    @staticmethod
+    def _cleanup(paths, keep):
+        if keep:
+            return
+        for path in paths:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    @property
+    def nbytes(self):
+        return int(len(self.slots) * self.p * self.p * self.dtype.itemsize)
+
+    def panel_width(self, budget_bytes):
+        return max(1, int(budget_bytes // max(1, self.p * (self.dtype.itemsize + 8))))
+
+    def put(self, s, G64, panel_bytes):
+        """Copy the float64 symmetric G64 into slot s (casting to the store dtype)."""
+        dst = self.slots[s]
+        if dst is G64:
+            return
+        pw = self.panel_width(panel_bytes)
+        for j0 in range(0, self.p, pw):
+            j1 = min(j0 + pw, self.p)
+            dst[:, j0:j1] = G64[:, j0:j1]
+        if self.kind == "disk":
+            dst.flush()
+
+    def sum_into(self, s_out, slots_in, panel_bytes):
+        """slot[s_out] = sum of slots_in, panel by panel in float64."""
+        pw = self.panel_width(panel_bytes)
+        out = self.slots[s_out]
+        for j0 in range(0, self.p, pw):
+            j1 = min(j0 + pw, self.p)
+            acc = np.array(self.slots[slots_in[0]][:, j0:j1], dtype=np.float64)
+            for s in slots_in[1:]:
+                acc += self.slots[s][:, j0:j1]
+            out[:, j0:j1] = acc
+        if self.kind == "disk":
+            out.flush()
+
+    def _panel(self, s, loc, full, j0, j1):
+        src = self.slots[s]
+        if full:
+            return np.asarray(src[:, j0:j1], dtype=np.float64)
+        sub = np.asarray(src[:, loc[j0:j1]])
+        return np.asarray(sub[loc, :], dtype=np.float64)
+
+    def gather(self, s, loc, out, mode, full, panel_bytes, threads):
+        """out (s x s float64) = / += / -= slot[s][loc][:, loc], by column panels."""
+        n = int(loc.size)
+        pw = max(1, self.panel_width(panel_bytes))
+
+        def one(j0):
+            j1 = min(j0 + pw, n)
+            P = self._panel(s, loc, full, j0, j1)
+            if mode == "set":
+                out[:, j0:j1] = P
+            elif mode == "add":
+                out[:, j0:j1] += P
+            else:
+                out[:, j0:j1] -= P
+
+        starts = list(range(0, n, pw))
+        if threads > 1 and len(starts) > 1:
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=min(threads, len(starts))) as ex:
+                list(ex.map(one, starts))
+        else:
+            for j0 in starts:
+                one(j0)
+
+    def matvec(self, s, loc, x, full, panel_bytes, threads):
+        """slot[s][loc][:, loc] @ x in float64, by column panels (no s x s copy)."""
+        n = int(loc.size)
+        pw = max(1, self.panel_width(panel_bytes))
+        starts = list(range(0, n, pw))
+
+        def one(j0):
+            j1 = min(j0 + pw, n)
+            return self._panel(s, loc, full, j0, j1) @ x[j0:j1]
+
+        if threads > 1 and len(starts) > 1:
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=min(threads, len(starts))) as ex:
+                parts = list(ex.map(one, starts))
+        else:
+            parts = [one(j0) for j0 in starts]
+        v = np.zeros(n, dtype=np.float64)
+        for part in parts:        # fixed order: reproducible sums
+            v += part
+        return v
+
+    def close(self):
+        self.slots = []
+        self._finalizer()
+
+
+def _sym_one_norm(M, panel_cols=2048):
+    """max_j sum_i |M_ij| without an s x s temporary."""
+    best = 0.0
+    for j0 in range(0, M.shape[1], panel_cols):
+        best = max(best, float(np.abs(M[:, j0:j0 + panel_cols]).sum(axis=0).max()))
+    return best
+
+
+def _spd_solve_inplace(M, rhs, ridge, rebuild):
+    """Solve (M + ridge I) x = rhs for symmetric PSD float64 M, destroying M.
+
+    Same rule as _gram_solve -- Jacobi-scaled Cholesky, and the minimum-norm
+    eigendecomposition solution in the scaled coordinates when M is not
+    numerically positive definite -- but the scaling and the factorization
+    overwrite M, so a round needs no extra s x s copy.  rebuild() refills M with
+    the unregularized system for the fallback.  Returns (x, method, rcond):
+    rcond is LAPACK's reciprocal 1-norm condition estimate of the scaled system.
+    """
+    from scipy.linalg import lapack as _lapack
+    s = int(M.shape[0])
+    rhs = np.asarray(rhs, dtype=np.float64)
+
+    def _scaled():
+        if ridge > 0:
+            M.flat[:: s + 1] += ridge
+        d = np.sqrt(np.clip(M.diagonal().copy(), 0.0, None))
+        d[~(d > 0)] = 1.0
+        inv = 1.0 / d
+        np.multiply(M, inv[:, None], out=M)     # in place (no M rebinding in
+        np.multiply(M, inv[None, :], out=M)     # this closure)
+        return inv
+
+    inv = _scaled()
+    anorm = _sym_one_norm(M)
+    try:
+        c, _low = spla.cho_factor(M, lower=False, overwrite_a=True, check_finite=False)
+        z = spla.cho_solve((c, False), rhs * inv, check_finite=False)
+        if np.all(np.isfinite(z)):
+            rcond, _info = _lapack.dpocon(c, anorm, uplo="U")
+            return z * inv, "cholesky", float(rcond)
+    except (np.linalg.LinAlgError, ValueError):
+        pass
+    # eigh needs the eigenvectors (s x s) plus dsyevd's ~2 s^2 workspace
+    _need = 3.0 * 8.0 * s * s
+    _avail = _available_memory_bytes()
+    if _avail is not None and _need > _avail:
+        raise MemoryError(
+            "[RFE-GRAM-STREAM] the %d x %d system is not numerically positive "
+            "definite and its eigendecomposition fallback needs %.1f GB, %.1f GB "
+            "available" % (s, s, _need / 1e9, _avail / 1e9))
+    rebuild()
+    inv = _scaled()
+    w, V = np.linalg.eigh(M)
+    keep = w > (w.max() if w.size else 0.0) * max(1, w.size) * np.finfo(np.float64).eps
+    z = V[:, keep] @ ((V[:, keep].T @ (rhs * inv)) / w[keep])
+    del V
+    rcond = float(max(w.min(), 0.0) / w.max()) if w.size and w.max() > 0 else 0.0
+    return z * inv, "eigh_min_norm", rcond
+
+
+def _rfe_stream_plan(n, p, K, budget, disk_dir):
+    """Choose store / dtype / buffers for p features and K folds, or raise.
+
+    Pure arithmetic on the sizes (nothing is allocated): the same numbers are
+    printed by the engine, and dev/test_rfe_gram_stream.py pins the refusals.
+    """
+    dtype = np.dtype(_rfe_stream_choice("PHEASY_RFE_GRAM_DTYPE", ("float64", "float32"),
+                                        "float64"))
+    store_req = _rfe_stream_choice("PHEASY_RFE_GRAM_STORE", ("auto", "ram", "disk"), "auto")
+    total_req = _rfe_stream_choice("PHEASY_RFE_GRAM_TOTAL", ("auto", "0", "1"), "auto")
+    nbuf_req = _rfe_stream_choice("PHEASY_RFE_GRAM_ROUND_BUFFERS", ("auto", "1", "2"), "auto")
+    gpu = _env_on("PHEASY_RFE_GRAM_GPU", "0")
+    threads = _rfe_stream_threads()
+    g64 = 8.0 * p * p                         # one float64 working matrix
+    gst = float(dtype.itemsize) * p * p       # one stored Gram
+    raw_blk = os.environ.get("PHEASY_RFE_GRAM_BLOCK_ROWS", "").strip()
+    blk_budget = float(os.environ.get("PHEASY_RFE_GRAM_BLOCK_GB", "1")) * 1e9
+    blk = int(raw_blk) if raw_blk else max(64, int(blk_budget // (8.0 * max(p, 1))))
+    blk = max(1, min(blk, max(1, int(n))))
+    block_bytes = 3.0 * blk * p * 8           # block, its stacked copy, scratch
+    panel_bytes = float(os.environ.get("PHEASY_RFE_GRAM_PANEL_GB", "0.25")) * 1e9
+    # one panel per thread: p x w columns in the store dtype plus its float64
+    # row selection, w = panel_bytes / (p (itemsize + 8)) -- never more than
+    # the whole Gram
+    panels = threads * min(panel_bytes, float(p) * p * (dtype.itemsize + 8))
+
+    def host_peak(kind, total, nbuf):
+        slots = K + (1 if total else 0)
+        store_ram = slots * gst if kind == "ram" else 0.0
+        direct = kind == "ram" and dtype == np.float64
+        accum = (0.0 if direct else g64) + block_bytes
+        rounds = nbuf * g64 + panels
+        return store_ram + max(accum, rounds)
+
+    try:
+        import shutil
+        probe = disk_dir
+        while not os.path.isdir(probe) and os.path.dirname(probe) != probe:
+            probe = os.path.dirname(probe)
+        disk_free = float(shutil.disk_usage(probe).free)
+    except OSError:
+        disk_free = 0.0
+
+    kinds = [store_req] if store_req != "auto" else ["ram", "disk"]
+    totals = {"auto": [True, False], "1": [True], "0": [False]}[total_req]
+    nbufs = {"auto": [2, 1], "2": [2], "1": [1]}[nbuf_req]
+    tried = []
+    for kind in kinds:
+        for total in totals:
+            for nbuf in nbufs:
+                peak = host_peak(kind, total, nbuf)
+                need_disk = (K + (1 if total else 0)) * gst * 1.02 if kind == "disk" else 0.0
+                ok = peak <= budget and need_disk <= 0.95 * disk_free
+                tried.append("store=%s total=%s buffers=%d: host %.1f GB%s"
+                             % (kind, "on" if total else "off", nbuf, peak / 1e9,
+                                ", disk %.1f GB" % (need_disk / 1e9) if kind == "disk" else ""))
+                if ok:
+                    return {"dtype": dtype, "store": kind, "total": total, "nbuf": nbuf,
+                            "gpu": gpu, "threads": threads, "block_rows": blk,
+                            "panel_bytes": panel_bytes, "host_peak": peak,
+                            "store_bytes": (K + (1 if total else 0)) * gst,
+                            "budget": budget, "disk_free": disk_free, "disk_dir": disk_dir,
+                            "gram64_bytes": g64, "block_bytes": block_bytes}
+    raise MemoryError(
+        "[RFE-GRAM-STREAM] p=%d, K=%d, %s Grams do not fit: RAM budget %.1f GB, "
+        "disk free %.1f GB in %s.  Tried: %s.  Options: PHEASY_RFE_GRAM_GB (RAM "
+        "budget), PHEASY_RFE_GRAM_STORE=disk with PHEASY_RFE_GRAM_DIR on a larger "
+        "disk, PHEASY_RFE_GRAM_DTYPE=float32 (halves the store; condition-checked)"
+        % (p, K, dtype.name, budget / 1e9, disk_free / 1e9, disk_dir, "; ".join(tried)))
+
+
+class _RFEStreamGramCV(object):
+    """[RFE-GRAM-STREAM] _RFEGramCV's exact K-fold least squares at large p.
+
+    Same interface (local / round / release, K, cols, nbytes, build_seconds,
+    rounds, methods, last_fold_rmse) and the same identities: training system
+    (sum_j G_j - G_k)[S, S], validation MSE (||y_k||^2 - 2 x.b_k + x.G_k.x)/n_k,
+    full-data fit from sum_j G_j.  See the block comment above for the layout.
+    """
+
+    streaming = True
+
+    def __init__(self, A, y, cols, splits, ridge_alpha=0.0, verbose=True):
+        import time as _time
+        t0 = _time.time()
+        y = np.asarray(y, dtype=np.float64).ravel()
+        n = int(A.shape[0])
+        self.K = K = len(splits)
+        self.cols = np.asarray(cols, dtype=np.int64)
+        p = int(self.cols.size)
+        self.p = p
+        self.ridge = float(ridge_alpha)
+        self.verbose = bool(verbose)
+        if not _splits_partition(splits, n):
+            raise ValueError("[RFE-GRAM-STREAM] CV splits do not partition the rows")
+        take = _rfe_row_take(A, self.cols)
+        if take is None:
+            raise ValueError("[RFE-GRAM-STREAM] no row source for %s" % type(A).__name__)
+        disk_dir = os.path.abspath(os.environ.get("PHEASY_RFE_GRAM_DIR", "rfe_gram_store"))
+        plan = _rfe_stream_plan(n, p, K, _rfe_stream_budget_bytes(), disk_dir)
+        self.plan = plan
+        self.dtype = plan["dtype"]
+        self.threads = plan["threads"]
+        self.panel_bytes = plan["panel_bytes"]
+        self.nbuf = plan["nbuf"]
+        self.total_slot = K if plan["total"] else None
+        gacc = None
+        if plan["gpu"]:
+            try:
+                from . import gpu_backend as _gbm
+            except (ImportError, ValueError):
+                from pheasy_gpu.core import gpu_backend as _gbm
+            # Requested explicitly: a GPU that cannot hold the panels raises
+            # here; there is no silent switch to host accumulation.
+            gacc = _gbm.GpuGramAccumulator(p, block_rows=plan["block_rows"])
+        self.gpu_plan = gacc.describe() if gacc is not None else None
+        print("[RFE-GRAM-STREAM] p=%d K=%d n=%d: store=%s%s dtype=%s total=%s "
+              "round-buffers=%d; Grams %.1f GB, host peak %.1f GB of %.1f GB budget "
+              "(one float64 Gram = %.1f GB, row blocks of %d rows = %.2f GB); "
+              "accumulation: %s"
+              % (p, K, n, plan["store"],
+                 "(%s, %.1f GB free)" % (disk_dir, plan["disk_free"] / 1e9)
+                 if plan["store"] == "disk" else "", self.dtype.name,
+                 "on" if plan["total"] else "off", self.nbuf,
+                 plan["store_bytes"] / 1e9, plan["host_peak"] / 1e9, plan["budget"] / 1e9,
+                 plan["gram64_bytes"] / 1e9, plan["block_rows"],
+                 plan["block_rows"] * p * 8 / 1e9,
+                 self.gpu_plan if gacc is not None else "host dsyrk (float64)"),
+              flush=True)
+        slots = K + (1 if plan["total"] else 0)
+        self.store = _GramStore(slots, p, self.dtype, plan["store"], disk_dir,
+                                keep=_env_on("PHEASY_RFE_GRAM_KEEP", "0"))
+        try:
+            self._accumulate(take, y, splits, plan, gacc)
+        except BaseException:
+            self.store.close()
+            raise
+        finally:
+            if gacc is not None:
+                gacc.close()
+        self.nbytes = self.store.nbytes
+        self.build_seconds = _time.time() - t0
+        self.rounds = 0
+        self.methods = set()
+        self.max_cond = 0.0
+        self.round_seconds = []
+        self.last_fold_rmse = None
+
+    # -- accumulation -----------------------------------------------------
+    def _accumulate(self, take, y, splits, plan, gacc):
+        import time as _time
+        from scipy.linalg import blas as _blas
+        K, p = self.K, self.p
+        direct = plan["store"] == "ram" and self.dtype == np.float64
+        acc = None if direct else np.empty((p, p), dtype=np.float64, order="F")
+        self.b = np.zeros((K, p), dtype=np.float64)
+        self.yy = np.zeros(K, dtype=np.float64)
+        self.nk = np.zeros(K, dtype=np.int64)
+        self.diag = np.zeros(p, dtype=np.float64)
+        blk = plan["block_rows"]
+        for k, (_tr, va) in enumerate(splits):
+            t0 = _time.time()
+            rows_k = np.sort(np.asarray(va, dtype=np.int64))
+            G = self.store.slots[k] if direct else acc
+            G.fill(0.0)
+            n_blocks = 0
+            waves = gacc.n_waves if gacc is not None else 1
+            for wave in range(waves):
+                if gacc is not None:
+                    gacc.begin_wave(wave, G)
+                for idx, B in _rfe_stream_blocks(take, rows_k, blk):
+                    if gacc is not None:
+                        gacc.add(B)
+                    else:
+                        G = _blas.dsyrk(1.0, B.T, beta=1.0, c=G, trans=0, lower=0,
+                                        overwrite_c=1)
+                    if wave == 0:
+                        yb = y[idx]
+                        self.b[k] += B.T @ yb
+                        self.yy[k] += float(yb @ yb)
+                        self.nk[k] += int(idx.size)
+                        n_blocks += 1
+                    del B
+                if gacc is not None:
+                    gacc.end_wave()
+            _mirror_upper(G)
+            self.diag += G.diagonal()
+            self.store.put(k, G, self.panel_bytes)
+            if self.verbose:
+                print("[RFE-GRAM-STREAM] fold %d/%d: %d rows in %d blocks%s, %.1fs"
+                      % (k + 1, K, int(self.nk[k]), n_blocks,
+                         " x %d GPU waves" % waves if gacc is not None and waves > 1 else "",
+                         _time.time() - t0), flush=True)
+        del acc
+        # [no silent drops] every fold must have accumulated exactly its rows
+        want = np.array([len(va) for _tr, va in splits], dtype=np.int64)
+        yy_want = np.array([float(np.dot(y[np.asarray(va)], y[np.asarray(va)]))
+                            for _tr, va in splits])
+        if not (np.array_equal(self.nk, want) and int(self.nk.sum()) == int(y.size)):
+            raise RuntimeError(
+                "[RFE-GRAM-STREAM] row accounting failed: accumulated %s rows per fold, "
+                "the CV splits have %s (a row block was dropped or duplicated)"
+                % (self.nk.tolist(), want.tolist()))
+        if not np.allclose(self.yy, yy_want, rtol=1e-12, atol=0.0):
+            raise RuntimeError("[RFE-GRAM-STREAM] ||y_k||^2 mismatch: %s vs %s"
+                               % (self.yy.tolist(), yy_want.tolist()))
+        if not np.all(np.isfinite(self.diag)):
+            raise RuntimeError("[RFE-GRAM-STREAM] non-finite Gram diagonal")
+        if self.total_slot is not None:
+            self.store.sum_into(self.total_slot, list(range(K)), self.panel_bytes)
+        self.bt = self.b.sum(axis=0)
+        self.yyt = float(self.yy.sum())
+
+    # -- interface shared with _RFEGramCV ---------------------------------
+    def col_norms(self):
+        """||A[:, j]|| for the engine's columns, from the float64 Gram diagonal."""
+        return np.sqrt(np.clip(self.diag, 0.0, None))
+
+    def release(self):
+        if getattr(self, "store", None) is not None:
+            self.store.close()
+            self.store = None
+        self.b = self.bt = None
+
+    def local(self, idx):
+        idx = np.asarray(idx, dtype=np.int64)
+        loc = np.searchsorted(self.cols, idx)
+        if loc.size and (loc.max() >= self.cols.size
+                         or not np.array_equal(self.cols[loc], idx)):
+            return None
+        return loc
+
+    def _round_bytes(self, s):
+        return self.nbuf * 8.0 * s * s + self.threads * min(
+            self.panel_bytes, float(self.p) * s * (self.dtype.itemsize + 8))
+
+    def _total_into(self, loc, M, full):
+        st = self.store
+        if self.total_slot is not None:
+            st.gather(self.total_slot, loc, M, "set", full, self.panel_bytes, self.threads)
+            return
+        for k in range(self.K):
+            st.gather(k, loc, M, "set" if k == 0 else "add", full, self.panel_bytes,
+                      self.threads)
+
+    def _train_into(self, k, loc, W, M, full):
+        """W = (sum_j G_j - G_k)[S, S]: from M when two buffers are held, else
+        summed over the other folds (one buffer, K-1 reads)."""
+        st = self.store
+        if M is not None:
+            np.copyto(W, M)
+            st.gather(k, loc, W, "sub", full, self.panel_bytes, self.threads)
+            return
+        first = True
+        for j in range(self.K):
+            if j == k:
+                continue
+            st.gather(j, loc, W, "set" if first else "add", full, self.panel_bytes,
+                      self.threads)
+            first = False
+
+    def _check_condition(self, rcond, what):
+        cond = (1.0 / rcond) if rcond > 0 else float("inf")
+        self.max_cond = max(self.max_cond, cond)
+        if self.dtype == np.float32:
+            maxerr = float(os.environ.get("PHEASY_RFE_GRAM_F32_MAXERR", "1e-4"))
+            if cond * _F32_UNIT > maxerr:
+                raise RuntimeError(
+                    "[RFE-GRAM-STREAM] float32 Gram storage is too coarse for this "
+                    "system: the Jacobi-scaled %s has condition ~%.2e, so the 2^-24 "
+                    "storage rounding moves the solution by ~%.1e (limit "
+                    "PHEASY_RFE_GRAM_F32_MAXERR=%.1e).  Use PHEASY_RFE_GRAM_DTYPE=float64."
+                    % (what, cond, cond * _F32_UNIT, maxerr))
+
+    def _check_cancellation(self, gk, sse, k):
+        """The validation SSE is ||y_k||^2 - 2 x.b_k + x.G_k.x: a difference of
+        terms ~||y_k||^2 / SSE_k larger than the result.  The stored G_k enters
+        only through x.G_k.x, so its rounding moves CV_RMSE by about
+        0.5 u |x.G_k.x| / SSE_k (u = 2^-24 for float32 storage)."""
+        amp = abs(gk) / max(sse, np.finfo(np.float64).tiny)
+        self.max_sse_amplification = max(getattr(self, "max_sse_amplification", 0.0), amp)
+        if self.dtype == np.float32:
+            maxerr = float(os.environ.get("PHEASY_RFE_GRAM_F32_MAXERR", "1e-4"))
+            est = 0.5 * _F32_UNIT * amp
+            if est > maxerr:
+                raise RuntimeError(
+                    "[RFE-GRAM-STREAM] float32 Gram storage cannot resolve the "
+                    "validation error of fold %d: x.G_k.x is %.2e times SSE_k, so the "
+                    "2^-24 storage rounding moves CV_RMSE by ~%.1e (limit "
+                    "PHEASY_RFE_GRAM_F32_MAXERR=%.1e).  Use PHEASY_RFE_GRAM_DTYPE=float64."
+                    % (k, amp, est, maxerr))
+
+    def round(self, loc, want_cv=True, final=False):
+        """(coef on the full data, cv_mean, cv_se, rss) for the support loc."""
+        import time as _time
+        t0 = _time.time()
+        loc = np.asarray(loc, dtype=np.int64)
+        s = int(loc.size)
+        full = bool(s == self.p and np.array_equal(loc, np.arange(self.p)))
+        need = self._round_bytes(s)
+        avail = _available_memory_bytes()
+        if avail is not None and need > avail:
+            raise MemoryError(
+                "[RFE-GRAM-STREAM] round on %d features needs %.1f GB of float64 "
+                "buffers, %.1f GB available" % (s, need / 1e9, avail / 1e9))
+        st = self.store
+        bt = self.bt[loc]
+        rm = None
+        M = None
+        if want_cv:
+            M = np.empty((s, s), dtype=np.float64, order="F") if self.nbuf == 2 else None
+            if M is not None:
+                self._total_into(loc, M, full)
+            W = np.empty((s, s), dtype=np.float64, order="F")
+            rm = np.empty(self.K, dtype=np.float64)
+            for k in range(self.K):
+                bk = self.b[k][loc]
+                self._train_into(k, loc, W, M, full)
+                xk, how, rc = _spd_solve_inplace(
+                    W, bt - bk, self.ridge,
+                    lambda k=k: self._train_into(k, loc, W, M, full))
+                self.methods.add(how)
+                self._check_condition(rc, "fold-%d training system" % k)
+                gk = float(xk @ st.matvec(k, loc, xk, full, self.panel_bytes, self.threads))
+                sse = self.yy[k] - 2.0 * float(xk @ bk) + gk
+                self._check_cancellation(gk, sse, k)
+                mse = sse / max(int(self.nk[k]), 1)
+                rm[k] = np.sqrt(max(mse, 0.0))
+            del W
+        if M is None:
+            M = np.empty((s, s), dtype=np.float64, order="F")
+            self._total_into(loc, M, full)
+        r_full = _rfe_final_ridge() if final else self.ridge
+        x, how, rc = _spd_solve_inplace(M, bt, r_full,
+                                        lambda: self._total_into(loc, M, full))
+        self.methods.add(how)
+        self._check_condition(rc, "full-data system")
+        del M
+        # rss from the unregularized full Gram, as _RFEGramCV (x.G.x by panels).
+        # Only the AIC/BIC rounds read it (want_cv=False); a CV round and the
+        # final refit skip the extra pass over the store and report NaN.
+        rss = float("nan")
+        if not want_cv and not final:
+            if self.total_slot is not None:
+                xGx = float(x @ st.matvec(self.total_slot, loc, x, full,
+                                          self.panel_bytes, self.threads))
+            else:
+                xGx = float(sum(x @ st.matvec(k, loc, x, full, self.panel_bytes,
+                                              self.threads) for k in range(self.K)))
+            rss = max(self.yyt - 2.0 * float(x @ bt) + xGx, 0.0)
+        self.rounds += 1
+        self.round_seconds.append(_time.time() - t0)
+        if rm is None:
+            return x, None, None, rss
+        se = float(rm.std(ddof=1) / np.sqrt(self.K)) if self.K > 1 else 0.0
+        self.last_fold_rmse = rm
+        return x, float(rm.mean()), se, rss
+
+    def describe(self):
+        """What backend_metadata_ reports about this engine."""
+        return {"mode": "stream", "store": self.plan["store"], "dtype": self.dtype.name,
+                "total_slot": self.total_slot is not None, "round_buffers": int(self.nbuf),
+                "store_bytes": int(self.nbytes), "host_peak_bytes": int(self.plan["host_peak"]),
+                "block_rows": int(self.plan["block_rows"]), "gpu": self.gpu_plan,
+                "max_condition_estimate": float(self.max_cond),
+                "max_sse_amplification": float(getattr(self, "max_sse_amplification", 0.0)),
+                "round_seconds": [float(t) for t in self.round_seconds]}
+
+
 def _rfe_final_lsmr_maxiter():
     """Iteration cap of the RFE final LSMR fallback, or None to inherit.
 
@@ -6393,7 +7042,11 @@ class _RFECVBase:
                   "eliminated; step/min_features apply to the %d eliminable ones"
                   % (int(protected.sum()), int((~protected).sum())), flush=True)
 
-        col_norms = _col_norms(A)
+        # [RFE-GRAM-STREAM] the streaming engine's Gram diagonal IS ||A[:, j]||^2,
+        # so with PHEASY_RFE_GRAM_CV=1 the norms come from it (below) instead of a
+        # separate pass (which on a TwoLevelSM needs the GPU or the column-norm file)
+        _stream = _rfe_stream_requested()
+        col_norms = None if _stream else _col_norms(A)
         # Reuse training norms as a right preconditioner, not as a change to
         # feature ranking or ridge objective. Independent test data is not used;
         # CV folds share these training-pool norms as a numerical preconditioner.
@@ -6443,7 +7096,25 @@ class _RFECVBase:
             and not os.environ.get("PHEASY_RFE_SUPPORT_NPY"))
         del _fold_rows
         gram_from_round = None
-        if gram_eligible and _RFEGramCV.fits(n_features, len(splits), gram_budget):
+        if _stream:
+            # [RFE-GRAM-STREAM] explicit request: one streaming pass, then every
+            # round is an exact dense solve.  Nothing here falls back: a plan that
+            # does not fit, a dropped row block or a failed GPU accumulation
+            # raises with the reason (the iterative / serial-matvec path is not
+            # reachable once PHEASY_RFE_GRAM_CV=1).
+            if not (_is_linear_operator(A) or sp.issparse(A) or isinstance(A, np.ndarray)):
+                raise TypeError("PHEASY_RFE_GRAM_CV=1 needs operator, sparse or dense "
+                                "input, got %s" % type(A).__name__)
+            gram = _RFEStreamGramCV(A, y, np.arange(n_features), splits,
+                                    ridge_alpha=self.ridge_alpha, verbose=self.verbose)
+            gram_from_round = 0
+            col_norms = gram.col_norms()
+            if _rfe_resident_on and self.verbose:
+                print("[RFE] PHEASY_RFE_GRAM_CV=1: the rounds are solved from the "
+                      "streamed Grams; the resident iterative GPU operator is not built",
+                      flush=True)
+            _rfe_resident_on = False
+        elif gram_eligible and _RFEGramCV.fits(n_features, len(splits), gram_budget):
             # Build it now, BEFORE deciding to skip the resident setup: a build
             # that fails must leave the GPU path in place, not fall through to
             # the CPU iterative solver.
@@ -6771,10 +7442,14 @@ class _RFECVBase:
                     print("[RFE] exact Gram CV unavailable (%s: %s); iterative subset "
                           "solves continue" % (type(_gexc).__name__, _gexc), flush=True)
             if gram is not None and gram.rounds == 0 and self.verbose:
-                print("[RFE] exact Gram CV from round %d (n_active=%d): per-fold float64 "
-                      "Grams (%d folds, %.2f GB) built in %.1fs; this and every later "
+                print("[RFE] exact Gram CV from round %d (n_active=%d): per-fold %s "
+                      "Grams (%d folds, %.2f GB%s) built in %.1fs; this and every later "
                       "round are solved exactly (no iterative precision floor)"
-                      % (gram_from_round, n_active, len(splits), gram.nbytes / 1e9,
+                      % (gram_from_round, n_active,
+                         getattr(gram, "dtype", np.dtype(np.float64)).name, len(splits),
+                         gram.nbytes / 1e9,
+                         ", streamed, store=%s" % gram.plan["store"]
+                         if getattr(gram, "streaming", False) else "",
                          gram.build_seconds), flush=True)
             _gram_loc = gram.local(idx) if gram is not None else None
             if _gram_loc is not None:
@@ -6906,15 +7581,19 @@ class _RFECVBase:
                 _sel = np.where(best_support)[0]
                 _engine = "qr"
                 _g = None
-                if _RFEGramCV.fits(_sel.size, len(splits), gram_budget):
+                if getattr(gram, "streaming", False):
+                    _g = gram
+                elif _RFEGramCV.fits(_sel.size, len(splits), gram_budget):
                     try:
                         _g = _RFEGramCV(A, y, _sel, splits, ridge_alpha=self.ridge_alpha)
                     except (MemoryError, ValueError, np.linalg.LinAlgError):
                         _g = None
                 if _g is not None:
-                    _, best_mean, best_se, _ = _g.round(np.arange(_sel.size))
+                    # local(): positions in the engine's columns (arange for an
+                    # engine built on _sel, the support inside the streamed one)
+                    _, best_mean, best_se, _ = _g.round(_g.local(_sel))
                     _folds = _g.last_fold_rmse
-                    _engine = "gram"
+                    _engine = "gram_stream" if getattr(_g, "streaming", False) else "gram"
                     del _g
                 else:
                     best_mean, best_se, _folds = _cv_rmse(
@@ -7051,11 +7730,22 @@ class _RFECVBase:
                                     self.ridge_alpha, _final[-1])
         coef_full = np.zeros(n_features, dtype=np.float64)
         coef_full[best_idx] = coef_final
+        _gram_engine = None
+        if getattr(gram, "streaming", False):
+            # [RFE-GRAM-STREAM] free the store (and delete its memmaps) now that the
+            # delivered coefficients exist; metadata keeps the sizes and timings
+            _gram_engine = gram.describe()
+            gram.release()
+        elif gram is not None:
+            _gram_engine = {"mode": "in_ram", "dtype": "float64"}
 
         self.coef_ = coef_full
         self.intercept_ = 0.0
         self.support_ = best_support
         self.n_iter_ = round_num
+        # per-round (n_active, cv_mean, cv_se) at full precision: what the log
+        # prints to 7 digits, for engine-vs-engine comparisons (proto_rfe_gram.py)
+        self.rfe_history_ = [(int(h[0]), float(h[1]), float(h[2])) for h in history]
         # A run that broke out before the first CV evaluation has NO CV score.
         # It used to publish best_mean = 0.0, i.e. a fabricated PERFECT CV RMSE
         # ("- RMSE_CV: 0.0 eV/A" in the log, rmse_path_mean = 0.0 in the metrics)
@@ -7087,6 +7777,8 @@ class _RFECVBase:
             "gram_build_seconds": float(gram.build_seconds) if gram is not None else None,
             "gram_from_round": gram_from_round,
             "gram_solvers": sorted(gram.methods) if gram is not None else [],
+            # [RFE-GRAM-STREAM] layout of the engine that answered the rounds
+            "gram_engine": _gram_engine,
             "iterative_diagnostics": iterative_diagnostics,
             "resident_input_kind": ("csr" if sp.issparse(A) else "twolevel") if resident_operator else ("dense" if resident_A is not None else None),
             "gpu_subset_solves": int(gpu_subset_solves),

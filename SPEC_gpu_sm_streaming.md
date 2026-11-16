@@ -1,6 +1,8 @@
 # Streaming (batched) execution for the c3 >= 4.5 RFE-OLS fit — specification for review
 
-Status: proposal, nothing implemented beyond what is noted in "Reuse".
+Status: phases 0-3 implemented behind `PHEASY_RFE_GRAM_CV=1` (default off);
+phase 4 (c3=4.5 on the cluster) not run.  See section 9 for what was built,
+where it deviates from this proposal, and the corrections to sections 2-6.
 Audience: whoever implements/reviews the streaming path in `pheasy-gpu`.
 Scope: `core/optimizer.py` (RFE-OLS / TwoLevelSM / Gram engine),
 `core/gpu_backend.py` (`GpuSparseMV`), plus one dev harness.

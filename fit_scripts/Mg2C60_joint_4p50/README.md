@@ -26,6 +26,7 @@ for the code-side change they rely on.
 | `submit_4p50_resume5.sh` | the fit job: prep -> `pheasy -f` -> post, with GPU card selection and fail-fast guards |
 | `pick_gpus.py` | standalone helper: prints the visible GPU indices ordered by **measured** free VRAM (freest first), for setups where the resident budget comes from `device[0]`. `submit_4p50_resume5.sh` does **not** call it; it has its own inline selector with the 15 GiB threshold |
 | `submit_colnorm.sh` | SLURM wrapper that precomputes the column norms on 32 CPUs |
+| `submit_4p50_stream.sh` | the same fit in **streaming mode** (`PHEASY_RFE_GRAM_CV=1`): no resident SpMV, CPU only or 1 GPU (`STREAM_GPU=1`); see "Streaming mode" below. Not yet run on the cluster |
 | `colnorm_parallel.py` | the actual parallel column-norm pass. Same per-block float64 arithmetic as the serial definition, but the blocks are summed in completion order (`imap_unordered`), so it matches to float64 rounding, not bit for bit |
 
 Everything else (`fc_fit_driver.py`, `fit_config.json`, `sm_prime.npz`,
@@ -113,6 +114,28 @@ below), so a restart after a crash costs ~40 min (`-c`) instead of ~5 h.
    exports `PHEASY_COL_NORMS_FILE` only when `sm_prime.npz` is reused, and
    moves the file to `colnorms_4p50.npy.stale` when a rebuild is coming;
    rerun `submit_colnorm.sh` after the rebuild.
+
+## Streaming mode (0 or 1 GPU)
+
+`submit_4p50_stream.sh` runs the same prep -> fit -> post with
+`PHEASY_RFE_GRAM_CV=1` (GPU.md "Streaming exact RFE-OLS").  The fit builds the
+five fold Grams of the 77,063 features once, then solves every RFE round
+exactly from them.  None of the four rules above about the resident operator
+applies: there are no shards and no `GpuSparseMV`, and the column norms come
+from the Grams.  What it needs instead:
+
+* **disk**: ~242 GB free under `PHEASY_RFE_GRAM_DIR` (default
+  `$CASE/rfe_gram_store`) for five 47.5 GB float64 fold Grams; the files are
+  deleted when the fit ends (`PHEASY_RFE_GRAM_KEEP=1` keeps them);
+* **RAM**: `--mem=200G`.  The engine plans with 0.8 of the RAM available when it
+  starts and prints the plan; a plan that does not fit raises before allocating;
+* **time** (estimated, not measured): ~3 h of accumulation on the host
+  (`STREAM_GPU=1` moves it to the freest card) plus ~2.2 h of round
+  Cholesky, instead of 10-14 h on 3 resident cards.
+
+Its rounds are exact least squares, so CV_RMSE will **not** match the
+resident run's LSMR iterates to 1e-4: those stop at the 5000-iteration cap.
+Compare supports and kappa, and treat the streaming run as the reference.
 
 ## Timings measured on this box (RTX 3090, 24 GB, 56 CPU cores)
 
