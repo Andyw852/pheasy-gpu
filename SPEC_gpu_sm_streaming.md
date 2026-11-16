@@ -279,3 +279,114 @@ Two things fall out of this table:
 * The streaming work must not disturb the resident path; `6c3b013` is the
   current `main` (see `REPORT_gpu_sm_sharding_20261116.md`,
   `REVIEW_NOTE_gpu_sm_sharding_zh.md`).
+
+---
+
+## 9. Implementation status (phases 0-3)
+
+Opt-in through `PHEASY_RFE_GRAM_CV=1`; without it the RFE path is unchanged.
+User documentation: GPU.md "Streaming exact RFE-OLS"; knobs also in README.md.
+
+| phase | where | state |
+|---|---|---|
+| 0 prototype / gate | `dev/proto_rfe_gram.py` | passes at p = 2000 (below) |
+| 1 round loop | `_RFEStreamGramCV`, `_GramStore`, `_spd_solve_inplace` in `core/optimizer.py`, wired into `_RFECVBase.fit` | done |
+| 2 streaming pass + guards | `_rfe_stream_plan`, `_rfe_row_take`, fold-by-fold accumulation, row accounting | done (no memmap of `sm_prime.npz`, see below) |
+| 3 GPU Gram | `GpuGramAccumulator` in `core/gpu_backend.py` | done, tested on the torch CPU device only |
+| 4 c3=4.5 end to end | `fit_scripts/Mg2C60_joint_4p50/submit_4p50_stream.sh` | **not run** |
+
+**Phase-0 gate** (`python dev/proto_rfe_gram.py`): a 12000 x 2000 two-level
+operator with 400 protected columns at 40x norm, 5 grouped folds, step 0.10,
+patience 5.  Every engine runs the same 23 rounds and selects the same 574
+features:
+
+| engine | CV_RMSE vs in-RAM engine | coef |
+|---|---|---|
+| LSMR (tolerances tightened, float64 operator) | 2.4e-13 | 1.3e-15 |
+| stream, RAM store | 2.8e-13 | 3.7e-16 |
+| stream, disk store | 2.8e-13 | 3.7e-16 |
+| stream, one round buffer | 3.5e-13 | 3.7e-16 |
+| stream, GPU accumulation (torch CPU device) | 1.6e-13 | 3.2e-16 |
+
+The gate needs a float64 operator: a float32 LSMR stops at its precision floor,
+far above 1e-6.  `dev/test_rfe_gram_stream.py` (16 tests) runs the same gate at
+test size plus the guard cases of section 6: memory refusal before allocating,
+disk round-trip, a dropped row block, and both float32 guards.
+
+### Knobs (section 5's names, plus what the implementation needed)
+
+`PHEASY_RFE_GRAM_CV`, `PHEASY_RFE_GRAM_DTYPE=float64|float32`,
+`PHEASY_RFE_GRAM_STORE=auto|ram|disk`, `PHEASY_RFE_GRAM_GPU=0|1` as proposed.
+Added: `PHEASY_RFE_GRAM_DIR` / `_KEEP`, `_TOTAL` (store `sum_k G_k` too),
+`_ROUND_BUFFERS` (1 or 2 `s x s` buffers), `_BLOCK_GB` / `_BLOCK_ROWS`,
+`_PANEL_GB`, `_THREADS`, `_F32_MAXERR`, and `PHEASY_RFE_GRAM_GPU_{DEVICES,DTYPE,
+PANEL,GB,FRACTION,MAX_WAVES,FLUSH_ROWS}`.  `PHEASY_RFE_GRAM_GB` is the budget
+of both engines; in streaming mode its default is 0.8 of the available RAM.
+
+### Deviations from sections 4-5
+
+* **Fold-by-fold accumulation.**  All K fold Grams cannot be in memory while
+  one pass routes rows to them (237.5 GB at p = 77,063).  Each fold is
+  therefore accumulated from its own rows into one float64 accumulator.  With
+  the default contiguous CV folds each fold is one row range, and the K folds
+  together are still one pass.
+* **float64 is the default everywhere** (store, accumulation, GPU GEMM).
+  float32 storage is accepted only under the two guards below; GPU float32
+  GEMM flushes into a float64 host accumulator.
+* **No memmap of `sm_prime.npz`.**  The driver already holds `SM_prime` (38.5
+  GB) when the RFE starts.  The plan counts it, through the available-RAM
+  budget, and the c3=4.5 plan fits `--mem=200G` with it in RAM.  Mapping
+  the npz instead needs a driver change and uncompressed members.  That is
+  left for when a cutoff stops fitting.
+
+### Corrections to sections 2-6
+
+1. **D2 already existed.**  `_RFEGramCV` ([FIX RFE-GRAM]) uses exactly the
+   identities of section 4/D2, in float64 host RAM.  Its gate `8 (K+4) p^2 <=
+   PHEASY_RFE_GRAM_GB` (default 16 GB) needs 427.6 GB at p = 77,063 and
+   152.3 GB at the final ~46k, so it never engaged at c3=4.5.  The work was the
+   memory layout, not a new solver.
+2. **"CV solves: minutes" is wrong.**  A round is K+1 Cholesky factorizations
+   of `s^3/3` flops: 25 min at round 0 (s = 77,063) at 600 GFLOPS.  With the
+   support shrinking 77,063 -> 53,125 that is ~2.2 h over nine rounds.  The D2
+   totals in section 5 understate the host runs by ~2 h.
+3. **One pass is not 1.75 s of PCIe.**  What is streamed and multiplied are
+   dense rows of `SM_prime @ NS`, 641 GB in float64 (321 GB float32), not the
+   38.5 GB sparse `SM_prime`.  On the GPU that is ~30 s of PCIe per wave.
+   Forming those rows on the host (sparse x sparse products, densified) is a
+   cost nobody has measured.  It may dominate the accumulation.
+4. **The memory tables omit the round buffers.**  A round needs one or two
+   `s x s` float64 matrices: 47.5 GB each at round 0.  The "float32 Grams in
+   RAM, ~120-130 GB" option is really 118.8 GB store + 47.5-95 GB buffers +
+   38.5 GB `SM_prime`, i.e. 205-252 GB, which does not fit the 251 GB host
+   with two buffers.  The float64 disk store fits: 97 GB host peak + 38.5 GB.
+5. **"GPU-resident float32 Gram (23.7 GB)" is one of K.**  With fold-by-fold
+   accumulation only one is resident at a time.  Only its upper triangle is
+   needed (11.9 GB float32, 23.8 GB float64), so float64 fits one A800 or two
+   24 GB cards in one pass, and one 24 GB card in 2-3.
+6. **float32 Grams fail the CV tolerance of section 6 on high-SNR data.**  The
+   validation SSE `||y_k||^2 - 2 x.b_k + x.G_k.x` cancels by a factor of
+   `x.G_k.x / SSE_k`, which multiplies the 2^-24 storage rounding.  On the
+   test problem (cond ~1e3, 1% noise) float32 storage gave 2e-7 coefficient
+   error but 1.6e-4 CV_RMSE error.  The engine refuses float32 when that
+   estimate, or `cond x 2^-24` from LAPACK `dpocon`, exceeds
+   `PHEASY_RFE_GRAM_F32_MAXERR` (1e-4).
+7. **"Per-round CV_RMSE within 1e-4 of the resident run" is not attainable.**
+   The resident rounds are LSMR iterates at the 5000-iteration cap (istop=7),
+   not least-squares solutions.  [FIX RFE-GRAM] measured the same support
+   scoring CV_RMSE 2.505e-01 or 3.401e-01 depending only on the solver
+   tolerance.  For phase 4, compare the final support, fc2/fc3 and kappa with
+   the resident run, and take the streaming run as the reference for
+   per-round CV.  A tolerance check needs an exact reference, e.g. the in-RAM
+   engine on a support that fits it (`PHEASY_RFE_SUPPORT_NPY` +
+   `PHEASY_RFE_SUPPORT_CV`).
+
+### Section 7 decisions, as currently defaulted
+
+1. LSMR -> exact: opt-in per run (`PHEASY_RFE_GRAM_CV=1`).
+2. Gram dtype: float64; float32 behind the two guards.
+3. Folds: unchanged (5, the same `_make_cv_splits`).
+4. Gram location: `auto` = RAM if the plan fits, else disk; the GPU only
+   accumulates, and only when asked.
+5. `GpuTwoLevelOperator`: untouched (not used by this path).
+

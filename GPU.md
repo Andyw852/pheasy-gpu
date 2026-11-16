@@ -1715,7 +1715,11 @@ passes.  The engine therefore refuses float32 when either estimate exceeds
   and the end-to-end RFE gate.
 * `dev/proto_rfe_gram.py` is the spec's Phase-0 gate: LSMR, the in-RAM engine
   and every streaming layout on a synthetic two-level operator, compared for the
-  same round sequence, CV_RMSE and coefficients to 1e-6.
+  same round sequence, CV_RMSE and coefficients to 1e-6.  At the spec size
+  (12000 x 2000, 400 protected columns) all six engines run the same 23 rounds
+  and select the same 574 features.  Per-round CV_RMSE agrees to <= 3.5e-13 and
+  the coefficients to <= 1.3e-15.  The in-RAM and streaming engines take 10.9 s
+  and 9.6 s on 4 idle cores, almost all of it the 139 Cholesky factorizations.
 * **Not run yet:** any CUDA device, and the c3=4.5 data (Phase 4).  For Phase 4,
   `fit_scripts/Mg2C60_joint_4p50/submit_4p50_stream.sh`.  Compare against an
   *exact* reference rather than the resident run: that run's rounds are LSMR
