@@ -332,23 +332,23 @@ class OptimizerLargeRegressions(unittest.TestCase):
                 self.assertEqual(int(model.support_.sum()), 1)
 
     def test_gpu_construction_failure_does_not_cache_host_transpose(self):
-        fake_backend = types.ModuleType("pheasy_gpu.core.gpu_backend")
+        # Two things made this test stale: the optimizer resolves gpu_backend
+        # through its own package (core.gpu_backend), which a fake installed as
+        # "pheasy_gpu.core.gpu_backend" never intercepts; and the CPU
+        # continuation it asserts is only legal with PHEASY_GPU_FALLBACK=1 --
+        # under required GPU mode construction raises now (see
+        # dev/test_gpu_failure_semantics.py).
+        from core import gpu_backend as gb
 
         def fail_gpu_allocation(_matrix):
             raise MemoryError("simulated insufficient VRAM")
 
-        fake_backend.GpuSparseMV = fail_gpu_allocation
-        fake_core = types.ModuleType("pheasy_gpu.core")
-        fake_core.gpu_backend = fake_backend
-        fake_package = types.ModuleType("pheasy_gpu")
-        fake_package.core = fake_core
-        modules = {"pheasy_gpu": fake_package, "pheasy_gpu.core": fake_core,
-                   "pheasy_gpu.core.gpu_backend": fake_backend}
         prime = sp.csr_matrix([[1., 2., 0.], [0., 3., 4.]])
         ns = sp.csr_matrix([[2., 0.], [1., 3.], [0., 5.]])
         with patch.dict(os.environ, {"PHEASY_GPU_SM": "1",
-                                     "PHEASY_TWOLEVEL_CACHE_T": "1"}), \
-                patch.dict(sys.modules, modules):
+                                     "PHEASY_TWOLEVEL_CACHE_T": "1",
+                                     "PHEASY_GPU_FALLBACK": "1"}), \
+                patch.object(gb, "GpuSparseMV", side_effect=fail_gpu_allocation):
             A = opt.TwoLevelSM(prime, ns)
         expected = (prime @ ns).toarray()
         assert_allclose(A @ np.array([2., 3.]), expected @ [2., 3.])
