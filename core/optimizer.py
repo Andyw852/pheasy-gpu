@@ -3233,8 +3233,9 @@ class TwoLevelSM(LinearOperator):
         self._SMpT = None
         self._NST = None
         # [GPU-SM] optional cuSPARSE SpMV for the SM_prime half (row-split
-        # across PHEASY_GPU_SM_NGPU devices). NS stays on the CPU. Falls
-        # back to the scipy path silently when unavailable.
+        # across PHEASY_GPU_SM_NGPU devices). NS stays on the CPU. Falls back
+        # to the scipy path only when PHEASY_GPU_FALLBACK=1 AND the GPU mode is
+        # not required -- the same rule as _matvec/_rmatvec below.
         self._gpu_mv = None
         if (os.environ.get("PHEASY_GPU_SM", "0").lower() in ("1", "true", "yes")
                 and not _resident_lasso_requested()):
@@ -3250,7 +3251,10 @@ class TwoLevelSM(LinearOperator):
                 print("[GPU-SM] SpMV on %d device(s), dtype=%s" % (
                     len(self._gpu_mv._devs), SM_prime.dtype), flush=True)
             except Exception as _e:
-                if os.environ.get("PHEASY_GPU_FALLBACK", "0").lower() in ("0", "false", "off", "no"):
+                # Required mode must win over PHEASY_GPU_FALLBACK=1 here too: the
+                # c3=4.5 fit ran with both set and this branch silently put the
+                # whole RFE on one CPU core (int32 refusal, then busy cards).
+                if _gpu_required() or os.environ.get("PHEASY_GPU_FALLBACK", "0").lower() in ("0", "false", "off", "no"):
                     raise RuntimeError("GPU SM initialization failed with fallback disabled: %s" % _e) from _e
                 print("[GPU-SM] SpMV unavailable (%s); using CPU" % _e, flush=True)
                 self._disable_gpu()

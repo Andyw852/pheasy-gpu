@@ -2466,13 +2466,20 @@ def row_shard_count(nnz, n_dev):
     """How many row shards a split must have for the int32 CUDA CSR path.
 
     The natural choice is one shard per card, but that is only valid while a
-    shard stays under 2**31-1 nonzeros: at c3=4.5 (nnz=4.82e9) two cards put
-    2.41e9 nonzeros on each (int32 wrap / instant "exceeds the int32 index
-    range" failure, and the whole fit then fell back to the SERIAL CPU SpMV --
-    106% CPU for hours per RFE round), and at c3=5.0 even four are not enough.
-    Splitting into MORE shards than cards keeps every block representable and
-    leaves the per-card footprint unchanged (the shards on one card add up to
-    the same nnz); the cost is one extra kernel launch per shard.
+    shard stays under 2**31-1 nonzeros: at c3=4.5 (Mg2C60 joint, nnz=4.82e9)
+    two cards put 2.41e9 nonzeros on each (instant "exceeds the int32 index
+    range" refusal, and with PHEASY_GPU_FALLBACK=1 the whole fit then fell back
+    to the SERIAL CPU SpMV -- 106% CPU for hours per RFE round).  One card
+    needs 3 shards at that size.  Splitting into MORE shards than cards keeps
+    every block representable and leaves the per-card footprint unchanged (the
+    shards on one card add up to the same nnz); the cost is one extra kernel
+    launch per shard.
+
+    The target is 0.9 * (2**31-1) per shard.  With the nnz-balanced edges
+    (_balanced_shard_edges) a shard overshoots nnz/n_shards by at most one row,
+    so the 10% is generous; with PHEASY_SHARD_BALANCE=0 (linspace edges) a
+    skewed matrix can still exceed the limit, and _check_cuda_csr_indices then
+    refuses the block instead of wrapping.
 
     Rounded up to a multiple of n_dev so every card carries the same number of
     shards.  PHEASY_GPU_SM_SHARDS overrides it (debugging/tests).

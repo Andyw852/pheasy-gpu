@@ -158,15 +158,23 @@ class GpuMemoryRegressions(unittest.TestCase):
         # cannot represent; the split must grow to 4 shards (2 per card).
         nnz = 4816356048
         limit = gb._CUDA_INT32_LIMIT
+        safe = gb._CUDA_SHARD_SAFE_NNZ
+        self.assertLess(safe, limit)
+        # The table in REPORT_gpu_sm_sharding_20261116.md section 3.2, every column.
+        table = {
+            4816356048: [3, 4, 3, 4, 5],     # c3=4.5 Mg2C60 joint (1040112 x 92079)
+            3569731584: [2, 2, 3, 4, 5],     # c3=5.0 (454656 x 265662), GPU.md
+            6_000_000_000: [4, 4, 6, 4, 5],  # hypothetical 6.0e9: 3 cards -> 6, not 3
+        }
+        for n, expected in table.items():
+            got = [gb.row_shard_count(n, g) for g in range(1, 6)]
+            self.assertEqual(got, expected, msg="nnz=%d" % n)
+            for g, n_shards in zip(range(1, 6), got):
+                self.assertEqual(n_shards % g, 0)
+                # average shard under the safe target, hence under int32
+                self.assertLessEqual(-(-n // n_shards), safe)
         self.assertEqual(gb.row_shard_count(nnz, 1), 3)
         self.assertEqual(gb.row_shard_count(nnz, 2), 4)
-        self.assertEqual(gb.row_shard_count(nnz, 3), 3)
-        self.assertEqual(gb.row_shard_count(nnz, 5), 5)
-        # c3=5.0-sized problem: even 4 cards need 4 shards of >= 2 shards/card.
-        for n_dev in (1, 2, 5):
-            n_shards = gb.row_shard_count(6_000_000_000, n_dev)
-            self.assertEqual(n_shards % n_dev, 0)
-            self.assertLessEqual(-(-6_000_000_000 // n_shards), limit)
         # small matrices keep the one-block-per-card layout.
         self.assertEqual(gb.row_shard_count(10_000, 3), 3)
         with patch.dict(os.environ, {"PHEASY_GPU_SM_SHARDS": "7"}):
@@ -207,6 +215,35 @@ class GpuMemoryRegressions(unittest.TestCase):
                                            rtol=1e-13, atol=1e-13)
             finally:
                 gpu.close()
+
+    def test_real_gpu_check_script_logic(self):
+        # dev/check_gpu_sm_shards.py is the real-GPU validation of the path above;
+        # run its comparison under the fake torch so the script itself is tested.
+        spec = importlib.util.spec_from_file_location(
+            "check_gpu_sm_shards", Path(__file__).resolve().parent / "check_gpu_sm_shards.py")
+        chk = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(chk)
+        rng = np.random.default_rng(31)
+        matrix = sp.random(53, 17, density=0.3, random_state=rng, format="csr")
+        for lowmem in (False, True):
+            with self.subTest(lowmem=lowmem):
+                res = chk.check(matrix, [0, 1], shards=4, lowmem=lowmem,
+                                backend=gb, log=lambda _s: None)
+                self.assertEqual(res["n_shards"], 4)
+                self.assertEqual(res["block_devs"], [0, 1, 0, 1])
+                self.assertEqual(sum(res["row_nnz"]), matrix.nnz)
+                self.assertLess(res["matvec_rel_err"], 1e-12)
+                self.assertLess(res["rmatvec_rel_err"], 1e-12)
+        # The script must not leak its env overrides into the caller.
+        self.assertNotIn("PHEASY_GPU_SM_SHARDS", os.environ)
+        # ... and it must flag a wrong result: drop one shard's rows.
+        broken = gb.GpuSparseMV.matvec
+        with patch.object(gb.GpuSparseMV, "matvec",
+                          lambda self, x: broken(self, x) * np.r_[
+                              np.zeros(int(self._rs[1])),
+                              np.ones(matrix.shape[0] - int(self._rs[1]))]):
+            res = chk.check(matrix, [0, 1], shards=4, backend=gb, log=lambda _s: None)
+        self.assertGreater(res["matvec_rel_err"], 1e-3)
 
 
 if __name__ == "__main__":
