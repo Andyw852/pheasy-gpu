@@ -89,6 +89,8 @@ Values in W m⁻¹ K⁻¹.
 | 04 frozen FC2, 7360 | 3.0 Å | 1.4406 | 0.5424 | **1.9830** |
 | 05 frozen FC2, 9765 | 3.5 Å | 1.3783 | 0.5458 | **1.9240** |
 
+![kappa 3.0 A vs 3.5 A under two FC2 protocols](kappa_3p0_vs_3p5_two_protocols.png)
+
 ### Cutoff effect depends entirely on the protocol
 
 | protocol | 3.0 Å | 3.5 Å | Δκ_P | Δκ_C | Δκ_total |
