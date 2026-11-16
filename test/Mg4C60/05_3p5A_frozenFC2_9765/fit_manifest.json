@@ -1,0 +1,160 @@
+{
+  "code": {
+    "optimizer": {
+      "md5": "846e8322f61a4467ddd1884b630745c1",
+      "path": "<gpu-host>:/home/software/pheasy-gpu-gh/core/optimizer.py"
+    },
+    "run_pheasy": {
+      "md5": "9390b4cd2a5416e6e8332d71a261512f",
+      "path": "<gpu-host>:/home/software/pheasy-gpu-gh/run_pheasy.py"
+    }
+  },
+  "environment": {
+    "PHEASY_ASR_COL_BLOCK": "5000",
+    "PHEASY_ASR_COMBINED": "1",
+    "PHEASY_ASR_LWORK_LIMIT": "1500000000",
+    "PHEASY_ASR_SPARSE": "1",
+    "PHEASY_ASR_SPARSE_THR": "1e-10",
+    "PHEASY_BLAS_THREADS": "32",
+    "PHEASY_COLNORM_EXACT": "0",
+    "PHEASY_COLNORM_FRAMES": "24",
+    "PHEASY_CV_GROUP_SIZE": "1536",
+    "PHEASY_DOT_THREADS": "56",
+    "PHEASY_HARM_DENSE": "1",
+    "PHEASY_N_JOBS": "1",
+    "PHEASY_RFE_1SE": "1",
+    "PHEASY_RFE_CV": "5",
+    "PHEASY_RFE_FINAL_LSMR_MAXITER": "60000",
+    "PHEASY_RFE_GRAM_GB": "21",
+    "PHEASY_RFE_MKL": "1",
+    "PHEASY_RFE_RIDGE_ALPHA": "0",
+    "PHEASY_RFE_STEP": "0.05",
+    "PHEASY_RFE_TWOLEVEL": "1",
+    "PHEASY_RFE_WARM_START": "1",
+    "PHEASY_SM_DTYPE": "float32",
+    "PHEASY_SM_THR": "1e-12",
+    "PHEASY_SVD_THRESHOLD": "500",
+    "PHEASY_USE_CELER": "1",
+    "PHEASY_USE_RFE": "1"
+  },
+  "harm_dense": {
+    "applied": false,
+    "enabled": true,
+    "harmonic_columns": null,
+    "source": "env"
+  },
+  "metrics": {
+    "mae": 0.004829693662484099,
+    "mape": 3.6899297209627893,
+    "mse": 4.333095334713801e-05,
+    "mse_path": {
+      "dtype": "float64",
+      "shape": [
+        1
+      ],
+      "type": "ndarray",
+      "values": [
+        4.677300144442126e-05
+      ]
+    },
+    "mse_path_mean": 4.677300144442126e-05,
+    "mspe": 2647638.753467859,
+    "n_featrues": 16311,
+    "n_features": 16311,
+    "r2_score": 0.991924371319861,
+    "re": 0.08986450177984051,
+    "re_total_forces": 0.007580311922715871,
+    "rmse": 0.006582625110633144,
+    "rmse_path": {
+      "dtype": "float64",
+      "shape": [
+        1
+      ],
+      "type": "ndarray",
+      "values": [
+        0.0068390789909476305
+      ]
+    },
+    "rmse_path_mean": 0.0068390789909476305,
+    "rmspe": 1627.1566468744977
+  },
+  "model": "RFE-OLS",
+  "platform": "Linux-6.5.0-35-generic-x86_64-with-glibc2.35",
+  "python": "3.11.15",
+  "results": {
+    "alpha": 0.0,
+    "alpha_at_grid_edge": false,
+    "backend_metadata": {
+      "criterion": "cv",
+      "cv_fold_scoring": "cpu",
+      "gpu_importance_rounds": 0,
+      "gpu_prediction": false,
+      "gpu_ranking_rounds": 0,
+      "gpu_subset_solves": 0,
+      "gram_build_seconds": 649.1521463394165,
+      "gram_bytes": 12770338608,
+      "gram_exact_rounds": 13,
+      "gram_from_round": 0,
+      "gram_n_features": 16311,
+      "gram_solvers": [
+        "cholesky"
+      ],
+      "ic_n_eff": null,
+      "iterative_diagnostics": [],
+      "jacobi_applied": false,
+      "n_active": 9765,
+      "n_candidates": 16311,
+      "orchestration": "cpu",
+      "postprocessing": "cpu",
+      "ranking": "cpu",
+      "resident_column_index_uploads": 0,
+      "resident_fallback_reason": null,
+      "resident_index_cache_budget_bytes": 18316728,
+      "resident_input_kind": null,
+      "resident_row_index_uploads": 0,
+      "resident_subset_builds": 0,
+      "resident_subset_inputs": false,
+      "subset_solver": "cpu_gram_exact",
+      "support_file": "rfe_support.npy"
+    },
+    "coef": {
+      "dtype": "float64",
+      "shape": [
+        16311
+      ],
+      "type": "ndarray"
+    },
+    "execution_backend": "cpu_rfe_gram_exact",
+    "fit_accepted": true,
+    "n_iter": 12,
+    "postfit_backend": "cpu_orchestration_and_metrics",
+    "rfe_criterion": "cv",
+    "rfe_gram_exact_rounds": 13,
+    "rfe_gram_n_features": 16311,
+    "status": "fit_returned"
+  },
+  "symmetry": {
+    "fit": {
+      "n_operations": 4,
+      "number": 15,
+      "spacegroup": "C2/c (15)",
+      "symbol": "C2/c",
+      "symprec": 0.001
+    },
+    "probe": null,
+    "probe_more_symmetric": false,
+    "symprec": 0.001
+  },
+  "versions": {
+    "ase": "3.29.0",
+    "f90nml": "1.5.0",
+    "h5py": "3.16.0",
+    "joblib": "1.5.3",
+    "numpy": "2.4.6",
+    "phonopy": "2.47.1",
+    "scikit-learn": "1.9.0",
+    "scipy": "1.17.1",
+    "spglib": "2.6.0",
+    "torch": "2.5.1+cu121"
+  }
+}

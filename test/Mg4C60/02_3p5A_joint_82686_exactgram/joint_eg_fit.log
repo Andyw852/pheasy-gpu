@@ -1,0 +1,1203 @@
+[..] FIT_ENGINE=pheasy
+[WARN] symmetry_audit.py 不可用，超胞保对称检查跳过：No module named 'symmetry_audit'
+[2026-11-09 01:49:05,544] Start Pheasy.
+{_______  {__     {__{________      {_         {__ __  {__      {__
+{__    {__{__     {__{__           {_ __     {__    {__ {__    {__ 
+{__    {__{__     {__{__          {_  {__     {__        {__ {__   
+{_______  {______ {__{______     {__   {__      {__        {__     
+{__       {__     {__{__        {______ {__        {__     {__     
+{__       {__     {__{__       {__       {__ {__    {__    {__     
+{__       {__     {__{________{__         {__  {__ __      {__   0.0.2
+[2026-11-09 01:49:05,552] System: C120Mg8
+[2026-11-09 01:49:05,552] Space group: C2/c (15), 4 symmetry operations found.
+[2026-11-09 01:49:05,557] Symmetry probe at symprec 0.001: C2/c (15), 4 symmetry operations.
+[2026-11-09 01:49:05,557] Creating 2 x 2 x 1 supercell (512 atoms).
+[2026-11-09 01:49:05,751] Starting to generate cluster space up to 3-order.
+[2026-11-09 01:49:05,751] Cutoff distance (A) for 2-order IFCs: inf
+[2026-11-09 01:49:47,303] Cutoff distance (A) for 3-order IFCs: 3.50
+[2026-11-09 01:49:53,968] Summary of cluster space:
+[2026-11-09 01:49:53,968] - HARM    | cluster number: 8384 | IFC number: 75456
+[2026-11-09 01:49:53,968] - ANHARM3 | cluster number: 1054 | IFC number: 28458
+[2026-11-09 01:50:02,012] Cluster space generation finished, time cost: 0:00:56.261499.
+[2026-11-09 01:50:02,012] Finalize Pheasy, total time cost: 0:00:56.470384.
+[OK] SPOSCAR.dataset matches the dataset source SPOSCAR (order + mod-lattice coordinates)
+[..] 单截断拟合（CUT3_SCAN=False，候选 4 档）
+[pheasy] cluster space: pheasy-gpu --dim 2 2 1 -w 3 --c3 3.5 --eps 0.001 -s
+[2026-11-09 01:50:04,234] Start Pheasy.
+_///////  _//     _//_////////      _/         _// //  _//      _//
+_//    _//_//     _//_//           _/ //     _//    _// _//    _// 
+_//    _//_//     _//_//          _/  _//     _//        _// _//   
+_///////  _////// _//_//////     _//   _//      _//        _//     
+_//       _//     _//_//        _////// _//        _//     _//     
+_//       _//     _//_//       _//       _// _//    _//    _//     
+_//       _//     _//_////////_//         _//  _// //      _// 0.0.2
+[2026-11-09 01:50:04,243] System: C120Mg8
+[2026-11-09 01:50:04,243] Space group: C2/c (15), 4 symmetry operations found.
+[2026-11-09 01:50:04,247] Symmetry probe at symprec 0.001: C2/c (15), 4 symmetry operations.
+[2026-11-09 01:50:04,247] Creating 2 x 2 x 1 supercell (512 atoms).
+[2026-11-09 01:50:04,450] Starting to generate cluster space up to 3-order.
+[2026-11-09 01:50:04,450] Cutoff distance (A) for 2-order IFCs: inf
+[2026-11-09 01:50:43,425] Cutoff distance (A) for 3-order IFCs: 3.50
+[2026-11-09 01:50:49,671] Summary of cluster space:
+[2026-11-09 01:50:49,671] - HARM    | cluster number: 8384 | IFC number: 75456
+[2026-11-09 01:50:49,672] - ANHARM3 | cluster number: 1054 | IFC number: 28458
+[2026-11-09 01:50:57,792] Cluster space generation finished, time cost: 0:00:53.342021.
+[2026-11-09 01:50:57,792] Finalize Pheasy, total time cost: 0:00:53.560598.
+[pheasy] symmetry constraints: pheasy-gpu --dim 2 2 1 -w 3 --c3 3.5 --eps 0.001 -c
+[2026-11-09 01:50:59,860] Start Pheasy.
+    ____  __  ___________   _______  __
+   / __ \/ / / / ____/   | / ___/\ \/ /
+  / /_/ / /_/ / __/ / /| | \__ \  \  / 
+ / ____/ __  / /___/ ___ |___/ /  / /  
+/_/   /_/ /_/_____/_/  |_/____/  /_/  0.0.2
+[2026-11-09 01:50:59,868] System: C120Mg8
+[2026-11-09 01:50:59,868] Space group: C2/c (15), 4 symmetry operations found.
+[2026-11-09 01:50:59,873] Symmetry probe at symprec 0.001: C2/c (15), 4 symmetry operations.
+[2026-11-09 01:50:59,873] Creating 2 x 2 x 1 supercell (512 atoms).
+[2026-11-09 01:51:00,074] Reading and generating cluster space from file, up to 3-order.
+[2026-11-09 01:51:06,538] Cutoff distance (A) for 2-order IFCs: inf
+[2026-11-09 01:51:06,539] Cutoff distance (A) for 3-order IFCs: 3.50
+[2026-11-09 01:51:06,539] Summary of cluster space:
+[2026-11-09 01:51:06,539] - HARM    | cluster number: 8384 | IFC number: 75456
+[2026-11-09 01:51:06,539] - ANHARM3 | cluster number: 1054 | IFC number: 28458
+[2026-11-09 01:51:06,539] Starting to construct symmetry constraints and null space.
+[2026-11-09 01:51:06,539] Symmmetry constraints are imposed in Cartesian coordinate.
+[2026-11-09 01:51:06,539] Symmetry constraints on 2-order IFCs:
+[2026-11-09 01:51:06,539] - Imposing space group and permuation symmetry.
+[2026-11-09 01:51:14,408] - Imposing translational invariance.
+[2026-11-09 01:52:21,383] - Calculating null space.
+[ASR] sparse mode ON, ns_mat: csc_matrix shape=(75456, 74304), nnz=75456, mem~0.6MB (thr=1e-10, col_blk=5000)
+[ASR] elimination mode (n_free=74304, 288 constraint rows)
+[ASR]   cons 1/32: n_free=74295, nnz=84468, t=0.1s
+[ASR]   cons 11/32: n_free=74205, nnz=257308, t=0.8s
+[ASR]   cons 21/32: n_free=74115, nnz=490948, t=1.9s
+[ASR]   cons 31/32: n_free=74025, nnz=657388, t=3.3s
+[ASR]   cons 32/32: n_free=74017, nnz=665410, t=3.5s
+[ASR] done: n_free=74017, eliminated=287, skipped=1, max|C@ns|=1.11e-16
+[2026-11-09 01:52:24,949] - [ns-rank] order 2: skipped (n_free=74017 > MAXCOL=5000)
+[2026-11-09 01:52:24,949] - Time cost: 0:01:18.410326.
+[2026-11-09 01:52:24,949] Symmetry constraints on 3-order IFCs:
+[2026-11-09 01:52:24,949] - Imposing space group and permuation symmetry.
+[2026-11-09 01:52:26,914] - Imposing translational invariance.
+[2026-11-09 01:52:29,951] - Calculating null space.
+[ASR] sparse mode ON, ns_mat: csc_matrix shape=(28458, 23378), nnz=28458, mem~0.2MB (thr=1e-10, col_blk=5000)
+[ASR] elimination mode (n_free=23378, 226368 constraint rows)
+[ASR]   cons 1/8384: n_free=23360, nnz=28836, t=0.1s
+[ASR]   cons 11/8384: n_free=23348, nnz=29044, t=0.2s
+[ASR]   cons 21/8384: n_free=23348, nnz=29044, t=0.3s
+[ASR]   cons 31/8384: n_free=23348, nnz=29044, t=0.4s
+[ASR]   cons 41/8384: n_free=23348, nnz=29044, t=0.5s
+[ASR]   cons 51/8384: n_free=23348, nnz=29044, t=0.6s
+[ASR]   cons 61/8384: n_free=23348, nnz=29044, t=0.7s
+[ASR]   cons 71/8384: n_free=23348, nnz=29044, t=0.8s
+[ASR]   cons 81/8384: n_free=23348, nnz=29044, t=0.9s
+[ASR]   cons 91/8384: n_free=23348, nnz=29044, t=1.0s
+[ASR]   cons 101/8384: n_free=23348, nnz=29044, t=1.1s
+[ASR]   cons 111/8384: n_free=23348, nnz=29044, t=1.2s
+[ASR]   cons 121/8384: n_free=23348, nnz=29044, t=1.3s
+[ASR]   cons 131/8384: n_free=23321, nnz=29425, t=1.4s
+[ASR]   cons 141/8384: n_free=23321, nnz=29425, t=1.5s
+[ASR]   cons 151/8384: n_free=23294, nnz=29506, t=1.7s
+[ASR]   cons 161/8384: n_free=23294, nnz=29506, t=1.8s
+[ASR]   cons 171/8384: n_free=23294, nnz=29506, t=1.9s
+[ASR]   cons 181/8384: n_free=23267, nnz=29959, t=2.0s
+[ASR]   cons 191/8384: n_free=23267, nnz=29959, t=2.1s
+[ASR]   cons 201/8384: n_free=23267, nnz=29959, t=2.2s
+[ASR]   cons 211/8384: n_free=23240, nnz=30067, t=2.4s
+[ASR]   cons 221/8384: n_free=23240, nnz=30067, t=2.5s
+[ASR]   cons 231/8384: n_free=23213, nnz=30229, t=2.6s
+[ASR]   cons 241/8384: n_free=23213, nnz=30229, t=2.7s
+[ASR]   cons 251/8384: n_free=23186, nnz=30723, t=2.9s
+[ASR]   cons 261/8384: n_free=23159, nnz=30957, t=3.0s
+[ASR]   cons 271/8384: n_free=23159, nnz=30957, t=3.1s
+[ASR]   cons 281/8384: n_free=23159, nnz=30957, t=3.2s
+[ASR]   cons 291/8384: n_free=23159, nnz=30957, t=3.3s
+[ASR]   cons 301/8384: n_free=23159, nnz=30957, t=3.4s
+[ASR]   cons 311/8384: n_free=23159, nnz=30957, t=3.5s
+[ASR]   cons 321/8384: n_free=23132, nnz=31362, t=3.7s
+[ASR]   cons 331/8384: n_free=23132, nnz=31362, t=3.8s
+[ASR]   cons 341/8384: n_free=23105, nnz=31857, t=4.0s
+[ASR]   cons 351/8384: n_free=23105, nnz=31857, t=4.1s
+[ASR]   cons 361/8384: n_free=23105, nnz=31857, t=4.2s
+[ASR]   cons 371/8384: n_free=23078, nnz=32788, t=4.3s
+[ASR]   cons 381/8384: n_free=23078, nnz=32788, t=4.4s
+[ASR]   cons 391/8384: n_free=23078, nnz=32788, t=4.5s
+[ASR]   cons 401/8384: n_free=23078, nnz=32788, t=4.6s
+[ASR]   cons 411/8384: n_free=23051, nnz=33724, t=4.8s
+[ASR]   cons 421/8384: n_free=23024, nnz=33936, t=5.0s
+[ASR]   cons 431/8384: n_free=23024, nnz=33936, t=5.1s
+[ASR]   cons 441/8384: n_free=23024, nnz=33936, t=5.2s
+[ASR]   cons 451/8384: n_free=23024, nnz=33936, t=5.3s
+[ASR]   cons 461/8384: n_free=23024, nnz=33936, t=5.4s
+[ASR]   cons 471/8384: n_free=23024, nnz=33936, t=5.5s
+[ASR]   cons 481/8384: n_free=23024, nnz=33936, t=5.6s
+[ASR]   cons 491/8384: n_free=22997, nnz=34071, t=5.8s
+[ASR]   cons 501/8384: n_free=22979, nnz=35023, t=5.9s
+[ASR]   cons 511/8384: n_free=22961, nnz=35590, t=6.1s
+[ASR]   cons 521/8384: n_free=22961, nnz=35590, t=6.2s
+[ASR]   cons 531/8384: n_free=22961, nnz=35590, t=6.3s
+[ASR]   cons 541/8384: n_free=22934, nnz=36310, t=6.4s
+[ASR]   cons 551/8384: n_free=22907, nnz=37048, t=6.6s
+[ASR]   cons 561/8384: n_free=22907, nnz=37048, t=6.7s
+[ASR]   cons 571/8384: n_free=22880, nnz=37840, t=6.9s
+[ASR]   cons 581/8384: n_free=22880, nnz=37840, t=7.0s
+[ASR]   cons 591/8384: n_free=22853, nnz=38731, t=7.2s
+[ASR]   cons 601/8384: n_free=22826, nnz=38839, t=7.3s
+[ASR]   cons 611/8384: n_free=22826, nnz=38839, t=7.5s
+[ASR]   cons 621/8384: n_free=22799, nnz=39730, t=7.6s
+[ASR]   cons 631/8384: n_free=22772, nnz=40666, t=7.8s
+[ASR]   cons 641/8384: n_free=22745, nnz=41674, t=8.0s
+[ASR]   cons 651/8384: n_free=22745, nnz=41674, t=8.1s
+[ASR]   cons 661/8384: n_free=22718, nnz=41782, t=8.3s
+[ASR]   cons 671/8384: n_free=22718, nnz=41782, t=8.4s
+[ASR]   cons 681/8384: n_free=22718, nnz=41782, t=8.5s
+[ASR]   cons 691/8384: n_free=22691, nnz=42889, t=8.7s
+[ASR]   cons 701/8384: n_free=22664, nnz=43024, t=8.9s
+[ASR]   cons 711/8384: n_free=22664, nnz=43024, t=9.0s
+[ASR]   cons 721/8384: n_free=22664, nnz=43024, t=9.1s
+[ASR]   cons 731/8384: n_free=22637, nnz=44140, t=9.3s
+[ASR]   cons 741/8384: n_free=22610, nnz=44401, t=9.5s
+[ASR]   cons 751/8384: n_free=22610, nnz=44401, t=9.6s
+[ASR]   cons 761/8384: n_free=22610, nnz=44401, t=9.7s
+[ASR]   cons 771/8384: n_free=22583, nnz=44788, t=9.9s
+[ASR]   cons 781/8384: n_free=22583, nnz=44788, t=10.0s
+[ASR]   cons 791/8384: n_free=22583, nnz=44788, t=10.2s
+[ASR]   cons 801/8384: n_free=22556, nnz=45337, t=10.3s
+[ASR]   cons 811/8384: n_free=22556, nnz=45337, t=10.5s
+[ASR]   cons 821/8384: n_free=22529, nnz=45976, t=10.7s
+[ASR]   cons 831/8384: n_free=22529, nnz=45976, t=10.8s
+[ASR]   cons 841/8384: n_free=22529, nnz=45976, t=10.9s
+[ASR]   cons 851/8384: n_free=22502, nnz=47515, t=11.1s
+[ASR]   cons 861/8384: n_free=22502, nnz=47515, t=11.2s
+[ASR]   cons 871/8384: n_free=22502, nnz=47515, t=11.4s
+[ASR]   cons 881/8384: n_free=22502, nnz=47515, t=11.5s
+[ASR]   cons 891/8384: n_free=22475, nnz=49072, t=11.7s
+[ASR]   cons 901/8384: n_free=22475, nnz=49072, t=11.8s
+[ASR]   cons 911/8384: n_free=22475, nnz=49072, t=12.0s
+[ASR]   cons 921/8384: n_free=22448, nnz=50638, t=12.2s
+[ASR]   cons 931/8384: n_free=22421, nnz=52375, t=12.4s
+[ASR]   cons 941/8384: n_free=22421, nnz=52375, t=12.5s
+[ASR]   cons 951/8384: n_free=22421, nnz=52375, t=12.7s
+[ASR]   cons 961/8384: n_free=22421, nnz=52375, t=12.8s
+[ASR]   cons 971/8384: n_free=22421, nnz=52375, t=13.0s
+[ASR]   cons 981/8384: n_free=22394, nnz=52627, t=13.2s
+[ASR]   cons 991/8384: n_free=22394, nnz=52627, t=13.3s
+[ASR]   cons 1001/8384: n_free=22376, nnz=52870, t=13.5s
+[ASR]   cons 1011/8384: n_free=22358, nnz=53419, t=13.7s
+[ASR]   cons 1021/8384: n_free=22331, nnz=54373, t=13.9s
+[ASR]   cons 1031/8384: n_free=22331, nnz=54373, t=14.0s
+[ASR]   cons 1041/8384: n_free=22304, nnz=55213, t=14.3s
+[ASR]   cons 1051/8384: n_free=22277, nnz=56056, t=14.5s
+[ASR]   cons 1061/8384: n_free=22277, nnz=56056, t=14.6s
+[ASR]   cons 1071/8384: n_free=22250, nnz=56941, t=14.8s
+[ASR]   cons 1081/8384: n_free=22250, nnz=56941, t=15.0s
+[ASR]   cons 1091/8384: n_free=22223, nnz=57103, t=15.2s
+[ASR]   cons 1101/8384: n_free=22196, nnz=57508, t=15.4s
+[ASR]   cons 1111/8384: n_free=22169, nnz=57922, t=15.7s
+[ASR]   cons 1121/8384: n_free=22142, nnz=58825, t=15.9s
+[ASR]   cons 1131/8384: n_free=22142, nnz=58825, t=16.0s
+[ASR]   cons 1141/8384: n_free=22142, nnz=58825, t=16.2s
+[ASR]   cons 1151/8384: n_free=22142, nnz=58825, t=16.4s
+[ASR]   cons 1161/8384: n_free=22115, nnz=58933, t=16.6s
+[ASR]   cons 1171/8384: n_free=22115, nnz=58933, t=16.8s
+[ASR]   cons 1181/8384: n_free=22061, nnz=59662, t=17.0s
+[ASR]   cons 1191/8384: n_free=22061, nnz=59662, t=17.2s
+[ASR]   cons 1201/8384: n_free=22034, nnz=60835, t=17.4s
+[ASR]   cons 1211/8384: n_free=22034, nnz=60835, t=17.6s
+[ASR]   cons 1221/8384: n_free=22034, nnz=60835, t=17.8s
+[ASR]   cons 1231/8384: n_free=22016, nnz=61999, t=18.0s
+[ASR]   cons 1241/8384: n_free=22016, nnz=61999, t=18.1s
+[ASR]   cons 1251/8384: n_free=22016, nnz=61999, t=18.3s
+[ASR]   cons 1261/8384: n_free=22016, nnz=61999, t=18.5s
+[ASR]   cons 1271/8384: n_free=22016, nnz=61999, t=18.7s
+[ASR]   cons 1281/8384: n_free=22016, nnz=61999, t=18.8s
+[ASR]   cons 1291/8384: n_free=22016, nnz=61999, t=19.0s
+[ASR]   cons 1301/8384: n_free=22016, nnz=61999, t=19.2s
+[ASR]   cons 1311/8384: n_free=22016, nnz=61999, t=19.3s
+[ASR]   cons 1321/8384: n_free=22016, nnz=61999, t=19.5s
+[ASR]   cons 1331/8384: n_free=22016, nnz=61999, t=19.7s
+[ASR]   cons 1341/8384: n_free=22016, nnz=61999, t=19.9s
+[ASR]   cons 1351/8384: n_free=22016, nnz=61999, t=20.0s
+[ASR]   cons 1361/8384: n_free=22016, nnz=61999, t=20.2s
+[ASR]   cons 1371/8384: n_free=22016, nnz=61999, t=20.4s
+[ASR]   cons 1381/8384: n_free=22016, nnz=61999, t=20.5s
+[ASR]   cons 1391/8384: n_free=22016, nnz=61999, t=20.7s
+[ASR]   cons 1401/8384: n_free=22016, nnz=61999, t=20.9s
+[ASR]   cons 1411/8384: n_free=22016, nnz=61999, t=21.1s
+[ASR]   cons 1421/8384: n_free=22016, nnz=61999, t=21.2s
+[ASR]   cons 1431/8384: n_free=22016, nnz=61999, t=21.4s
+[ASR]   cons 1441/8384: n_free=22016, nnz=61999, t=21.6s
+[ASR]   cons 1451/8384: n_free=22016, nnz=61999, t=21.7s
+[ASR]   cons 1461/8384: n_free=22016, nnz=61999, t=21.9s
+[ASR]   cons 1471/8384: n_free=22016, nnz=61999, t=22.1s
+[ASR]   cons 1481/8384: n_free=22016, nnz=61999, t=22.3s
+[ASR]   cons 1491/8384: n_free=21998, nnz=62737, t=22.5s
+[ASR]   cons 1501/8384: n_free=21971, nnz=64216, t=22.7s
+[ASR]   cons 1511/8384: n_free=21971, nnz=64216, t=22.9s
+[ASR]   cons 1521/8384: n_free=21944, nnz=65419, t=23.2s
+[ASR]   cons 1531/8384: n_free=21917, nnz=66592, t=23.5s
+[ASR]   cons 1541/8384: n_free=21917, nnz=66592, t=23.7s
+[ASR]   cons 1551/8384: n_free=21890, nnz=66862, t=24.0s
+[ASR]   cons 1561/8384: n_free=21863, nnz=67204, t=24.2s
+[ASR]   cons 1571/8384: n_free=21863, nnz=67204, t=24.4s
+[ASR]   cons 1581/8384: n_free=21863, nnz=67204, t=24.6s
+[ASR]   cons 1591/8384: n_free=21863, nnz=67204, t=24.8s
+[ASR]   cons 1601/8384: n_free=21836, nnz=68467, t=25.0s
+[ASR]   cons 1611/8384: n_free=21836, nnz=68467, t=25.2s
+[ASR]   cons 1621/8384: n_free=21809, nnz=68890, t=25.5s
+[ASR]   cons 1631/8384: n_free=21809, nnz=68890, t=25.7s
+[ASR]   cons 1641/8384: n_free=21782, nnz=69034, t=25.9s
+[ASR]   cons 1651/8384: n_free=21782, nnz=69034, t=26.2s
+[ASR]   cons 1661/8384: n_free=21782, nnz=69034, t=26.4s
+[ASR]   cons 1671/8384: n_free=21782, nnz=69034, t=26.6s
+[ASR]   cons 1681/8384: n_free=21755, nnz=70513, t=26.9s
+[ASR]   cons 1691/8384: n_free=21728, nnz=70594, t=27.1s
+[ASR]   cons 1701/8384: n_free=21728, nnz=70594, t=27.3s
+[ASR]   cons 1711/8384: n_free=21701, nnz=72280, t=27.6s
+[ASR]   cons 1721/8384: n_free=21683, nnz=72415, t=27.8s
+[ASR]   cons 1731/8384: n_free=21683, nnz=72415, t=28.0s
+[ASR]   cons 1741/8384: n_free=21683, nnz=72415, t=28.2s
+[ASR]   cons 1751/8384: n_free=21683, nnz=72415, t=28.5s
+[ASR]   cons 1761/8384: n_free=21683, nnz=72415, t=28.7s
+[ASR]   cons 1771/8384: n_free=21683, nnz=72415, t=28.9s
+[ASR]   cons 1781/8384: n_free=21683, nnz=72415, t=29.1s
+[ASR]   cons 1791/8384: n_free=21683, nnz=72415, t=29.3s
+[ASR]   cons 1801/8384: n_free=21683, nnz=72415, t=29.5s
+[ASR]   cons 1811/8384: n_free=21683, nnz=72415, t=29.7s
+[ASR]   cons 1821/8384: n_free=21683, nnz=72415, t=29.9s
+[ASR]   cons 1831/8384: n_free=21683, nnz=72415, t=30.1s
+[ASR]   cons 1841/8384: n_free=21683, nnz=72415, t=30.3s
+[ASR]   cons 1851/8384: n_free=21683, nnz=72415, t=30.5s
+[ASR]   cons 1861/8384: n_free=21683, nnz=72415, t=30.7s
+[ASR]   cons 1871/8384: n_free=21683, nnz=72415, t=30.9s
+[ASR]   cons 1881/8384: n_free=21683, nnz=72415, t=31.1s
+[ASR]   cons 1891/8384: n_free=21683, nnz=72415, t=31.3s
+[ASR]   cons 1901/8384: n_free=21683, nnz=72415, t=31.5s
+[ASR]   cons 1911/8384: n_free=21683, nnz=72415, t=31.7s
+[ASR]   cons 1921/8384: n_free=21683, nnz=72415, t=31.9s
+[ASR]   cons 1931/8384: n_free=21683, nnz=72415, t=32.1s
+[ASR]   cons 1941/8384: n_free=21683, nnz=72415, t=32.3s
+[ASR]   cons 1951/8384: n_free=21656, nnz=74191, t=32.6s
+[ASR]   cons 1961/8384: n_free=21629, nnz=76492, t=32.9s
+[ASR]   cons 1971/8384: n_free=21629, nnz=76492, t=33.1s
+[ASR]   cons 1981/8384: n_free=21575, nnz=79681, t=33.4s
+[ASR]   cons 1991/8384: n_free=21575, nnz=79681, t=33.7s
+[ASR]   cons 2001/8384: n_free=21575, nnz=79681, t=33.9s
+[ASR]   cons 2011/8384: n_free=21548, nnz=79843, t=34.2s
+[ASR]   cons 2021/8384: n_free=21548, nnz=79843, t=34.4s
+[ASR]   cons 2031/8384: n_free=21521, nnz=81778, t=34.7s
+[ASR]   cons 2041/8384: n_free=21521, nnz=81778, t=34.9s
+[ASR]   cons 2051/8384: n_free=21521, nnz=81778, t=35.2s
+[ASR]   cons 2061/8384: n_free=21521, nnz=81778, t=35.4s
+[ASR]   cons 2071/8384: n_free=21521, nnz=81778, t=35.6s
+[ASR]   cons 2081/8384: n_free=21521, nnz=81778, t=35.9s
+[ASR]   cons 2091/8384: n_free=21521, nnz=81778, t=36.1s
+[ASR]   cons 2101/8384: n_free=21467, nnz=83904, t=36.5s
+[ASR]   cons 2111/8384: n_free=21440, nnz=84012, t=36.8s
+[ASR]   cons 2121/8384: n_free=21440, nnz=84012, t=37.0s
+[ASR]   cons 2131/8384: n_free=21440, nnz=84012, t=37.3s
+[ASR]   cons 2141/8384: n_free=21413, nnz=84219, t=37.6s
+[ASR]   cons 2151/8384: n_free=21413, nnz=84219, t=37.8s
+[ASR]   cons 2161/8384: n_free=21413, nnz=84219, t=38.1s
+[ASR]   cons 2171/8384: n_free=21386, nnz=86226, t=38.4s
+[ASR]   cons 2181/8384: n_free=21386, nnz=86226, t=38.6s
+[ASR]   cons 2191/8384: n_free=21386, nnz=86226, t=38.9s
+[ASR]   cons 2201/8384: n_free=21386, nnz=86226, t=39.1s
+[ASR]   cons 2211/8384: n_free=21368, nnz=88248, t=39.4s
+[ASR]   cons 2221/8384: n_free=21368, nnz=88248, t=39.6s
+[ASR]   cons 2231/8384: n_free=21368, nnz=88248, t=39.9s
+[ASR]   cons 2241/8384: n_free=21368, nnz=88248, t=40.1s
+[ASR]   cons 2251/8384: n_free=21368, nnz=88248, t=40.4s
+[ASR]   cons 2261/8384: n_free=21368, nnz=88248, t=40.6s
+[ASR]   cons 2271/8384: n_free=21368, nnz=88248, t=40.9s
+[ASR]   cons 2281/8384: n_free=21368, nnz=88248, t=41.1s
+[ASR]   cons 2291/8384: n_free=21368, nnz=88248, t=41.4s
+[ASR]   cons 2301/8384: n_free=21368, nnz=88248, t=41.6s
+[ASR]   cons 2311/8384: n_free=21368, nnz=88248, t=41.9s
+[ASR]   cons 2321/8384: n_free=21368, nnz=88248, t=42.1s
+[ASR]   cons 2331/8384: n_free=21368, nnz=88248, t=42.4s
+[ASR]   cons 2341/8384: n_free=21368, nnz=88248, t=42.6s
+[ASR]   cons 2351/8384: n_free=21368, nnz=88248, t=42.9s
+[ASR]   cons 2361/8384: n_free=21368, nnz=88248, t=43.1s
+[ASR]   cons 2371/8384: n_free=21368, nnz=88248, t=43.4s
+[ASR]   cons 2381/8384: n_free=21368, nnz=88248, t=43.6s
+[ASR]   cons 2391/8384: n_free=21350, nnz=89370, t=43.9s
+[ASR]   cons 2401/8384: n_free=21338, nnz=90360, t=44.2s
+[ASR]   cons 2411/8384: n_free=21311, nnz=93228, t=44.5s
+[ASR]   cons 2421/8384: n_free=21284, nnz=94218, t=44.9s
+[ASR]   cons 2431/8384: n_free=21284, nnz=94218, t=45.1s
+[ASR]   cons 2441/8384: n_free=21284, nnz=94218, t=45.4s
+[ASR]   cons 2451/8384: n_free=21284, nnz=94218, t=45.7s
+[ASR]   cons 2461/8384: n_free=21284, nnz=94218, t=45.9s
+[ASR]   cons 2471/8384: n_free=21257, nnz=97278, t=46.3s
+[ASR]   cons 2481/8384: n_free=21230, nnz=100681, t=46.6s
+[ASR]   cons 2491/8384: n_free=21230, nnz=100681, t=46.9s
+[ASR]   cons 2501/8384: n_free=21230, nnz=100681, t=47.2s
+[ASR]   cons 2511/8384: n_free=21230, nnz=100681, t=47.5s
+[ASR]   cons 2521/8384: n_free=21230, nnz=100681, t=47.7s
+[ASR]   cons 2531/8384: n_free=21203, nnz=100816, t=48.1s
+[ASR]   cons 2541/8384: n_free=21203, nnz=100816, t=48.4s
+[ASR]   cons 2551/8384: n_free=21176, nnz=100924, t=48.7s
+[ASR]   cons 2561/8384: n_free=21176, nnz=100924, t=49.0s
+[ASR]   cons 2571/8384: n_free=21176, nnz=100924, t=49.3s
+[ASR]   cons 2581/8384: n_free=21149, nnz=101158, t=49.7s
+[ASR]   cons 2591/8384: n_free=21122, nnz=104663, t=50.1s
+[ASR]   cons 2601/8384: n_free=21122, nnz=104663, t=50.3s
+[ASR]   cons 2611/8384: n_free=21122, nnz=104663, t=50.6s
+[ASR]   cons 2621/8384: n_free=21095, nnz=105122, t=51.0s
+[ASR]   cons 2631/8384: n_free=21095, nnz=105122, t=51.3s
+[ASR]   cons 2641/8384: n_free=21095, nnz=105122, t=51.6s
+[ASR]   cons 2651/8384: n_free=21095, nnz=105122, t=51.9s
+[ASR]   cons 2661/8384: n_free=21077, nnz=105590, t=52.3s
+[ASR]   cons 2671/8384: n_free=21077, nnz=105590, t=52.6s
+[ASR]   cons 2681/8384: n_free=21077, nnz=105590, t=52.9s
+[ASR]   cons 2691/8384: n_free=21077, nnz=105590, t=53.2s
+[ASR]   cons 2701/8384: n_free=21077, nnz=105590, t=53.5s
+[ASR]   cons 2711/8384: n_free=21077, nnz=105590, t=53.8s
+[ASR]   cons 2721/8384: n_free=21077, nnz=105590, t=54.1s
+[ASR]   cons 2731/8384: n_free=21077, nnz=105590, t=54.4s
+[ASR]   cons 2741/8384: n_free=21077, nnz=105590, t=54.7s
+[ASR]   cons 2751/8384: n_free=21077, nnz=105590, t=55.0s
+[ASR]   cons 2761/8384: n_free=21077, nnz=105590, t=55.3s
+[ASR]   cons 2771/8384: n_free=21077, nnz=105590, t=55.6s
+[ASR]   cons 2781/8384: n_free=21077, nnz=105590, t=55.9s
+[ASR]   cons 2791/8384: n_free=21077, nnz=105590, t=56.3s
+[ASR]   cons 2801/8384: n_free=21077, nnz=105590, t=56.6s
+[ASR]   cons 2811/8384: n_free=21077, nnz=105590, t=56.9s
+[ASR]   cons 2821/8384: n_free=21059, nnz=107018, t=57.2s
+[ASR]   cons 2831/8384: n_free=21059, nnz=107018, t=57.5s
+[ASR]   cons 2841/8384: n_free=21059, nnz=107018, t=57.8s
+[ASR]   cons 2851/8384: n_free=21059, nnz=107018, t=58.1s
+[ASR]   cons 2861/8384: n_free=21059, nnz=107018, t=58.4s
+[ASR]   cons 2871/8384: n_free=21032, nnz=109583, t=58.8s
+[ASR]   cons 2881/8384: n_free=21005, nnz=110274, t=59.2s
+[ASR]   cons 2891/8384: n_free=20978, nnz=112845, t=59.6s
+[ASR]   cons 2901/8384: n_free=20978, nnz=112845, t=60.0s
+[ASR]   cons 2911/8384: n_free=20978, nnz=112845, t=60.3s
+[ASR]   cons 2921/8384: n_free=20978, nnz=112845, t=60.6s
+[ASR]   cons 2931/8384: n_free=20978, nnz=112845, t=61.0s
+[ASR]   cons 2941/8384: n_free=20978, nnz=112845, t=61.3s
+[ASR]   cons 2951/8384: n_free=20951, nnz=115566, t=61.7s
+[ASR]   cons 2961/8384: n_free=20951, nnz=115566, t=62.0s
+[ASR]   cons 2971/8384: n_free=20951, nnz=115566, t=62.4s
+[ASR]   cons 2981/8384: n_free=20951, nnz=115566, t=62.7s
+[ASR]   cons 2991/8384: n_free=20951, nnz=115566, t=63.1s
+[ASR]   cons 3001/8384: n_free=20951, nnz=115566, t=63.4s
+[ASR]   cons 3011/8384: n_free=20924, nnz=118254, t=63.8s
+[ASR]   cons 3021/8384: n_free=20924, nnz=118254, t=64.2s
+[ASR]   cons 3031/8384: n_free=20897, nnz=118362, t=64.6s
+[ASR]   cons 3041/8384: n_free=20897, nnz=118362, t=64.9s
+[ASR]   cons 3051/8384: n_free=20897, nnz=118362, t=65.3s
+[ASR]   cons 3061/8384: n_free=20870, nnz=121101, t=65.7s
+[ASR]   cons 3071/8384: n_free=20852, nnz=123858, t=66.1s
+[ASR]   cons 3081/8384: n_free=20852, nnz=123858, t=66.5s
+[ASR]   cons 3091/8384: n_free=20852, nnz=123858, t=66.8s
+[ASR]   cons 3101/8384: n_free=20852, nnz=123858, t=67.2s
+[ASR]   cons 3111/8384: n_free=20852, nnz=123858, t=67.6s
+[ASR]   cons 3121/8384: n_free=20852, nnz=123858, t=67.9s
+[ASR]   cons 3131/8384: n_free=20852, nnz=123858, t=68.3s
+[ASR]   cons 3141/8384: n_free=20852, nnz=123858, t=68.7s
+[ASR]   cons 3151/8384: n_free=20852, nnz=123858, t=69.0s
+[ASR]   cons 3161/8384: n_free=20852, nnz=123858, t=69.4s
+[ASR]   cons 3171/8384: n_free=20852, nnz=123858, t=69.8s
+[ASR]   cons 3181/8384: n_free=20852, nnz=123858, t=70.1s
+[ASR]   cons 3191/8384: n_free=20852, nnz=123858, t=70.5s
+[ASR]   cons 3201/8384: n_free=20852, nnz=123858, t=70.8s
+[ASR]   cons 3211/8384: n_free=20852, nnz=123858, t=71.2s
+[ASR]   cons 3221/8384: n_free=20852, nnz=123858, t=71.6s
+[ASR]   cons 3231/8384: n_free=20852, nnz=123858, t=72.0s
+[ASR]   cons 3241/8384: n_free=20834, nnz=124762, t=72.4s
+[ASR]   cons 3251/8384: n_free=20795, nnz=126759, t=72.9s
+[ASR]   cons 3261/8384: n_free=20795, nnz=126759, t=73.2s
+[ASR]   cons 3271/8384: n_free=20795, nnz=126759, t=73.6s
+[ASR]   cons 3281/8384: n_free=20768, nnz=127531, t=74.0s
+[ASR]   cons 3291/8384: n_free=20768, nnz=127531, t=74.4s
+[ASR]   cons 3301/8384: n_free=20768, nnz=127531, t=74.8s
+[ASR]   cons 3311/8384: n_free=20741, nnz=128929, t=75.2s
+[ASR]   cons 3321/8384: n_free=20741, nnz=128929, t=75.6s
+[ASR]   cons 3331/8384: n_free=20714, nnz=130175, t=76.1s
+[ASR]   cons 3341/8384: n_free=20714, nnz=130175, t=76.5s
+[ASR]   cons 3351/8384: n_free=20714, nnz=130175, t=76.9s
+[ASR]   cons 3361/8384: n_free=20687, nnz=131507, t=77.3s
+[ASR]   cons 3371/8384: n_free=20687, nnz=131507, t=77.7s
+[ASR]   cons 3381/8384: n_free=20660, nnz=132851, t=78.2s
+[ASR]   cons 3391/8384: n_free=20660, nnz=132851, t=78.6s
+[ASR]   cons 3401/8384: n_free=20633, nnz=134169, t=79.1s
+[ASR]   cons 3411/8384: n_free=20633, nnz=134169, t=79.5s
+[ASR]   cons 3421/8384: n_free=20633, nnz=134169, t=79.9s
+[ASR]   cons 3431/8384: n_free=20633, nnz=134169, t=80.2s
+[ASR]   cons 3441/8384: n_free=20633, nnz=134169, t=80.6s
+[ASR]   cons 3451/8384: n_free=20633, nnz=134169, t=81.0s
+[ASR]   cons 3461/8384: n_free=20633, nnz=134169, t=81.4s
+[ASR]   cons 3471/8384: n_free=20633, nnz=134169, t=81.8s
+[ASR]   cons 3481/8384: n_free=20633, nnz=134169, t=82.2s
+[ASR]   cons 3491/8384: n_free=20633, nnz=134169, t=82.6s
+[ASR]   cons 3501/8384: n_free=20606, nnz=135481, t=83.0s
+[ASR]   cons 3511/8384: n_free=20606, nnz=135481, t=83.4s
+[ASR]   cons 3521/8384: n_free=20588, nnz=136968, t=83.9s
+[ASR]   cons 3531/8384: n_free=20588, nnz=136968, t=84.3s
+[ASR]   cons 3541/8384: n_free=20588, nnz=136968, t=84.7s
+[ASR]   cons 3551/8384: n_free=20588, nnz=136968, t=85.1s
+[ASR]   cons 3561/8384: n_free=20588, nnz=136968, t=85.5s
+[ASR]   cons 3571/8384: n_free=20588, nnz=136968, t=85.9s
+[ASR]   cons 3581/8384: n_free=20588, nnz=136968, t=86.3s
+[ASR]   cons 3591/8384: n_free=20588, nnz=136968, t=86.7s
+[ASR]   cons 3601/8384: n_free=20588, nnz=136968, t=87.1s
+[ASR]   cons 3611/8384: n_free=20588, nnz=136968, t=87.5s
+[ASR]   cons 3621/8384: n_free=20588, nnz=136968, t=87.9s
+[ASR]   cons 3631/8384: n_free=20588, nnz=136968, t=88.3s
+[ASR]   cons 3641/8384: n_free=20561, nnz=139217, t=88.8s
+[ASR]   cons 3651/8384: n_free=20534, nnz=139433, t=89.3s
+[ASR]   cons 3661/8384: n_free=20534, nnz=139433, t=89.7s
+[ASR]   cons 3671/8384: n_free=20534, nnz=139433, t=90.1s
+[ASR]   cons 3681/8384: n_free=20534, nnz=139433, t=90.5s
+[ASR]   cons 3691/8384: n_free=20507, nnz=140640, t=91.0s
+[ASR]   cons 3701/8384: n_free=20507, nnz=140640, t=91.4s
+[ASR]   cons 3711/8384: n_free=20453, nnz=145902, t=92.0s
+[ASR]   cons 3721/8384: n_free=20453, nnz=145902, t=92.5s
+[ASR]   cons 3731/8384: n_free=20426, nnz=148330, t=93.0s
+[ASR]   cons 3741/8384: n_free=20426, nnz=148330, t=93.4s
+[ASR]   cons 3751/8384: n_free=20426, nnz=148330, t=93.9s
+[ASR]   cons 3761/8384: n_free=20399, nnz=150753, t=94.4s
+[ASR]   cons 3771/8384: n_free=20399, nnz=150753, t=94.9s
+[ASR]   cons 3781/8384: n_free=20399, nnz=150753, t=95.3s
+[ASR]   cons 3791/8384: n_free=20399, nnz=150753, t=95.8s
+[ASR]   cons 3801/8384: n_free=20399, nnz=150753, t=96.3s
+[ASR]   cons 3811/8384: n_free=20399, nnz=150753, t=96.7s
+[ASR]   cons 3821/8384: n_free=20399, nnz=150753, t=97.2s
+[ASR]   cons 3831/8384: n_free=20399, nnz=150753, t=97.6s
+[ASR]   cons 3841/8384: n_free=20399, nnz=150753, t=98.1s
+[ASR]   cons 3851/8384: n_free=20399, nnz=150753, t=98.5s
+[ASR]   cons 3861/8384: n_free=20399, nnz=150753, t=99.0s
+[ASR]   cons 3871/8384: n_free=20372, nnz=150888, t=99.5s
+[ASR]   cons 3881/8384: n_free=20372, nnz=150888, t=100.0s
+[ASR]   cons 3891/8384: n_free=20354, nnz=153311, t=100.5s
+[ASR]   cons 3901/8384: n_free=20354, nnz=153311, t=101.0s
+[ASR]   cons 3911/8384: n_free=20354, nnz=153311, t=101.5s
+[ASR]   cons 3921/8384: n_free=20354, nnz=153311, t=101.9s
+[ASR]   cons 3931/8384: n_free=20354, nnz=153311, t=102.4s
+[ASR]   cons 3941/8384: n_free=20354, nnz=153311, t=102.9s
+[ASR]   cons 3951/8384: n_free=20354, nnz=153311, t=103.4s
+[ASR]   cons 3961/8384: n_free=20354, nnz=153311, t=103.9s
+[ASR]   cons 3971/8384: n_free=20354, nnz=153311, t=104.3s
+[ASR]   cons 3981/8384: n_free=20354, nnz=153311, t=104.8s
+[ASR]   cons 3991/8384: n_free=20354, nnz=153311, t=105.3s
+[ASR]   cons 4001/8384: n_free=20354, nnz=153311, t=105.8s
+[ASR]   cons 4011/8384: n_free=20354, nnz=153311, t=106.3s
+[ASR]   cons 4021/8384: n_free=20336, nnz=154839, t=106.8s
+[ASR]   cons 4031/8384: n_free=20336, nnz=154839, t=107.3s
+[ASR]   cons 4041/8384: n_free=20336, nnz=154839, t=107.7s
+[ASR]   cons 4051/8384: n_free=20336, nnz=154839, t=108.2s
+[ASR]   cons 4061/8384: n_free=20336, nnz=154839, t=108.7s
+[ASR]   cons 4071/8384: n_free=20336, nnz=154839, t=109.2s
+[ASR]   cons 4081/8384: n_free=20336, nnz=154839, t=109.7s
+[ASR]   cons 4091/8384: n_free=20309, nnz=158102, t=110.2s
+[ASR]   cons 4101/8384: n_free=20282, nnz=159314, t=110.8s
+[ASR]   cons 4111/8384: n_free=20282, nnz=159314, t=111.3s
+[ASR]   cons 4121/8384: n_free=20282, nnz=159314, t=111.8s
+[ASR]   cons 4131/8384: n_free=20255, nnz=160352, t=112.4s
+[ASR]   cons 4141/8384: n_free=20255, nnz=160352, t=112.9s
+[ASR]   cons 4151/8384: n_free=20255, nnz=160352, t=113.4s
+[ASR]   cons 4161/8384: n_free=20228, nnz=163369, t=114.0s
+[ASR]   cons 4171/8384: n_free=20228, nnz=163369, t=114.5s
+[ASR]   cons 4181/8384: n_free=20228, nnz=163369, t=115.1s
+[ASR]   cons 4191/8384: n_free=20228, nnz=163369, t=115.6s
+[ASR]   cons 4201/8384: n_free=20201, nnz=166374, t=116.2s
+[ASR]   cons 4211/8384: n_free=20201, nnz=166374, t=116.7s
+[ASR]   cons 4221/8384: n_free=20201, nnz=166374, t=117.2s
+[ASR]   cons 4231/8384: n_free=20201, nnz=166374, t=117.8s
+[ASR]   cons 4241/8384: n_free=20201, nnz=166374, t=118.3s
+[ASR]   cons 4251/8384: n_free=20201, nnz=166374, t=118.8s
+[ASR]   cons 4261/8384: n_free=20201, nnz=166374, t=119.4s
+[ASR]   cons 4271/8384: n_free=20201, nnz=166374, t=119.9s
+[ASR]   cons 4281/8384: n_free=20201, nnz=166374, t=120.4s
+[ASR]   cons 4291/8384: n_free=20174, nnz=166509, t=121.1s
+[ASR]   cons 4301/8384: n_free=20174, nnz=166509, t=121.6s
+[ASR]   cons 4311/8384: n_free=20174, nnz=166509, t=122.1s
+[ASR]   cons 4321/8384: n_free=20156, nnz=169523, t=122.7s
+[ASR]   cons 4331/8384: n_free=20156, nnz=169523, t=123.3s
+[ASR]   cons 4341/8384: n_free=20156, nnz=169523, t=123.8s
+[ASR]   cons 4351/8384: n_free=20156, nnz=169523, t=124.4s
+[ASR]   cons 4361/8384: n_free=20156, nnz=169523, t=124.9s
+[ASR]   cons 4371/8384: n_free=20156, nnz=169523, t=125.5s
+[ASR]   cons 4381/8384: n_free=20138, nnz=171178, t=126.0s
+[ASR]   cons 4391/8384: n_free=20126, nnz=173103, t=126.6s
+[ASR]   cons 4401/8384: n_free=20126, nnz=173103, t=127.2s
+[ASR]   cons 4411/8384: n_free=20126, nnz=173103, t=127.7s
+[ASR]   cons 4421/8384: n_free=20126, nnz=173103, t=128.3s
+[ASR]   cons 4431/8384: n_free=20126, nnz=173103, t=128.9s
+[ASR]   cons 4441/8384: n_free=20099, nnz=176643, t=129.5s
+[ASR]   cons 4451/8384: n_free=20099, nnz=176643, t=130.1s
+[ASR]   cons 4461/8384: n_free=20072, nnz=178471, t=130.7s
+[ASR]   cons 4471/8384: n_free=20072, nnz=178471, t=131.3s
+[ASR]   cons 4481/8384: n_free=20072, nnz=178471, t=131.9s
+[ASR]   cons 4491/8384: n_free=20045, nnz=181897, t=132.5s
+[ASR]   cons 4501/8384: n_free=20045, nnz=181897, t=133.1s
+[ASR]   cons 4511/8384: n_free=20045, nnz=181897, t=133.7s
+[ASR]   cons 4521/8384: n_free=20045, nnz=181897, t=134.3s
+[ASR]   cons 4531/8384: n_free=20018, nnz=185146, t=135.0s
+[ASR]   cons 4541/8384: n_free=20018, nnz=185146, t=135.6s
+[ASR]   cons 4551/8384: n_free=20018, nnz=185146, t=136.2s
+[ASR]   cons 4561/8384: n_free=20018, nnz=185146, t=136.8s
+[ASR]   cons 4571/8384: n_free=19991, nnz=188358, t=137.5s
+[ASR]   cons 4581/8384: n_free=19991, nnz=188358, t=138.1s
+[ASR]   cons 4591/8384: n_free=19991, nnz=188358, t=138.7s
+[ASR]   cons 4601/8384: n_free=19991, nnz=188358, t=139.3s
+[ASR]   cons 4611/8384: n_free=19991, nnz=188358, t=140.0s
+[ASR]   cons 4621/8384: n_free=19991, nnz=188358, t=140.6s
+[ASR]   cons 4631/8384: n_free=19991, nnz=188358, t=141.2s
+[ASR]   cons 4641/8384: n_free=19991, nnz=188358, t=141.8s
+[ASR]   cons 4651/8384: n_free=19964, nnz=188520, t=142.5s
+[ASR]   cons 4661/8384: n_free=19964, nnz=188520, t=143.1s
+[ASR]   cons 4671/8384: n_free=19964, nnz=188520, t=143.7s
+[ASR]   cons 4681/8384: n_free=19937, nnz=188736, t=144.4s
+[ASR]   cons 4691/8384: n_free=19919, nnz=192025, t=145.0s
+[ASR]   cons 4701/8384: n_free=19919, nnz=192025, t=145.6s
+[ASR]   cons 4711/8384: n_free=19919, nnz=192025, t=146.2s
+[ASR]   cons 4721/8384: n_free=19919, nnz=192025, t=146.8s
+[ASR]   cons 4731/8384: n_free=19901, nnz=193139, t=147.5s
+[ASR]   cons 4741/8384: n_free=19901, nnz=193139, t=148.1s
+[ASR]   cons 4751/8384: n_free=19874, nnz=195297, t=148.9s
+[ASR]   cons 4761/8384: n_free=19874, nnz=195297, t=149.5s
+[ASR]   cons 4771/8384: n_free=19874, nnz=195297, t=150.1s
+[ASR]   cons 4781/8384: n_free=19874, nnz=195297, t=150.7s
+[ASR]   cons 4791/8384: n_free=19874, nnz=195297, t=151.4s
+[ASR]   cons 4801/8384: n_free=19874, nnz=195297, t=152.0s
+[ASR]   cons 4811/8384: n_free=19847, nnz=196254, t=152.7s
+[ASR]   cons 4821/8384: n_free=19847, nnz=196254, t=153.4s
+[ASR]   cons 4831/8384: n_free=19847, nnz=196254, t=154.0s
+[ASR]   cons 4841/8384: n_free=19847, nnz=196254, t=154.7s
+[ASR]   cons 4851/8384: n_free=19847, nnz=196254, t=155.3s
+[ASR]   cons 4861/8384: n_free=19847, nnz=196254, t=156.0s
+[ASR]   cons 4871/8384: n_free=19847, nnz=196254, t=156.6s
+[ASR]   cons 4881/8384: n_free=19847, nnz=196254, t=157.3s
+[ASR]   cons 4891/8384: n_free=19847, nnz=196254, t=158.0s
+[ASR]   cons 4901/8384: n_free=19847, nnz=196254, t=158.6s
+[ASR]   cons 4911/8384: n_free=19820, nnz=198150, t=159.3s
+[ASR]   cons 4921/8384: n_free=19793, nnz=200306, t=160.1s
+[ASR]   cons 4931/8384: n_free=19793, nnz=200306, t=160.8s
+[ASR]   cons 4941/8384: n_free=19793, nnz=200306, t=161.4s
+[ASR]   cons 4951/8384: n_free=19793, nnz=200306, t=162.1s
+[ASR]   cons 4961/8384: n_free=19793, nnz=200306, t=162.7s
+[ASR]   cons 4971/8384: n_free=19766, nnz=202477, t=163.5s
+[ASR]   cons 4981/8384: n_free=19766, nnz=202477, t=164.1s
+[ASR]   cons 4991/8384: n_free=19766, nnz=202477, t=164.8s
+[ASR]   cons 5001/8384: n_free=19766, nnz=202477, t=165.4s
+[ASR]   cons 5011/8384: n_free=19766, nnz=202477, t=166.1s
+[ASR]   cons 5021/8384: n_free=19766, nnz=202477, t=166.7s
+[ASR]   cons 5031/8384: n_free=19766, nnz=202477, t=167.4s
+[ASR]   cons 5041/8384: n_free=19739, nnz=202585, t=168.1s
+[ASR]   cons 5051/8384: n_free=19721, nnz=204801, t=168.8s
+[ASR]   cons 5061/8384: n_free=19721, nnz=204801, t=169.5s
+[ASR]   cons 5071/8384: n_free=19703, nnz=207132, t=170.2s
+[ASR]   cons 5081/8384: n_free=19703, nnz=207132, t=170.9s
+[ASR]   cons 5091/8384: n_free=19703, nnz=207132, t=171.6s
+[ASR]   cons 5101/8384: n_free=19703, nnz=207132, t=172.3s
+[ASR]   cons 5111/8384: n_free=19676, nnz=209362, t=173.1s
+[ASR]   cons 5121/8384: n_free=19676, nnz=209362, t=173.8s
+[ASR]   cons 5131/8384: n_free=19676, nnz=209362, t=174.5s
+[ASR]   cons 5141/8384: n_free=19676, nnz=209362, t=175.2s
+[ASR]   cons 5151/8384: n_free=19676, nnz=209362, t=175.9s
+[ASR]   cons 5161/8384: n_free=19676, nnz=209362, t=176.6s
+[ASR]   cons 5171/8384: n_free=19676, nnz=209362, t=177.3s
+[ASR]   cons 5181/8384: n_free=19676, nnz=209362, t=178.0s
+[ASR]   cons 5191/8384: n_free=19676, nnz=209362, t=178.7s
+[ASR]   cons 5201/8384: n_free=19676, nnz=209362, t=179.4s
+[ASR]   cons 5211/8384: n_free=19676, nnz=209362, t=180.1s
+[ASR]   cons 5221/8384: n_free=19676, nnz=209362, t=180.8s
+[ASR]   cons 5231/8384: n_free=19649, nnz=211952, t=181.6s
+[ASR]   cons 5241/8384: n_free=19622, nnz=214109, t=182.4s
+[ASR]   cons 5251/8384: n_free=19622, nnz=214109, t=183.1s
+[ASR]   cons 5261/8384: n_free=19622, nnz=214109, t=183.8s
+[ASR]   cons 5271/8384: n_free=19595, nnz=214244, t=184.6s
+[ASR]   cons 5281/8384: n_free=19595, nnz=214244, t=185.3s
+[ASR]   cons 5291/8384: n_free=19595, nnz=214244, t=186.0s
+[ASR]   cons 5301/8384: n_free=19595, nnz=214244, t=186.8s
+[ASR]   cons 5311/8384: n_free=19595, nnz=214244, t=187.5s
+[ASR]   cons 5321/8384: n_free=19595, nnz=214244, t=188.2s
+[ASR]   cons 5331/8384: n_free=19595, nnz=214244, t=188.9s
+[ASR]   cons 5341/8384: n_free=19595, nnz=214244, t=189.7s
+[ASR]   cons 5351/8384: n_free=19568, nnz=215978, t=190.5s
+[ASR]   cons 5361/8384: n_free=19568, nnz=215978, t=191.2s
+[ASR]   cons 5371/8384: n_free=19550, nnz=217694, t=192.0s
+[ASR]   cons 5381/8384: n_free=19550, nnz=217694, t=192.7s
+[ASR]   cons 5391/8384: n_free=19532, nnz=219270, t=193.5s
+[ASR]   cons 5401/8384: n_free=19532, nnz=219270, t=194.3s
+[ASR]   cons 5411/8384: n_free=19532, nnz=219270, t=195.0s
+[ASR]   cons 5421/8384: n_free=19532, nnz=219270, t=195.7s
+[ASR]   cons 5431/8384: n_free=19532, nnz=219270, t=196.5s
+[ASR]   cons 5441/8384: n_free=19532, nnz=219270, t=197.2s
+[ASR]   cons 5451/8384: n_free=19532, nnz=219270, t=198.0s
+[ASR]   cons 5461/8384: n_free=19532, nnz=219270, t=198.7s
+[ASR]   cons 5471/8384: n_free=19532, nnz=219270, t=199.4s
+[ASR]   cons 5481/8384: n_free=19505, nnz=223648, t=200.3s
+[ASR]   cons 5491/8384: n_free=19478, nnz=227297, t=201.1s
+[ASR]   cons 5501/8384: n_free=19451, nnz=231057, t=202.0s
+[ASR]   cons 5511/8384: n_free=19424, nnz=234923, t=202.8s
+[ASR]   cons 5521/8384: n_free=19424, nnz=234923, t=203.6s
+[ASR]   cons 5531/8384: n_free=19424, nnz=234923, t=204.4s
+[ASR]   cons 5541/8384: n_free=19424, nnz=234923, t=205.2s
+[ASR]   cons 5551/8384: n_free=19424, nnz=234923, t=206.0s
+[ASR]   cons 5561/8384: n_free=19424, nnz=234923, t=206.8s
+[ASR]   cons 5571/8384: n_free=19424, nnz=234923, t=207.6s
+[ASR]   cons 5581/8384: n_free=19424, nnz=234923, t=208.4s
+[ASR]   cons 5591/8384: n_free=19424, nnz=234923, t=209.2s
+[ASR]   cons 5601/8384: n_free=19424, nnz=234923, t=210.0s
+[ASR]   cons 5611/8384: n_free=19424, nnz=234923, t=210.8s
+[ASR]   cons 5621/8384: n_free=19424, nnz=234923, t=211.6s
+[ASR]   cons 5631/8384: n_free=19424, nnz=234923, t=212.4s
+[ASR]   cons 5641/8384: n_free=19424, nnz=234923, t=213.2s
+[ASR]   cons 5651/8384: n_free=19424, nnz=234923, t=214.0s
+[ASR]   cons 5661/8384: n_free=19370, nnz=242802, t=215.0s
+[ASR]   cons 5671/8384: n_free=19343, nnz=246782, t=215.9s
+[ASR]   cons 5681/8384: n_free=19325, nnz=250765, t=216.9s
+[ASR]   cons 5691/8384: n_free=19307, nnz=252673, t=217.8s
+[ASR]   cons 5701/8384: n_free=19307, nnz=252673, t=218.6s
+[ASR]   cons 5711/8384: n_free=19307, nnz=252673, t=219.5s
+[ASR]   cons 5721/8384: n_free=19280, nnz=256298, t=220.4s
+[ASR]   cons 5731/8384: n_free=19280, nnz=256298, t=221.3s
+[ASR]   cons 5741/8384: n_free=19280, nnz=256298, t=222.2s
+[ASR]   cons 5751/8384: n_free=19280, nnz=256298, t=223.0s
+[ASR]   cons 5761/8384: n_free=19280, nnz=256298, t=223.9s
+[ASR]   cons 5771/8384: n_free=19280, nnz=256298, t=224.7s
+[ASR]   cons 5781/8384: n_free=19280, nnz=256298, t=225.6s
+[ASR]   cons 5791/8384: n_free=19280, nnz=256298, t=226.5s
+[ASR]   cons 5801/8384: n_free=19280, nnz=256298, t=227.3s
+[ASR]   cons 5811/8384: n_free=19280, nnz=256298, t=228.2s
+[ASR]   cons 5821/8384: n_free=19280, nnz=256298, t=229.0s
+[ASR]   cons 5831/8384: n_free=19253, nnz=258984, t=230.0s
+[ASR]   cons 5841/8384: n_free=19253, nnz=258984, t=230.9s
+[ASR]   cons 5851/8384: n_free=19226, nnz=261851, t=231.9s
+[ASR]   cons 5861/8384: n_free=19226, nnz=261851, t=232.8s
+[ASR]   cons 5871/8384: n_free=19199, nnz=264685, t=233.8s
+[ASR]   cons 5881/8384: n_free=19172, nnz=264847, t=234.8s
+[ASR]   cons 5891/8384: n_free=19172, nnz=264847, t=235.7s
+[ASR]   cons 5901/8384: n_free=19145, nnz=267732, t=236.7s
+[ASR]   cons 5911/8384: n_free=19145, nnz=267732, t=237.7s
+[ASR]   cons 5921/8384: n_free=19145, nnz=267732, t=238.6s
+[ASR]   cons 5931/8384: n_free=19127, nnz=270662, t=239.6s
+[ASR]   cons 5941/8384: n_free=19127, nnz=270662, t=240.5s
+[ASR]   cons 5951/8384: n_free=19127, nnz=270662, t=241.5s
+[ASR]   cons 5961/8384: n_free=19127, nnz=270662, t=242.4s
+[ASR]   cons 5971/8384: n_free=19109, nnz=273202, t=243.4s
+[ASR]   cons 5981/8384: n_free=19109, nnz=273202, t=244.3s
+[ASR]   cons 5991/8384: n_free=19109, nnz=273202, t=245.3s
+[ASR]   cons 6001/8384: n_free=19082, nnz=276800, t=246.3s
+[ASR]   cons 6011/8384: n_free=19082, nnz=276800, t=247.3s
+[ASR]   cons 6021/8384: n_free=19082, nnz=276800, t=248.3s
+[ASR]   cons 6031/8384: n_free=19082, nnz=276800, t=249.2s
+[ASR]   cons 6041/8384: n_free=19082, nnz=276800, t=250.2s
+[ASR]   cons 6051/8384: n_free=19082, nnz=276800, t=251.2s
+[ASR]   cons 6061/8384: n_free=19082, nnz=276800, t=252.1s
+[ASR]   cons 6071/8384: n_free=19082, nnz=276800, t=253.1s
+[ASR]   cons 6081/8384: n_free=19082, nnz=276800, t=254.1s
+[ASR]   cons 6091/8384: n_free=19082, nnz=276800, t=255.0s
+[ASR]   cons 6101/8384: n_free=19082, nnz=276800, t=256.0s
+[ASR]   cons 6111/8384: n_free=19055, nnz=277811, t=257.1s
+[ASR]   cons 6121/8384: n_free=19055, nnz=277811, t=258.0s
+[ASR]   cons 6131/8384: n_free=19001, nnz=281340, t=259.2s
+[ASR]   cons 6141/8384: n_free=19001, nnz=281340, t=260.2s
+[ASR]   cons 6151/8384: n_free=18974, nnz=284773, t=261.2s
+[ASR]   cons 6161/8384: n_free=18947, nnz=288272, t=262.3s
+[ASR]   cons 6171/8384: n_free=18947, nnz=288272, t=263.3s
+[ASR]   cons 6181/8384: n_free=18920, nnz=291825, t=264.4s
+[ASR]   cons 6191/8384: n_free=18920, nnz=291825, t=265.4s
+[ASR]   cons 6201/8384: n_free=18902, nnz=295378, t=266.5s
+[ASR]   cons 6211/8384: n_free=18902, nnz=295378, t=267.6s
+[ASR]   cons 6221/8384: n_free=18902, nnz=295378, t=268.6s
+[ASR]   cons 6231/8384: n_free=18902, nnz=295378, t=269.6s
+[ASR]   cons 6241/8384: n_free=18884, nnz=298807, t=270.8s
+[ASR]   cons 6251/8384: n_free=18884, nnz=298807, t=271.8s
+[ASR]   cons 6261/8384: n_free=18884, nnz=298807, t=272.9s
+[ASR]   cons 6271/8384: n_free=18857, nnz=301993, t=274.0s
+[ASR]   cons 6281/8384: n_free=18857, nnz=301993, t=275.1s
+[ASR]   cons 6291/8384: n_free=18857, nnz=301993, t=276.1s
+[ASR]   cons 6301/8384: n_free=18830, nnz=304894, t=277.2s
+[ASR]   cons 6311/8384: n_free=18830, nnz=304894, t=278.3s
+[ASR]   cons 6321/8384: n_free=18830, nnz=304894, t=279.4s
+[ASR]   cons 6331/8384: n_free=18830, nnz=304894, t=280.5s
+[ASR]   cons 6341/8384: n_free=18830, nnz=304894, t=281.6s
+[ASR]   cons 6351/8384: n_free=18830, nnz=304894, t=282.6s
+[ASR]   cons 6361/8384: n_free=18830, nnz=304894, t=283.7s
+[ASR]   cons 6371/8384: n_free=18803, nnz=308707, t=284.9s
+[ASR]   cons 6381/8384: n_free=18803, nnz=308707, t=286.0s
+[ASR]   cons 6391/8384: n_free=18803, nnz=308707, t=287.1s
+[ASR]   cons 6401/8384: n_free=18776, nnz=313491, t=288.3s
+[ASR]   cons 6411/8384: n_free=18776, nnz=313491, t=289.5s
+[ASR]   cons 6421/8384: n_free=18749, nnz=318311, t=290.7s
+[ASR]   cons 6431/8384: n_free=18722, nnz=323143, t=291.9s
+[ASR]   cons 6441/8384: n_free=18722, nnz=323143, t=293.1s
+[ASR]   cons 6451/8384: n_free=18695, nnz=323323, t=294.3s
+[ASR]   cons 6461/8384: n_free=18677, nnz=328164, t=295.6s
+[ASR]   cons 6471/8384: n_free=18677, nnz=328164, t=296.8s
+[ASR]   cons 6481/8384: n_free=18677, nnz=328164, t=297.9s
+[ASR]   cons 6491/8384: n_free=18677, nnz=328164, t=299.1s
+[ASR]   cons 6501/8384: n_free=18659, nnz=333320, t=300.4s
+[ASR]   cons 6511/8384: n_free=18659, nnz=333320, t=301.6s
+[ASR]   cons 6521/8384: n_free=18632, nnz=338272, t=302.9s
+[ASR]   cons 6531/8384: n_free=18605, nnz=344000, t=304.3s
+[ASR]   cons 6541/8384: n_free=18605, nnz=344000, t=305.5s
+[ASR]   cons 6551/8384: n_free=18605, nnz=344000, t=306.7s
+[ASR]   cons 6561/8384: n_free=18605, nnz=344000, t=308.0s
+[ASR]   cons 6571/8384: n_free=18605, nnz=344000, t=309.2s
+[ASR]   cons 6581/8384: n_free=18605, nnz=344000, t=310.4s
+[ASR]   cons 6591/8384: n_free=18605, nnz=344000, t=311.7s
+[ASR]   cons 6601/8384: n_free=18605, nnz=344000, t=312.9s
+[ASR]   cons 6611/8384: n_free=18605, nnz=344000, t=314.1s
+[ASR]   cons 6621/8384: n_free=18578, nnz=347484, t=315.4s
+[ASR]   cons 6631/8384: n_free=18578, nnz=347484, t=316.7s
+[ASR]   cons 6641/8384: n_free=18551, nnz=350219, t=318.1s
+[ASR]   cons 6651/8384: n_free=18551, nnz=350219, t=319.3s
+[ASR]   cons 6661/8384: n_free=18524, nnz=354747, t=320.7s
+[ASR]   cons 6671/8384: n_free=18524, nnz=354747, t=322.0s
+[ASR]   cons 6681/8384: n_free=18470, nnz=359431, t=323.6s
+[ASR]   cons 6691/8384: n_free=18452, nnz=363983, t=325.0s
+[ASR]   cons 6701/8384: n_free=18452, nnz=363983, t=326.3s
+[ASR]   cons 6711/8384: n_free=18452, nnz=363983, t=327.6s
+[ASR]   cons 6721/8384: n_free=18452, nnz=363983, t=328.9s
+[ASR]   cons 6731/8384: n_free=18452, nnz=363983, t=330.2s
+[ASR]   cons 6741/8384: n_free=18434, nnz=367071, t=331.7s
+[ASR]   cons 6751/8384: n_free=18434, nnz=367071, t=333.0s
+[ASR]   cons 6761/8384: n_free=18407, nnz=373354, t=334.5s
+[ASR]   cons 6771/8384: n_free=18407, nnz=373354, t=335.9s
+[ASR]   cons 6781/8384: n_free=18380, nnz=379641, t=337.4s
+[ASR]   cons 6791/8384: n_free=18380, nnz=379641, t=338.7s
+[ASR]   cons 6801/8384: n_free=18380, nnz=379641, t=340.1s
+[ASR]   cons 6811/8384: n_free=18380, nnz=379641, t=341.4s
+[ASR]   cons 6821/8384: n_free=18353, nnz=384605, t=342.9s
+[ASR]   cons 6831/8384: n_free=18353, nnz=384605, t=344.4s
+[ASR]   cons 6841/8384: n_free=18353, nnz=384605, t=345.8s
+[ASR]   cons 6851/8384: n_free=18326, nnz=389722, t=347.3s
+[ASR]   cons 6861/8384: n_free=18299, nnz=395040, t=348.9s
+[ASR]   cons 6871/8384: n_free=18299, nnz=395040, t=350.4s
+[ASR]   cons 6881/8384: n_free=18299, nnz=395040, t=351.8s
+[ASR]   cons 6891/8384: n_free=18245, nnz=400631, t=353.5s
+[ASR]   cons 6901/8384: n_free=18245, nnz=400631, t=354.9s
+[ASR]   cons 6911/8384: n_free=18245, nnz=400631, t=356.4s
+[ASR]   cons 6921/8384: n_free=18218, nnz=400850, t=358.0s
+[ASR]   cons 6931/8384: n_free=18218, nnz=400850, t=359.4s
+[ASR]   cons 6941/8384: n_free=18218, nnz=400850, t=360.9s
+[ASR]   cons 6951/8384: n_free=18200, nnz=406276, t=362.5s
+[ASR]   cons 6961/8384: n_free=18182, nnz=410234, t=364.1s
+[ASR]   cons 6971/8384: n_free=18182, nnz=410234, t=365.6s
+[ASR]   cons 6981/8384: n_free=18182, nnz=410234, t=367.1s
+[ASR]   cons 6991/8384: n_free=18182, nnz=410234, t=368.7s
+[ASR]   cons 7001/8384: n_free=18155, nnz=417250, t=370.3s
+[ASR]   cons 7011/8384: n_free=18128, nnz=423450, t=372.0s
+[ASR]   cons 7021/8384: n_free=18128, nnz=423450, t=373.6s
+[ASR]   cons 7031/8384: n_free=18128, nnz=423450, t=375.1s
+[ASR]   cons 7041/8384: n_free=18101, nnz=429767, t=376.8s
+[ASR]   cons 7051/8384: n_free=18101, nnz=429767, t=378.4s
+[ASR]   cons 7061/8384: n_free=18101, nnz=429767, t=380.0s
+[ASR]   cons 7071/8384: n_free=18101, nnz=429767, t=381.6s
+[ASR]   cons 7081/8384: n_free=18047, nnz=445255, t=383.5s
+[ASR]   cons 7091/8384: n_free=18047, nnz=445255, t=385.1s
+[ASR]   cons 7101/8384: n_free=18047, nnz=445255, t=386.8s
+[ASR]   cons 7111/8384: n_free=18020, nnz=455465, t=388.6s
+[ASR]   cons 7121/8384: n_free=17993, nnz=465708, t=390.5s
+[ASR]   cons 7131/8384: n_free=17993, nnz=465708, t=392.2s
+[ASR]   cons 7141/8384: n_free=17975, nnz=475894, t=394.1s
+[ASR]   cons 7151/8384: n_free=17975, nnz=475894, t=395.9s
+[ASR]   cons 7161/8384: n_free=17957, nnz=480253, t=397.8s
+[ASR]   cons 7171/8384: n_free=17957, nnz=480253, t=399.6s
+[ASR]   cons 7181/8384: n_free=17930, nnz=485858, t=401.5s
+[ASR]   cons 7191/8384: n_free=17903, nnz=486611, t=403.5s
+[ASR]   cons 7201/8384: n_free=17903, nnz=486611, t=405.4s
+[ASR]   cons 7211/8384: n_free=17876, nnz=491656, t=407.4s
+[ASR]   cons 7221/8384: n_free=17876, nnz=491656, t=409.2s
+[ASR]   cons 7231/8384: n_free=17876, nnz=491656, t=410.9s
+[ASR]   cons 7241/8384: n_free=17876, nnz=491656, t=412.7s
+[ASR]   cons 7251/8384: n_free=17849, nnz=495636, t=414.7s
+[ASR]   cons 7261/8384: n_free=17849, nnz=495636, t=416.5s
+[ASR]   cons 7271/8384: n_free=17849, nnz=495636, t=418.4s
+[ASR]   cons 7281/8384: n_free=17849, nnz=495636, t=420.3s
+[ASR]   cons 7291/8384: n_free=17849, nnz=495636, t=422.1s
+[ASR]   cons 7301/8384: n_free=17822, nnz=500780, t=424.1s
+[ASR]   cons 7311/8384: n_free=17822, nnz=500780, t=426.0s
+[ASR]   cons 7321/8384: n_free=17795, nnz=505887, t=428.1s
+[ASR]   cons 7331/8384: n_free=17768, nnz=511051, t=430.2s
+[ASR]   cons 7341/8384: n_free=17723, nnz=521792, t=432.4s
+[ASR]   cons 7351/8384: n_free=17705, nnz=527579, t=434.5s
+[ASR]   cons 7361/8384: n_free=17705, nnz=527579, t=436.5s
+[ASR]   cons 7371/8384: n_free=17678, nnz=536451, t=438.7s
+[ASR]   cons 7381/8384: n_free=17651, nnz=537054, t=440.9s
+[ASR]   cons 7391/8384: n_free=17651, nnz=537054, t=443.0s
+[ASR]   cons 7401/8384: n_free=17651, nnz=537054, t=445.0s
+[ASR]   cons 7411/8384: n_free=17624, nnz=542954, t=447.3s
+[ASR]   cons 7421/8384: n_free=17624, nnz=542954, t=449.4s
+[ASR]   cons 7431/8384: n_free=17624, nnz=542954, t=451.4s
+[ASR]   cons 7441/8384: n_free=17624, nnz=542954, t=453.5s
+[ASR]   cons 7451/8384: n_free=17624, nnz=542954, t=455.5s
+[ASR]   cons 7461/8384: n_free=17624, nnz=542954, t=457.6s
+[ASR]   cons 7471/8384: n_free=17624, nnz=542954, t=459.6s
+[ASR]   cons 7481/8384: n_free=17624, nnz=542954, t=461.7s
+[ASR]   cons 7491/8384: n_free=17597, nnz=549503, t=464.0s
+[ASR]   cons 7501/8384: n_free=17543, nnz=562266, t=466.5s
+[ASR]   cons 7511/8384: n_free=17516, nnz=568070, t=468.8s
+[ASR]   cons 7521/8384: n_free=17498, nnz=573895, t=471.1s
+[ASR]   cons 7531/8384: n_free=17480, nnz=578725, t=473.5s
+[ASR]   cons 7541/8384: n_free=17453, nnz=584813, t=475.9s
+[ASR]   cons 7551/8384: n_free=17453, nnz=584813, t=478.2s
+[ASR]   cons 7561/8384: n_free=17453, nnz=584813, t=480.5s
+[ASR]   cons 7571/8384: n_free=17426, nnz=595490, t=482.9s
+[ASR]   cons 7581/8384: n_free=17426, nnz=595490, t=485.3s
+[ASR]   cons 7591/8384: n_free=17426, nnz=595490, t=487.6s
+[ASR]   cons 7601/8384: n_free=17426, nnz=595490, t=489.9s
+[ASR]   cons 7611/8384: n_free=17426, nnz=595490, t=492.3s
+[ASR]   cons 7621/8384: n_free=17426, nnz=595490, t=494.6s
+[ASR]   cons 7631/8384: n_free=17426, nnz=595490, t=496.9s
+[ASR]   cons 7641/8384: n_free=17426, nnz=595490, t=499.2s
+[ASR]   cons 7651/8384: n_free=17372, nnz=616478, t=501.9s
+[ASR]   cons 7661/8384: n_free=17345, nnz=628902, t=504.6s
+[ASR]   cons 7671/8384: n_free=17300, nnz=653855, t=507.4s
+[ASR]   cons 7681/8384: n_free=17300, nnz=653855, t=510.0s
+[ASR]   cons 7691/8384: n_free=17282, nnz=657655, t=512.7s
+[ASR]   cons 7701/8384: n_free=17282, nnz=657655, t=515.3s
+[ASR]   cons 7711/8384: n_free=17282, nnz=657655, t=517.9s
+[ASR]   cons 7721/8384: n_free=17282, nnz=657655, t=520.5s
+[ASR]   cons 7731/8384: n_free=17255, nnz=665080, t=523.3s
+[ASR]   cons 7741/8384: n_free=17255, nnz=665080, t=525.8s
+[ASR]   cons 7751/8384: n_free=17255, nnz=665080, t=528.4s
+[ASR]   cons 7761/8384: n_free=17255, nnz=665080, t=531.0s
+[ASR]   cons 7771/8384: n_free=17228, nnz=671511, t=533.7s
+[ASR]   cons 7781/8384: n_free=17228, nnz=671511, t=536.3s
+[ASR]   cons 7791/8384: n_free=17228, nnz=671511, t=538.9s
+[ASR]   cons 7801/8384: n_free=17174, nnz=681986, t=542.1s
+[ASR]   cons 7811/8384: n_free=17147, nnz=689170, t=545.0s
+[ASR]   cons 7821/8384: n_free=17129, nnz=696336, t=547.9s
+[ASR]   cons 7831/8384: n_free=17111, nnz=702826, t=550.8s
+[ASR]   cons 7841/8384: n_free=17111, nnz=702826, t=553.6s
+[ASR]   cons 7851/8384: n_free=17084, nnz=709851, t=556.6s
+[ASR]   cons 7861/8384: n_free=17057, nnz=713094, t=559.7s
+[ASR]   cons 7871/8384: n_free=17030, nnz=724905, t=562.8s
+[ASR]   cons 7881/8384: n_free=17003, nnz=727440, t=566.0s
+[ASR]   cons 7891/8384: n_free=17003, nnz=727440, t=568.9s
+[ASR]   cons 7901/8384: n_free=16976, nnz=737065, t=572.1s
+[ASR]   cons 7911/8384: n_free=16949, nnz=753103, t=575.4s
+[ASR]   cons 7921/8384: n_free=16949, nnz=753103, t=578.5s
+[ASR]   cons 7931/8384: n_free=16931, nnz=765959, t=581.7s
+[ASR]   cons 7941/8384: n_free=16931, nnz=765959, t=584.8s
+[ASR]   cons 7951/8384: n_free=16913, nnz=770764, t=588.1s
+[ASR]   cons 7961/8384: n_free=16913, nnz=770764, t=591.3s
+[ASR]   cons 7971/8384: n_free=16886, nnz=783240, t=594.6s
+[ASR]   cons 7981/8384: n_free=16859, nnz=792021, t=598.1s
+[ASR]   cons 7991/8384: n_free=16832, nnz=794954, t=601.6s
+[ASR]   cons 8001/8384: n_free=16805, nnz=805945, t=605.1s
+[ASR]   cons 8011/8384: n_free=16805, nnz=805945, t=608.3s
+[ASR]   cons 8021/8384: n_free=16778, nnz=806197, t=611.8s
+[ASR]   cons 8031/8384: n_free=16778, nnz=806197, t=615.2s
+[ASR]   cons 8041/8384: n_free=16778, nnz=806197, t=618.5s
+[ASR]   cons 8051/8384: n_free=16778, nnz=806197, t=621.8s
+[ASR]   cons 8061/8384: n_free=16742, nnz=824915, t=625.8s
+[ASR]   cons 8071/8384: n_free=16742, nnz=824915, t=629.3s
+[ASR]   cons 8081/8384: n_free=16715, nnz=840771, t=633.0s
+[ASR]   cons 8091/8384: n_free=16688, nnz=860396, t=636.8s
+[ASR]   cons 8101/8384: n_free=16661, nnz=860504, t=640.6s
+[ASR]   cons 8111/8384: n_free=16634, nnz=860900, t=644.4s
+[ASR]   cons 8121/8384: n_free=16616, nnz=878626, t=648.2s
+[ASR]   cons 8131/8384: n_free=16616, nnz=878626, t=651.9s
+[ASR]   cons 8141/8384: n_free=16616, nnz=878626, t=655.5s
+[ASR]   cons 8151/8384: n_free=16616, nnz=878626, t=659.2s
+[ASR]   cons 8161/8384: n_free=16598, nnz=886266, t=663.1s
+[ASR]   cons 8171/8384: n_free=16598, nnz=886266, t=666.7s
+[ASR]   cons 8181/8384: n_free=16544, nnz=911688, t=671.2s
+[ASR]   cons 8191/8384: n_free=16517, nnz=924891, t=675.4s
+[ASR]   cons 8201/8384: n_free=16499, nnz=935132, t=679.7s
+[ASR]   cons 8211/8384: n_free=16499, nnz=935132, t=683.6s
+[ASR]   cons 8221/8384: n_free=16499, nnz=935132, t=687.6s
+[ASR]   cons 8231/8384: n_free=16499, nnz=935132, t=691.5s
+[ASR]   cons 8241/8384: n_free=16481, nnz=946686, t=695.7s
+[ASR]   cons 8251/8384: n_free=16481, nnz=946686, t=699.7s
+[ASR]   cons 8261/8384: n_free=16455, nnz=974966, t=704.1s
+[ASR]   cons 8271/8384: n_free=16455, nnz=974966, t=708.2s
+[ASR]   cons 8281/8384: n_free=16455, nnz=974966, t=712.2s
+[ASR]   cons 8291/8384: n_free=16437, nnz=986824, t=716.6s
+[ASR]   cons 8301/8384: n_free=16419, nnz=1019399, t=721.1s
+[ASR]   cons 8311/8384: n_free=16419, nnz=1019399, t=725.3s
+[ASR]   cons 8321/8384: n_free=16401, nnz=1049759, t=730.0s
+[ASR]   cons 8331/8384: n_free=16401, nnz=1049759, t=734.4s
+[ASR]   cons 8341/8384: n_free=16383, nnz=1080849, t=739.2s
+[ASR]   cons 8351/8384: n_free=16374, nnz=1089447, t=744.1s
+[ASR]   cons 8361/8384: n_free=16329, nnz=1116332, t=749.6s
+[ASR]   cons 8371/8384: n_free=16311, nnz=1147795, t=754.7s
+[ASR]   cons 8381/8384: n_free=16311, nnz=1147795, t=759.9s
+[ASR]   cons 8384/8384: n_free=16311, nnz=1147795, t=761.4s
+[ASR] done: n_free=16311, eliminated=7067, skipped=219301, max|C@ns|=1.97e-15
+[2026-11-09 02:05:11,447] - [ns-rank] order 3: skipped (n_free=16311 > MAXCOL=5000)
+[2026-11-09 02:05:11,447] - Time cost: 0:12:46.498245.
+[2026-11-09 02:05:11,462] Summary of IFCs:
+[2026-11-09 02:05:11,463] - HARM    | IFC number: 75456 | Free IFC number: 74017
+[2026-11-09 02:05:11,603] - ANHARM3 | IFC number: 28458 | Free IFC number: 16311
+[2026-11-09 02:05:11,991] Total number of free IFCs: 90328
+[2026-11-09 02:05:12,006] Construction of symmetry constraints finished, time cost: 0:14:05.467277.
+[2026-11-09 02:05:12,025] Finalize Pheasy, total time cost: 0:14:12.167637.
+[pheasy] displacement matrix: pheasy-gpu --dim 2 2 1 -w 3 --c3 3.5 --eps 0.001 -d --ndata 296 --disp_file
+[2026-11-09 02:05:14,172] Start Pheasy.
+ _______           _______  _______  _______          
+(  ____ )|\     /|(  ____ \(  ___  )(  ____ \|\     /|
+| (    )|| )   ( || (    \/| (   ) || (    \/( \   / )
+| (____)|| (___) || (__    | (___) || (_____  \ (_) / 
+|  _____)|  ___  ||  __)   |  ___  |(_____  )  \   /  
+| (      | (   ) || (      | (   ) |      ) |   ) (   
+| )      | )   ( || (____/\| )   ( |/\____) |   | |   
+|/       |/     \|(_______/|/     \|\_______)   \_/  0.0.2
+[2026-11-09 02:05:14,181] System: C120Mg8
+[2026-11-09 02:05:14,181] Space group: C2/c (15), 4 symmetry operations found.
+[2026-11-09 02:05:14,185] Symmetry probe at symprec 0.001: C2/c (15), 4 symmetry operations.
+[2026-11-09 02:05:14,185] Creating 2 x 2 x 1 supercell (512 atoms).
+[2026-11-09 02:05:14,395] Reading and generating cluster space from file, up to 3-order.
+[2026-11-09 02:05:21,251] Cutoff distance (A) for 2-order IFCs: inf
+[2026-11-09 02:05:21,251] Cutoff distance (A) for 3-order IFCs: 3.50
+[2026-11-09 02:05:21,251] Summary of cluster space:
+[2026-11-09 02:05:21,251] - HARM    | cluster number: 8384 | IFC number: 75456
+[2026-11-09 02:05:21,251] - ANHARM3 | cluster number: 1054 | IFC number: 28458
+[2026-11-09 02:05:21,251] Starting to construct sensing (displacement) matrix.
+[2026-11-09 02:05:21,251] Reading displaced configurations from file.
+[2026-11-09 02:05:33,652] - Parallel sensing matrix construction: 56 workers.
+[2026-11-09 02:06:53,775 - run_pheasy][ERROR] - Parallel sensing-matrix workers failed (TerminatedWorkerError: A worker process managed by the executor was unexpectedly terminated. This could be caused by a segmentation fault while calling the function or by an excessive memory usage causing the Operating System to kill the worker.
+
+The exit codes of the workers are {SIGTERM(-15)}
+Detailed tracebacks of the workers should have been printed to stderr in the executor process if faulthandler was not disabled.). This is almost always the OOM killer: every worker holds its own copy of the cluster space. Falling back to serial construction; set PHEASY_N_JOBS=1 to skip this attempt next time. (run_pheasy.py:602)
+[2026-11-09 02:09:23,059] - Sensing matrix: 10 / 296 configurations.
+[2026-11-09 02:11:52,922] - Sensing matrix: 20 / 296 configurations.
+[2026-11-09 02:14:22,341] - Sensing matrix: 30 / 296 configurations.
+[2026-11-09 02:16:52,636] - Sensing matrix: 40 / 296 configurations.
+[2026-11-09 02:19:22,687] - Sensing matrix: 50 / 296 configurations.
+[2026-11-09 02:21:52,391] - Sensing matrix: 60 / 296 configurations.
+[2026-11-09 02:24:22,219] - Sensing matrix: 70 / 296 configurations.
+[2026-11-09 02:26:51,978] - Sensing matrix: 80 / 296 configurations.
+[2026-11-09 02:29:22,493] - Sensing matrix: 90 / 296 configurations.
+[2026-11-09 02:31:52,792] - Sensing matrix: 100 / 296 configurations.
+[2026-11-09 02:34:22,890] - Sensing matrix: 110 / 296 configurations.
+[2026-11-09 02:36:53,638] - Sensing matrix: 120 / 296 configurations.
+[2026-11-09 02:39:22,770] - Sensing matrix: 130 / 296 configurations.
+[2026-11-09 02:41:53,630] - Sensing matrix: 140 / 296 configurations.
+[2026-11-09 02:44:26,094] - Sensing matrix: 150 / 296 configurations.
+[2026-11-09 02:46:56,620] - Sensing matrix: 160 / 296 configurations.
+[2026-11-09 02:49:27,024] - Sensing matrix: 170 / 296 configurations.
+[2026-11-09 02:51:57,245] - Sensing matrix: 180 / 296 configurations.
+[2026-11-09 02:54:25,835] - Sensing matrix: 190 / 296 configurations.
+[2026-11-09 02:56:56,967] - Sensing matrix: 200 / 296 configurations.
+[2026-11-09 02:59:27,951] - Sensing matrix: 210 / 296 configurations.
+[2026-11-09 03:01:59,091] - Sensing matrix: 220 / 296 configurations.
+[2026-11-09 03:04:30,408] - Sensing matrix: 230 / 296 configurations.
+[2026-11-09 03:06:58,857] - Sensing matrix: 240 / 296 configurations.
+[2026-11-09 03:09:28,245] - Sensing matrix: 250 / 296 configurations.
+[2026-11-09 03:11:58,485] - Sensing matrix: 260 / 296 configurations.
+[2026-11-09 03:14:28,906] - Sensing matrix: 270 / 296 configurations.
+[2026-11-09 03:16:59,208] - Sensing matrix: 280 / 296 configurations.
+[2026-11-09 03:19:34,568] - Sensing matrix: 290 / 296 configurations.
+[2026-11-09 03:21:08,480] - Sensing matrix: 296 / 296 configurations.
+[SM] streaming dense->sparse float32 conversion of 296 blocks...
+[SM] blocks converted in 8.5s, vstacking...
+[SM] vstack done in 1.0s: shape=(454656, 103914), nnz=1076099712, mem=8.61 GB (float32 sparse CSR)
+[2026-11-09 03:21:32,104] Construction of sensing (displacement) matrix finished, time cost: 1:16:10.852329.
+[2026-11-09 03:21:32,104] Finalize Pheasy, total time cost: 1:16:17.934381.
+[pheasy] fit: pheasy-gpu --dim 2 2 1 -w 3 --c3 3.5 --eps 0.001 -f --ndata 296 --full_ifc -l LASSO --hdf5 --seed 666666 --cv 5 --nmu 40 --mu_min -8 --mu_max -5 --max_iter 100000 --tol 1e-05
+[2026-11-09 03:21:37,072] Start Pheasy.
+ _______           _______  _______  _______          
+(  ____ )|\     /|(  ____ \(  ___  )(  ____ \|\     /|
+| (    )|| )   ( || (    \/| (   ) || (    \/( \   / )
+| (____)|| (___) || (__    | (___) || (_____  \ (_) / 
+|  _____)|  ___  ||  __)   |  ___  |(_____  )  \   /  
+| (      | (   ) || (      | (   ) |      ) |   ) (   
+| )      | )   ( || (____/\| )   ( |/\____) |   | |   
+|/       |/     \|(_______/|/     \|\_______)   \_/  0.0.2
+[2026-11-09 03:21:37,196] System: C120Mg8
+[2026-11-09 03:21:37,196] Space group: C2/c (15), 4 symmetry operations found.
+[2026-11-09 03:21:37,200] Symmetry probe at symprec 0.001: C2/c (15), 4 symmetry operations.
+[2026-11-09 03:21:37,200] Creating 2 x 2 x 1 supercell (512 atoms).
+[2026-11-09 03:21:38,180] Reading and generating cluster space from file, up to 3-order.
+[2026-11-09 03:21:44,565] Cutoff distance (A) for 2-order IFCs: inf
+[2026-11-09 03:21:44,565] Cutoff distance (A) for 3-order IFCs: 3.50
+[2026-11-09 03:21:44,565] Summary of cluster space:
+[2026-11-09 03:21:44,565] - HARM    | cluster number: 8384 | IFC number: 75456
+[2026-11-09 03:21:44,565] - ANHARM3 | cluster number: 1054 | IFC number: 28458
+[2026-11-09 03:21:44,565] Reconstructing null space of symmetry constraints from file.
+[2026-11-09 03:21:44,666] Summary of IFCs:
+[2026-11-09 03:21:44,666] - HARM    | IFC number: 75456 | Free IFC number: 74017
+[2026-11-09 03:21:44,666] - ANHARM3 | IFC number: 28458 | Free IFC number: 16311
+[2026-11-09 03:21:44,666] Total number of free IFCs: 90328
+[2026-11-09 03:21:44,667] Reconstructing sensing (displacement) matrix from file.
+[SM] sm_prime.npz load (narrow): shape=(454656, 103914) nnz=1076099712 data=4.30 GB indices=int32 (4.30 GB) indptr=int64 total=8.61 GB
+[2026-11-09 03:22:02,547] Starting to fit interatomic force constants.
+[2026-11-09 03:22:02,556] SM_prime kept sparse float32 CSR: shape=(454656, 103914), nnz=1076099712, mem=8.61 GB
+[2026-11-09 03:22:02,556 - run_pheasy][WARNING] - SM_prime is 8.6 GB in float32. Set PHEASY_SM_DTYPE=float32 to halve it (all matrices stay consistent). (run_pheasy.py:790)
+[2026-11-09 03:22:02,556] Reading interatomic forces, 296 configurations.
+[SM-sparse] LASSO sparse path: (454656, 103914) x (103914, 90328)
+<gpu-host>:/home/miniconda3/envs/mace-gpu/lib/python3.11/site-packages/torch/cuda/__init__.py:716: UserWarning: Can't initialize NVML
+  warnings.warn("Can't initialize NVML")
+<gpu-host>:/home/software/pheasy-gpu-gh/core/gpu_backend.py:2397: UserWarning: Sparse CSR tensor support is in beta state. If you miss a functionality in the sparse tensor support, please submit a feature request to https://github.com/pytorch/pytorch/issues. (Triggered internally at ../aten/src/ATen/SparseCsrTensorImpl.cpp:53.)
+  return t.sparse_csr_tensor(crow, ccol, cval, size=m.shape,
+[GPU-SM] SpMV on 3 device(s), dtype=float32
+[SM-twolevel] RFE-OLS 两级 matvec (不生成 SM): SM_prime(454656, 103914)(8.6GB) @ NS(103914, 90328)(0.0GB), SM.shape=(454656, 90328), 主机矩阵常驻~8.6GB（不含GPU分块构造临时内存）
+[run_pheasy] PHEASY_USE_RFE=1 detected, switching LASSO -> RFE-OLS
+[2026-11-09 03:24:33,185] [HARM_DENSE] RFE-OLS (PHEASY_HARM_DENSE=1): 74017 harmonic columns are never penalized or pruned; 16311 anharmonic columns are sparsified.
+[2026-11-09 03:24:33,186] Fitting force constants via Recursive Feature Elimination (RFE-OLS) with OLS base estimator (scale-invariant importance, grouped CV).
+[HARM_DENSE] RFE: 74017 unpenalized (never pruned) columns, 16311 penalized
+[HARM_DENSE] RFE: 74017 protected (harmonic) columns are never eliminated; step/min_features apply to the 16311 eliminable ones
+[host] keeping canonical resident factors (8.03 GiB; MemAvailable 226.2 GiB)
+[RFE] START n_features=90328, step=0.10, cv=5, min_features=1, patience=5, solver=lstsq, ridge_alpha=1.00e-11
+<gpu-host>:/home/software/pheasy-gpu-gh/core/optimizer.py:2993: UserWarning: [lsmr] PHEASY_LSQR_ATOL=1e-08 is below the float32 reachable floor 1.19e-06; raised to the floor -- a tighter request only makes the stopping test unreachable and burns the iteration budget.
+  atol = float(_lsmr_tol("PHEASY_LSQR_ATOL",
+<gpu-host>:/home/software/pheasy-gpu-gh/core/optimizer.py:2995: UserWarning: [lsmr] PHEASY_LSQR_BTOL=1e-08 is below the float32 reachable floor 1.19e-06; raised to the floor -- a tighter request only makes the stopping test unreachable and burns the iteration budget.
+  btol = float(_lsmr_tol("PHEASY_LSQR_BTOL",
+<gpu-host>:/home/software/pheasy-gpu-gh/core/optimizer.py:6553: RuntimeWarning: LSMR did not converge [ranking]: iteration limit reached (istop=7, iterations=5000, normr=5.399097e+00, normar=2.349728e-02). RFE ranking solve: it only orders the features for elimination; it is not part of the acceptance gate (fit_accepted) and its coefficients are not delivered.
+  return _solve_subset(A, y, row_idx, col_idx,
+<gpu-host>:/home/software/pheasy-gpu-gh/core/optimizer.py:6553: RuntimeWarning: LSMR did not converge [fold]: iteration limit reached (istop=7, iterations=5000, normr=4.719517e+00, normar=1.873318e-02). CV fold solve: it only scores one validation fold; it is not part of the acceptance gate (fit_accepted) and its coefficients are not delivered.
+  return _solve_subset(A, y, row_idx, col_idx,
+<gpu-host>:/home/software/pheasy-gpu-gh/core/optimizer.py:6553: RuntimeWarning: LSMR did not converge [fold]: iteration limit reached (istop=7, iterations=5000, normr=4.694682e+00, normar=1.815286e-02). CV fold solve: it only scores one validation fold; it is not part of the acceptance gate (fit_accepted) and its coefficients are not delivered.
+  return _solve_subset(A, y, row_idx, col_idx,
+<gpu-host>:/home/software/pheasy-gpu-gh/core/optimizer.py:6553: RuntimeWarning: LSMR did not converge [fold]: iteration limit reached (istop=7, iterations=5000, normr=4.690319e+00, normar=1.789556e-02). CV fold solve: it only scores one validation fold; it is not part of the acceptance gate (fit_accepted) and its coefficients are not delivered.
+  return _solve_subset(A, y, row_idx, col_idx,
+<gpu-host>:/home/software/pheasy-gpu-gh/core/optimizer.py:6553: RuntimeWarning: LSMR did not converge [fold]: iteration limit reached (istop=7, iterations=5000, normr=4.691500e+00, normar=1.802795e-02). CV fold solve: it only scores one validation fold; it is not part of the acceptance gate (fit_accepted) and its coefficients are not delivered.
+  return _solve_subset(A, y, row_idx, col_idx,
+<gpu-host>:/home/software/pheasy-gpu-gh/core/optimizer.py:6553: RuntimeWarning: LSMR did not converge [fold]: iteration limit reached (istop=7, iterations=5000, normr=4.693543e+00, normar=1.823677e-02). CV fold solve: it only scores one validation fold; it is not part of the acceptance gate (fit_accepted) and its coefficients are not delivered.
+  return _solve_subset(A, y, row_idx, col_idx,
+[RFE] Round   0: n_active=90328  CV_RMSE=1.054071e-02 (+-2.27e-05)  nonzero=90328
+<gpu-host>:/home/software/pheasy-gpu-gh/core/optimizer.py:6553: RuntimeWarning: LSMR did not converge [ranking]: iteration limit reached (istop=7, iterations=5000, normr=5.399596e+00, normar=2.348252e-02). RFE ranking solve: it only orders the features for elimination; it is not part of the acceptance gate (fit_accepted) and its coefficients are not delivered.
+  return _solve_subset(A, y, row_idx, col_idx,
+<gpu-host>:/home/software/pheasy-gpu-gh/core/optimizer.py:6553: RuntimeWarning: LSMR did not converge [fold]: iteration limit reached (istop=7, iterations=5000, normr=4.678600e+00, normar=1.779993e-02). CV fold solve: it only scores one validation fold; it is not part of the acceptance gate (fit_accepted) and its coefficients are not delivered.
+  return _solve_subset(A, y, row_idx, col_idx,
+<gpu-host>:/home/software/pheasy-gpu-gh/core/optimizer.py:6553: RuntimeWarning: LSMR did not converge [fold]: iteration limit reached (istop=7, iterations=5000, normr=4.680872e+00, normar=1.780162e-02). CV fold solve: it only scores one validation fold; it is not part of the acceptance gate (fit_accepted) and its coefficients are not delivered.
+  return _solve_subset(A, y, row_idx, col_idx,
+<gpu-host>:/home/software/pheasy-gpu-gh/core/optimizer.py:6553: RuntimeWarning: LSMR did not converge [fold]: iteration limit reached (istop=7, iterations=5000, normr=4.706811e+00, normar=1.816956e-02). CV fold solve: it only scores one validation fold; it is not part of the acceptance gate (fit_accepted) and its coefficients are not delivered.
+  return _solve_subset(A, y, row_idx, col_idx,
+<gpu-host>:/home/software/pheasy-gpu-gh/core/optimizer.py:6553: RuntimeWarning: LSMR did not converge [fold]: iteration limit reached (istop=7, iterations=5000, normr=4.688352e+00, normar=1.789843e-02). CV fold solve: it only scores one validation fold; it is not part of the acceptance gate (fit_accepted) and its coefficients are not delivered.
+  return _solve_subset(A, y, row_idx, col_idx,
+<gpu-host>:/home/software/pheasy-gpu-gh/core/optimizer.py:6553: RuntimeWarning: LSMR did not converge [fold]: iteration limit reached (istop=7, iterations=5000, normr=4.670309e+00, normar=1.769001e-02). CV fold solve: it only scores one validation fold; it is not part of the acceptance gate (fit_accepted) and its coefficients are not delivered.
+  return _solve_subset(A, y, row_idx, col_idx,
+[RFE] Round   1: n_active=88697  CV_RMSE=1.045447e-02 (+-2.33e-05)  nonzero=88697
+<gpu-host>:/home/software/pheasy-gpu-gh/core/optimizer.py:6553: RuntimeWarning: LSMR did not converge [ranking]: iteration limit reached (istop=7, iterations=5000, normr=5.354804e+00, normar=2.234983e-02). RFE ranking solve: it only orders the features for elimination; it is not part of the acceptance gate (fit_accepted) and its coefficients are not delivered.
+  return _solve_subset(A, y, row_idx, col_idx,
+<gpu-host>:/home/software/pheasy-gpu-gh/core/optimizer.py:6553: RuntimeWarning: LSMR did not converge [fold]: iteration limit reached (istop=7, iterations=5000, normr=4.674969e+00, normar=1.758205e-02). CV fold solve: it only scores one validation fold; it is not part of the acceptance gate (fit_accepted) and its coefficients are not delivered.
+  return _solve_subset(A, y, row_idx, col_idx,
+<gpu-host>:/home/software/pheasy-gpu-gh/core/optimizer.py:6553: RuntimeWarning: LSMR did not converge [fold]: iteration limit reached (istop=7, iterations=5000, normr=4.677199e+00, normar=1.758633e-02). CV fold solve: it only scores one validation fold; it is not part of the acceptance gate (fit_accepted) and its coefficients are not delivered.
+  return _solve_subset(A, y, row_idx, col_idx,
+<gpu-host>:/home/software/pheasy-gpu-gh/core/optimizer.py:6553: RuntimeWarning: LSMR did not converge [fold]: iteration limit reached (istop=7, iterations=5000, normr=4.688622e+00, normar=1.766466e-02). CV fold solve: it only scores one validation fold; it is not part of the acceptance gate (fit_accepted) and its coefficients are not delivered.
+  return _solve_subset(A, y, row_idx, col_idx,
+<gpu-host>:/home/software/pheasy-gpu-gh/core/optimizer.py:6553: RuntimeWarning: LSMR did not converge [fold]: iteration limit reached (istop=7, iterations=5000, normr=4.669192e+00, normar=1.737968e-02). CV fold solve: it only scores one validation fold; it is not part of the acceptance gate (fit_accepted) and its coefficients are not delivered.
+  return _solve_subset(A, y, row_idx, col_idx,
+<gpu-host>:/home/software/pheasy-gpu-gh/core/optimizer.py:6553: RuntimeWarning: LSMR did not converge [fold]: iteration limit reached (istop=7, iterations=5000, normr=4.683961e+00, normar=1.782628e-02). CV fold solve: it only scores one validation fold; it is not part of the acceptance gate (fit_accepted) and its coefficients are not delivered.
+  return _solve_subset(A, y, row_idx, col_idx,
+[RFE] Round   2: n_active=87229  CV_RMSE=1.038945e-02 (+-1.88e-05)  nonzero=87229
+<gpu-host>:/home/software/pheasy-gpu-gh/core/optimizer.py:6553: RuntimeWarning: LSMR did not converge [ranking]: iteration limit reached (istop=7, iterations=5000, normr=5.346122e+00, normar=2.196178e-02). RFE ranking solve: it only orders the features for elimination; it is not part of the acceptance gate (fit_accepted) and its coefficients are not delivered.
+  return _solve_subset(A, y, row_idx, col_idx,
+<gpu-host>:/home/software/pheasy-gpu-gh/core/optimizer.py:6553: RuntimeWarning: LSMR did not converge [fold]: iteration limit reached (istop=7, iterations=5000, normr=4.672866e+00, normar=1.732953e-02). CV fold solve: it only scores one validation fold; it is not part of the acceptance gate (fit_accepted) and its coefficients are not delivered.
+  return _solve_subset(A, y, row_idx, col_idx,
+<gpu-host>:/home/software/pheasy-gpu-gh/core/optimizer.py:6553: RuntimeWarning: LSMR did not converge [fold]: iteration limit reached (istop=7, iterations=5000, normr=4.682623e+00, normar=1.749324e-02). CV fold solve: it only scores one validation fold; it is not part of the acceptance gate (fit_accepted) and its coefficients are not delivered.
+  return _solve_subset(A, y, row_idx, col_idx,
+<gpu-host>:/home/software/pheasy-gpu-gh/core/optimizer.py:6553: RuntimeWarning: LSMR did not converge [fold]: iteration limit reached (istop=7, iterations=5000, normr=4.688169e+00, normar=1.743985e-02). CV fold solve: it only scores one validation fold; it is not part of the acceptance gate (fit_accepted) and its coefficients are not delivered.
+  return _solve_subset(A, y, row_idx, col_idx,
+<gpu-host>:/home/software/pheasy-gpu-gh/core/optimizer.py:6553: RuntimeWarning: LSMR did not converge [fold]: iteration limit reached (istop=7, iterations=5000, normr=4.690082e+00, normar=1.760120e-02). CV fold solve: it only scores one validation fold; it is not part of the acceptance gate (fit_accepted) and its coefficients are not delivered.
+  return _solve_subset(A, y, row_idx, col_idx,
+<gpu-host>:/home/software/pheasy-gpu-gh/core/optimizer.py:6553: RuntimeWarning: LSMR did not converge [fold]: iteration limit reached (istop=7, iterations=5000, normr=4.664358e+00, normar=1.722123e-02). CV fold solve: it only scores one validation fold; it is not part of the acceptance gate (fit_accepted) and its coefficients are not delivered.
+  return _solve_subset(A, y, row_idx, col_idx,
+[RFE] Round   3: n_active=85908  CV_RMSE=1.034029e-02 (+-1.91e-05)  nonzero=85908
+<gpu-host>:/home/software/pheasy-gpu-gh/core/optimizer.py:6553: RuntimeWarning: LSMR did not converge [ranking]: iteration limit reached (istop=7, iterations=5000, normr=5.322934e+00, normar=2.111363e-02). RFE ranking solve: it only orders the features for elimination; it is not part of the acceptance gate (fit_accepted) and its coefficients are not delivered.
+  return _solve_subset(A, y, row_idx, col_idx,
+<gpu-host>:/home/software/pheasy-gpu-gh/core/optimizer.py:6553: RuntimeWarning: LSMR did not converge [fold]: iteration limit reached (istop=7, iterations=5000, normr=4.649753e+00, normar=1.656934e-02). CV fold solve: it only scores one validation fold; it is not part of the acceptance gate (fit_accepted) and its coefficients are not delivered.
+  return _solve_subset(A, y, row_idx, col_idx,
+<gpu-host>:/home/software/pheasy-gpu-gh/core/optimizer.py:6553: RuntimeWarning: LSMR did not converge [fold]: iteration limit reached (istop=7, iterations=5000, normr=4.677721e+00, normar=1.709572e-02). CV fold solve: it only scores one validation fold; it is not part of the acceptance gate (fit_accepted) and its coefficients are not delivered.
+  return _solve_subset(A, y, row_idx, col_idx,
+<gpu-host>:/home/software/pheasy-gpu-gh/core/optimizer.py:6553: RuntimeWarning: LSMR did not converge [fold]: iteration limit reached (istop=7, iterations=5000, normr=4.684852e+00, normar=1.707211e-02). CV fold solve: it only scores one validation fold; it is not part of the acceptance gate (fit_accepted) and its coefficients are not delivered.
+  return _solve_subset(A, y, row_idx, col_idx,
+<gpu-host>:/home/software/pheasy-gpu-gh/core/optimizer.py:6553: RuntimeWarning: LSMR did not converge [fold]: iteration limit reached (istop=7, iterations=5000, normr=4.680086e+00, normar=1.710672e-02). CV fold solve: it only scores one validation fold; it is not part of the acceptance gate (fit_accepted) and its coefficients are not delivered.
+  return _solve_subset(A, y, row_idx, col_idx,
+<gpu-host>:/home/software/pheasy-gpu-gh/core/optimizer.py:6553: RuntimeWarning: LSMR did not converge [fold]: iteration limit reached (istop=7, iterations=5000, normr=4.672858e+00, normar=1.708430e-02). CV fold solve: it only scores one validation fold; it is not part of the acceptance gate (fit_accepted) and its coefficients are not delivered.
+  return _solve_subset(A, y, row_idx, col_idx,
+[RFE] Round   4: n_active=84719  CV_RMSE=1.028553e-02 (+-1.71e-05)  nonzero=84719
+<gpu-host>:/home/software/pheasy-gpu-gh/core/optimizer.py:6553: RuntimeWarning: LSMR did not converge [ranking]: iteration limit reached (istop=7, iterations=5000, normr=5.360499e+00, normar=2.138476e-02). RFE ranking solve: it only orders the features for elimination; it is not part of the acceptance gate (fit_accepted) and its coefficients are not delivered.
+  return _solve_subset(A, y, row_idx, col_idx,
+<gpu-host>:/home/software/pheasy-gpu-gh/core/optimizer.py:6553: RuntimeWarning: LSMR did not converge [fold]: iteration limit reached (istop=7, iterations=5000, normr=4.690384e+00, normar=1.691574e-02). CV fold solve: it only scores one validation fold; it is not part of the acceptance gate (fit_accepted) and its coefficients are not delivered.
+  return _solve_subset(A, y, row_idx, col_idx,
+<gpu-host>:/home/software/pheasy-gpu-gh/core/optimizer.py:6553: RuntimeWarning: LSMR did not converge [fold]: iteration limit reached (istop=7, iterations=5000, normr=4.698444e+00, normar=1.703149e-02). CV fold solve: it only scores one validation fold; it is not part of the acceptance gate (fit_accepted) and its coefficients are not delivered.
+  return _solve_subset(A, y, row_idx, col_idx,
+<gpu-host>:/home/software/pheasy-gpu-gh/core/optimizer.py:6553: RuntimeWarning: LSMR did not converge [fold]: iteration limit reached (istop=7, iterations=5000, normr=4.718954e+00, normar=1.728036e-02). CV fold solve: it only scores one validation fold; it is not part of the acceptance gate (fit_accepted) and its coefficients are not delivered.
+  return _solve_subset(A, y, row_idx, col_idx,
+<gpu-host>:/home/software/pheasy-gpu-gh/core/optimizer.py:6553: RuntimeWarning: LSMR did not converge [fold]: iteration limit reached (istop=7, iterations=5000, normr=4.706438e+00, normar=1.715519e-02). CV fold solve: it only scores one validation fold; it is not part of the acceptance gate (fit_accepted) and its coefficients are not delivered.
+  return _solve_subset(A, y, row_idx, col_idx,
+<gpu-host>:/home/software/pheasy-gpu-gh/core/optimizer.py:6553: RuntimeWarning: LSMR did not converge [fold]: iteration limit reached (istop=7, iterations=5000, normr=4.705326e+00, normar=1.724879e-02). CV fold solve: it only scores one validation fold; it is not part of the acceptance gate (fit_accepted) and its coefficients are not delivered.
+  return _solve_subset(A, y, row_idx, col_idx,
+[RFE] Round   5: n_active=83649  CV_RMSE=1.031038e-02 (+-1.54e-05)  nonzero=83649
+<gpu-host>:/home/software/pheasy-gpu-gh/core/optimizer.py:6553: RuntimeWarning: LSMR did not converge [ranking]: iteration limit reached (istop=7, iterations=5000, normr=5.388661e+00, normar=2.121125e-02). RFE ranking solve: it only orders the features for elimination; it is not part of the acceptance gate (fit_accepted) and its coefficients are not delivered.
+  return _solve_subset(A, y, row_idx, col_idx,
+<gpu-host>:/home/software/pheasy-gpu-gh/core/optimizer.py:6553: RuntimeWarning: LSMR did not converge [fold]: iteration limit reached (istop=7, iterations=5000, normr=4.698917e+00, normar=1.646700e-02). CV fold solve: it only scores one validation fold; it is not part of the acceptance gate (fit_accepted) and its coefficients are not delivered.
+  return _solve_subset(A, y, row_idx, col_idx,
+<gpu-host>:/home/software/pheasy-gpu-gh/core/optimizer.py:6553: RuntimeWarning: LSMR did not converge [fold]: iteration limit reached (istop=7, iterations=5000, normr=4.722313e+00, normar=1.687478e-02). CV fold solve: it only scores one validation fold; it is not part of the acceptance gate (fit_accepted) and its coefficients are not delivered.
+  return _solve_subset(A, y, row_idx, col_idx,
+<gpu-host>:/home/software/pheasy-gpu-gh/core/optimizer.py:6553: RuntimeWarning: LSMR did not converge [fold]: iteration limit reached (istop=7, iterations=5000, normr=4.724734e+00, normar=1.676586e-02). CV fold solve: it only scores one validation fold; it is not part of the acceptance gate (fit_accepted) and its coefficients are not delivered.
+  return _solve_subset(A, y, row_idx, col_idx,
+<gpu-host>:/home/software/pheasy-gpu-gh/core/optimizer.py:6553: RuntimeWarning: LSMR did not converge [fold]: iteration limit reached (istop=7, iterations=5000, normr=4.722877e+00, normar=1.683841e-02). CV fold solve: it only scores one validation fold; it is not part of the acceptance gate (fit_accepted) and its coefficients are not delivered.
+  return _solve_subset(A, y, row_idx, col_idx,
+<gpu-host>:/home/software/pheasy-gpu-gh/core/optimizer.py:6553: RuntimeWarning: LSMR did not converge [fold]: iteration limit reached (istop=7, iterations=5000, normr=4.709012e+00, normar=1.669577e-02). CV fold solve: it only scores one validation fold; it is not part of the acceptance gate (fit_accepted) and its coefficients are not delivered.
+  return _solve_subset(A, y, row_idx, col_idx,
+[RFE] Round   6: n_active=82686  CV_RMSE=1.029758e-02 (+-1.69e-05)  nonzero=82686
+<gpu-host>:/home/software/pheasy-gpu-gh/core/optimizer.py:6553: RuntimeWarning: LSMR did not converge [ranking]: iteration limit reached (istop=7, iterations=5000, normr=5.383145e+00, normar=2.009755e-02). RFE ranking solve: it only orders the features for elimination; it is not part of the acceptance gate (fit_accepted) and its coefficients are not delivered.
+  return _solve_subset(A, y, row_idx, col_idx,
+<gpu-host>:/home/software/pheasy-gpu-gh/core/optimizer.py:6553: RuntimeWarning: LSMR did not converge [fold]: iteration limit reached (istop=7, iterations=5000, normr=4.750459e+00, normar=1.670370e-02). CV fold solve: it only scores one validation fold; it is not part of the acceptance gate (fit_accepted) and its coefficients are not delivered.
+  return _solve_subset(A, y, row_idx, col_idx,
+<gpu-host>:/home/software/pheasy-gpu-gh/core/optimizer.py:6553: RuntimeWarning: LSMR did not converge [fold]: iteration limit reached (istop=7, iterations=5000, normr=4.793445e+00, normar=1.746817e-02). CV fold solve: it only scores one validation fold; it is not part of the acceptance gate (fit_accepted) and its coefficients are not delivered.
+  return _solve_subset(A, y, row_idx, col_idx,
+<gpu-host>:/home/software/pheasy-gpu-gh/core/optimizer.py:6553: RuntimeWarning: LSMR did not converge [fold]: iteration limit reached (istop=7, iterations=5000, normr=4.774282e+00, normar=1.693998e-02). CV fold solve: it only scores one validation fold; it is not part of the acceptance gate (fit_accepted) and its coefficients are not delivered.
+  return _solve_subset(A, y, row_idx, col_idx,
+<gpu-host>:/home/software/pheasy-gpu-gh/core/optimizer.py:6553: RuntimeWarning: LSMR did not converge [fold]: iteration limit reached (istop=7, iterations=5000, normr=4.748423e+00, normar=1.659115e-02). CV fold solve: it only scores one validation fold; it is not part of the acceptance gate (fit_accepted) and its coefficients are not delivered.
+  return _solve_subset(A, y, row_idx, col_idx,
+<gpu-host>:/home/software/pheasy-gpu-gh/core/optimizer.py:6553: RuntimeWarning: LSMR did not converge [fold]: iteration limit reached (istop=7, iterations=5000, normr=4.760109e+00, normar=1.688803e-02). CV fold solve: it only scores one validation fold; it is not part of the acceptance gate (fit_accepted) and its coefficients are not delivered.
+  return _solve_subset(A, y, row_idx, col_idx,
+[RFE] Round   7: n_active=81819  CV_RMSE=1.037095e-02 (+-2.96e-05)  nonzero=81819
+<gpu-host>:/home/software/pheasy-gpu-gh/core/optimizer.py:6553: RuntimeWarning: LSMR did not converge [ranking]: iteration limit reached (istop=7, iterations=5000, normr=5.473888e+00, normar=2.091962e-02). RFE ranking solve: it only orders the features for elimination; it is not part of the acceptance gate (fit_accepted) and its coefficients are not delivered.
+  return _solve_subset(A, y, row_idx, col_idx,
+<gpu-host>:/home/software/pheasy-gpu-gh/core/optimizer.py:6553: RuntimeWarning: LSMR did not converge [fold]: iteration limit reached (istop=7, iterations=5000, normr=4.779259e+00, normar=1.633713e-02). CV fold solve: it only scores one validation fold; it is not part of the acceptance gate (fit_accepted) and its coefficients are not delivered.
+  return _solve_subset(A, y, row_idx, col_idx,
+<gpu-host>:/home/software/pheasy-gpu-gh/core/optimizer.py:6553: RuntimeWarning: LSMR did not converge [fold]: iteration limit reached (istop=7, iterations=5000, normr=4.782911e+00, normar=1.635350e-02). CV fold solve: it only scores one validation fold; it is not part of the acceptance gate (fit_accepted) and its coefficients are not delivered.
+  return _solve_subset(A, y, row_idx, col_idx,
+<gpu-host>:/home/software/pheasy-gpu-gh/core/optimizer.py:6553: RuntimeWarning: LSMR did not converge [fold]: iteration limit reached (istop=7, iterations=5000, normr=4.803551e+00, normar=1.659143e-02). CV fold solve: it only scores one validation fold; it is not part of the acceptance gate (fit_accepted) and its coefficients are not delivered.
+  return _solve_subset(A, y, row_idx, col_idx,
+<gpu-host>:/home/software/pheasy-gpu-gh/core/optimizer.py:6553: RuntimeWarning: LSMR did not converge [fold]: iteration limit reached (istop=7, iterations=5000, normr=4.799746e+00, normar=1.667071e-02). CV fold solve: it only scores one validation fold; it is not part of the acceptance gate (fit_accepted) and its coefficients are not delivered.
+  return _solve_subset(A, y, row_idx, col_idx,
+<gpu-host>:/home/software/pheasy-gpu-gh/core/optimizer.py:6553: RuntimeWarning: LSMR did not converge [fold]: iteration limit reached (istop=7, iterations=5000, normr=4.771810e+00, normar=1.619722e-02). CV fold solve: it only scores one validation fold; it is not part of the acceptance gate (fit_accepted) and its coefficients are not delivered.
+  return _solve_subset(A, y, row_idx, col_idx,
+[RFE] Round   8: n_active=81039  CV_RMSE=1.038739e-02 (+-1.57e-05)  nonzero=81039
+<gpu-host>:/home/software/pheasy-gpu-gh/core/optimizer.py:6553: RuntimeWarning: LSMR did not converge [ranking]: iteration limit reached (istop=7, iterations=5000, normr=5.522166e+00, normar=2.017956e-02). RFE ranking solve: it only orders the features for elimination; it is not part of the acceptance gate (fit_accepted) and its coefficients are not delivered.
+  return _solve_subset(A, y, row_idx, col_idx,
+<gpu-host>:/home/software/pheasy-gpu-gh/core/optimizer.py:6553: RuntimeWarning: LSMR did not converge [fold]: iteration limit reached (istop=7, iterations=5000, normr=4.828446e+00, normar=1.591917e-02). CV fold solve: it only scores one validation fold; it is not part of the acceptance gate (fit_accepted) and its coefficients are not delivered.
+  return _solve_subset(A, y, row_idx, col_idx,
+<gpu-host>:/home/software/pheasy-gpu-gh/core/optimizer.py:6553: RuntimeWarning: LSMR did not converge [fold]: iteration limit reached (istop=7, iterations=5000, normr=4.835879e+00, normar=1.604560e-02). CV fold solve: it only scores one validation fold; it is not part of the acceptance gate (fit_accepted) and its coefficients are not delivered.
+  return _solve_subset(A, y, row_idx, col_idx,
+<gpu-host>:/home/software/pheasy-gpu-gh/core/optimizer.py:6553: RuntimeWarning: LSMR did not converge [fold]: iteration limit reached (istop=7, iterations=5000, normr=4.861453e+00, normar=1.634057e-02). CV fold solve: it only scores one validation fold; it is not part of the acceptance gate (fit_accepted) and its coefficients are not delivered.
+  return _solve_subset(A, y, row_idx, col_idx,
+<gpu-host>:/home/software/pheasy-gpu-gh/core/optimizer.py:6553: RuntimeWarning: LSMR did not converge [fold]: iteration limit reached (istop=7, iterations=5000, normr=4.837905e+00, normar=1.601267e-02). CV fold solve: it only scores one validation fold; it is not part of the acceptance gate (fit_accepted) and its coefficients are not delivered.
+  return _solve_subset(A, y, row_idx, col_idx,
+<gpu-host>:/home/software/pheasy-gpu-gh/core/optimizer.py:6553: RuntimeWarning: LSMR did not converge [fold]: iteration limit reached (istop=7, iterations=5000, normr=4.848779e+00, normar=1.630349e-02). CV fold solve: it only scores one validation fold; it is not part of the acceptance gate (fit_accepted) and its coefficients are not delivered.
+  return _solve_subset(A, y, row_idx, col_idx,
+[RFE] Round   9: n_active=80337  CV_RMSE=1.047489e-02 (+-1.71e-05)  nonzero=80337
+[RFE] CV 连续 5 轮无改善, 提前停止.
+[RFE] argmin: n_active=84719, CV=1.028553e-02
+[RFE] selected: n_active=82686, CV=1.029758e-02 (+-1.69e-05)
+[RFE] final exact refit: Gram normal equations (454656 x 82686), blocks of 20000
+[RFE] final exact refit: Jacobi-scaled Cholesky ok (cond_est(scaled G) ~ 3.35e+05)
+[RFE] final exact refit: optimality max|A_j^T r|/(||A_j|| ||r||) = 1.108e-12, ||r||/||y|| = 7.665e-03
+[RFE] final exact refit: refinement 1: optimality 1.108e-12 -> 1.274e-14
+[HARM_DENSE] nonzero: unpenalized 74017/74017, penalized 8669/16311 (46.9% of the penalized block pruned)
+[2026-11-09 12:00:24,965] Summary of force constants fitting:
+[2026-11-09 12:00:24,965] - RFE finished after 9 rounds.
+[2026-11-09 12:00:24,965] - feature-count criterion: CV + 1-SE
+[2026-11-09 12:00:24,966] - ridge_alpha: 1e-11
+[2026-11-09 12:00:24,966] - best CV RMSE: 0.010297576701000602 eV/A
+[2026-11-09 12:00:24,966] - selected features: 82686 of 90328
+[2026-11-09 12:00:24,966] - RMSE: 0.006656042643695232 eV/A
+[2026-11-09 12:00:24,966] - Relative error: 0.007664856886465937
+[2026-11-09 12:00:24,966] - Number of coefficient columns: 90328 (numerical rank not estimated)
+[2026-11-09 12:00:24,966] - Free IFC terms: 90328
+[2026-11-09 12:00:24,966] - Non-zero IFC terms: 82686
+[2026-11-09 12:00:24,966] - Non-zero HARM (unpenalized): 74017 / 74017
+[2026-11-09 12:00:24,966] - Non-zero ANHARM (penalized): 8669 / 16311
+[2026-11-09 12:00:24,969] [fit] alignment check OK (worst corr=1.0000)
+[2026-11-09 12:00:45,319] Wrote FORCE_CONSTANTS_2ND (ShengBTE, 512 x 512)
+[2026-11-09 12:00:45,319] Writing second-order force constants into file.
+[2026-11-09 12:03:55,735] Writing third-order force constants into file.
+[2026-11-09 12:03:55,735] Force constant fitting finished, time cost: 8:41:53.188285.
+[2026-11-09 12:03:55,736] Finalize Pheasy, total time cost: 8:42:18.665758.
+[OK] HARM_DENSE gate: 74017 / 74017 second-order columns kept
+[DONE] fit_pheasy: method=RFE-OLS ndata=296 dim=2 2 1

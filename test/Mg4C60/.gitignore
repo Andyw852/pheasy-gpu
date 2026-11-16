@@ -1,0 +1,4 @@
+# This archived test case intentionally keeps the fitted force constants
+# and the RFE support indices (needed to reproduce the published kappa).
+!rfe_support.npy
+!**/rfe_support.npy

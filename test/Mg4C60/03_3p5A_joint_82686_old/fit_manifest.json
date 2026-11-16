@@ -1,0 +1,167 @@
+{
+  "environment": {
+    "PHEASY_ASR_COL_BLOCK": "5000",
+    "PHEASY_ASR_COMBINED": "1",
+    "PHEASY_ASR_LWORK_LIMIT": "1500000000",
+    "PHEASY_ASR_SPARSE": "1",
+    "PHEASY_ASR_SPARSE_THR": "1e-10",
+    "PHEASY_BLAS_THREADS": "32",
+    "PHEASY_COLNORM_EXACT": "0",
+    "PHEASY_COLNORM_FRAMES": "24",
+    "PHEASY_CV_GROUP_SIZE": "1536",
+    "PHEASY_DOT_THREADS": "56",
+    "PHEASY_HARM_DENSE": "1",
+    "PHEASY_N_JOBS": "1",
+    "PHEASY_RFE_CV": "5",
+    "PHEASY_RFE_FINAL_LSMR_MAXITER": "60000",
+    "PHEASY_RFE_MKL": "1",
+    "PHEASY_RFE_ONE_SE": "1",
+    "PHEASY_RFE_RIDGE_ALPHA": "1e-11",
+    "PHEASY_RFE_STEP": "0.1",
+    "PHEASY_RFE_SUPPORT_NPY": "<gpu-host>:/data/taskflow/work/Mg4C60_c3scan_ols/_backup_20261023/6260_3p50_rfe_support.npy",
+    "PHEASY_RFE_TWOLEVEL": "1",
+    "PHEASY_RFE_WARM_START": "1",
+    "PHEASY_SM_DTYPE": "float32",
+    "PHEASY_SM_THR": "1e-12",
+    "PHEASY_SVD_THRESHOLD": "500",
+    "PHEASY_USE_CELER": "1",
+    "PHEASY_USE_RFE": "1"
+  },
+  "harm_dense": {
+    "applied": true,
+    "enabled": true,
+    "harmonic_columns": 74017,
+    "source": "env"
+  },
+  "metrics": {
+    "cv_evaluated": false,
+    "mae": 0.004890577896059217,
+    "mape": 0.09093068290997107,
+    "mse": 4.432629201201247e-05,
+    "mse_path": {
+      "dtype": "float64",
+      "shape": [
+        1
+      ],
+      "type": "ndarray",
+      "values": [
+        null
+      ]
+    },
+    "mse_path_mean": NaN,
+    "mspe": 98.36351782198045,
+    "n_featrues": 90328,
+    "n_features": 90328,
+    "r2_score": 0.999941218953662,
+    "re": 0.007666879830674974,
+    "rmse": 0.006657799337019138,
+    "rmse_path": {
+      "dtype": "float64",
+      "shape": [
+        1
+      ],
+      "type": "ndarray",
+      "values": [
+        null
+      ]
+    },
+    "rmse_path_mean": NaN,
+    "rmspe": 9.917838364380641
+  },
+  "model": "RFE-OLS",
+  "platform": "Linux-6.5.0-35-generic-x86_64-with-glibc2.35",
+  "python": "3.11.15",
+  "results": {
+    "alpha": 1e-11,
+    "alpha_at_grid_edge": false,
+    "backend_metadata": {
+      "criterion": "cv",
+      "cv_fold_scoring": "cpu",
+      "gpu_importance_rounds": 0,
+      "gpu_prediction": false,
+      "gpu_ranking_rounds": 0,
+      "gpu_subset_solves": 0,
+      "gram_build_seconds": null,
+      "gram_bytes": null,
+      "gram_exact_rounds": 0,
+      "gram_from_round": null,
+      "gram_n_features": null,
+      "gram_solvers": [],
+      "ic_n_eff": null,
+      "iterative_diagnostics": [
+        {
+          "cond_est_scaled": 335318.5921954365,
+          "converged": true,
+          "fit_scope": "full",
+          "n_features": 82686,
+          "n_samples": 454656,
+          "optimality": 9.147310402092444e-13,
+          "refine_steps": 0,
+          "rel_residual": 0.00766687888466573,
+          "solver": "Gram-Cholesky",
+          "stop_reason": "normal_equations"
+        }
+      ],
+      "jacobi_applied": true,
+      "orchestration": "cpu",
+      "postprocessing": "cpu",
+      "ranking": "cpu",
+      "resident_column_index_uploads": 0,
+      "resident_fallback_reason": null,
+      "resident_index_cache_budget_bytes": 18908864,
+      "resident_input_kind": null,
+      "resident_row_index_uploads": 0,
+      "resident_subset_builds": 0,
+      "resident_subset_inputs": false,
+      "subset_solver": "cpu"
+    },
+    "coef": {
+      "dtype": "float64",
+      "shape": [
+        90328
+      ],
+      "type": "ndarray"
+    },
+    "execution_backend": "cpu_rfe",
+    "fit_accepted": true,
+    "n_iter": 0,
+    "n_penalized": 16311,
+    "nnz_penalized": 8669,
+    "nnz_unpenalized": 74017,
+    "postfit_backend": "cpu_orchestration_and_metrics",
+    "rfe_criterion": "cv",
+    "rfe_gram_exact_rounds": 0,
+    "status": "fit_returned",
+    "unpenalized_columns": 74017
+  },
+  "symmetry": {
+    "fit": {
+      "n_operations": 4,
+      "number": 15,
+      "spacegroup": "C2/c (15)",
+      "symbol": "C2/c",
+      "symprec": 1e-05
+    },
+    "probe": {
+      "n_operations": 4,
+      "number": 15,
+      "spacegroup": "C2/c (15)",
+      "symbol": "C2/c",
+      "symprec": 0.001
+    },
+    "probe_more_symmetric": false,
+    "symprec": 1e-05
+  },
+  "versions": {
+    "ase": "3.29.0",
+    "f90nml": "1.5.0",
+    "h5py": "3.16.0",
+    "joblib": "1.5.3",
+    "numpy": "2.4.6",
+    "phonopy": "2.47.1",
+    "scikit-learn": "1.9.0",
+    "scipy": "1.17.1",
+    "spglib": "2.6.0",
+    "torch": "2.5.1+cu121"
+  }
+}

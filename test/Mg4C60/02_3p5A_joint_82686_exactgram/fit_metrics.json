@@ -1,0 +1,29 @@
+{
+  "pheasy_rmse_train": 0.006656042643695232,
+  "pheasy_relative_error": 0.007664856886465937,
+  "pheasy_rmse_cv": 0.010297576701000602,
+  "pheasy_worst_force_correlation": 1.0,
+  "pheasy_free_ifcs": 90328,
+  "pheasy_cv_hit_cap": false,
+  "pheasy_cv_warning": false,
+  "pheasy_gpu_evidence": [
+    "gpu_sm_matvec",
+    "twolevel_sm"
+  ],
+  "pheasy_gpu_used": true,
+  "mem_probe": {},
+  "driver_md5": "f069d1aa9a3af63a3242a1882ac84bfe",
+  "fix_scan_active": false,
+  "rfe_plan": {},
+  "pheasy_method": "RFE-OLS",
+  "fit_method_configured": "RFE-OLS",
+  "fit_method_delivered": "RFE-OLS",
+  "alpha_star": null,
+  "alpha_star_source": "not_applicable",
+  "pheasy_gpu_requested": true,
+  "pheasy_gpu_resident": false,
+  "pheasy_lasso_twolevel": false,
+  "harm_dense_env": "1",
+  "harm_free": 74017,
+  "harm_kept": 74017
+}

@@ -1,0 +1,24 @@
+{
+  "pheasy_rmse_train": 0.006688752604456853,
+  "pheasy_relative_error": 0.007702524488886911,
+  "pheasy_rmse_cv": NaN,
+  "pheasy_worst_force_correlation": 1.0,
+  "pheasy_free_ifcs": 84557,
+  "pheasy_cv_hit_cap": false,
+  "pheasy_cv_warning": false,
+  "pheasy_gpu_evidence": [
+    "twolevel_sm"
+  ],
+  "pheasy_gpu_used": false,
+  "pheasy_method": "RFE-OLS",
+  "fit_method_configured": "RFE-OLS",
+  "fit_method_delivered": "RFE-OLS",
+  "alpha_star": null,
+  "alpha_star_source": "not_applicable",
+  "pheasy_gpu_requested": false,
+  "pheasy_gpu_resident": false,
+  "pheasy_lasso_twolevel": false,
+  "harm_dense_env": "1",
+  "harm_free": 74017,
+  "harm_kept": 74017
+}

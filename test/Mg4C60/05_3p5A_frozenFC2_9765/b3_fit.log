@@ -1,0 +1,1083 @@
+[..] FIT_ENGINE=pheasy
+[WARN] symmetry_audit.py 不可用，超胞保对称检查跳过：No module named 'symmetry_audit'
+[FIX_FC2] second-order force constants fixed from fc.hdf5 (sha256 264eae0f807e7fc40e0714c548fbc3062c66f76400a6c92e215fcc564aee6b5f)
+[2026-11-03 14:59:56,717] Start Pheasy.
+.______    __    __   _______     ___           _______.____    ____ 
+|   _  \  |  |  |  | |   ____|   /   \         /       |\   \  /   / 
+|  |_)  | |  |__|  | |  |__     /  ^  \       |   (----` \   \/   /  
+|   ___/  |   __   | |   __|   /  /_\  \       \   \      \_    _/   
+|  |      |  |  |  | |  |____ /  _____  \  .----)   |       |  |     
+| _|      |__|  |__| |_______/__/     \__\ |_______/        |__|     
+                                                                  0.0.2
+[2026-11-03 14:59:56,726] System: C120Mg8
+[2026-11-03 14:59:56,726] Space group: C2/c (15), 4 symmetry operations found.
+[2026-11-03 14:59:56,726] Creating 2 x 2 x 1 supercell (512 atoms).
+[2026-11-03 15:00:12,575] Starting to generate cluster space up to 3-order.
+[2026-11-03 15:00:12,576] Cutoff distance (A) for 2-order IFCs: inf
+[2026-11-03 15:00:56,496] Cutoff distance (A) for 3-order IFCs: 3.50
+[2026-11-03 15:01:03,360] Summary of cluster space:
+[2026-11-03 15:01:03,360] - HARM    | cluster number: 8384 | IFC number: 75456
+[2026-11-03 15:01:03,360] - ANHARM3 | cluster number: 1054 | IFC number: 28458
+[2026-11-03 15:01:11,810] Cluster space generation finished, time cost: 0:00:59.234182.
+[2026-11-03 15:01:11,810] Finalize Pheasy, total time cost: 0:01:15.095005.
+[OK] SPOSCAR.dataset matches the dataset source SPOSCAR (order + mod-lattice coordinates)
+[..] 单截断拟合（CUT3_SCAN=False，候选 4 档）
+[pheasy] cluster space: pheasy-gpu --dim 2 2 1 -w 3 --c3 3.5 --eps 0.001 --symprec 1e-3 --fix_fc2 --fc2_fmt PHONOPY -s
+[2026-11-03 15:01:14,717] Start Pheasy.
+.______    __    __   _______     ___           _______.____    ____ 
+|   _  \  |  |  |  | |   ____|   /   \         /       |\   \  /   / 
+|  |_)  | |  |__|  | |  |__     /  ^  \       |   (----` \   \/   /  
+|   ___/  |   __   | |   __|   /  /_\  \       \   \      \_    _/   
+|  |      |  |  |  | |  |____ /  _____  \  .----)   |       |  |     
+| _|      |__|  |__| |_______/__/     \__\ |_______/        |__|     
+                                                                  0.0.2
+[2026-11-03 15:01:14,728] System: C120Mg8
+[2026-11-03 15:01:14,728] Space group: C2/c (15), 4 symmetry operations found.
+[2026-11-03 15:01:14,728] Creating 2 x 2 x 1 supercell (512 atoms).
+[2026-11-03 15:01:14,991] Starting to generate cluster space up to 3-order.
+[2026-11-03 15:01:14,991] Cutoff distance (A) for 2-order IFCs: inf
+[2026-11-03 15:02:25,369] Cutoff distance (A) for 3-order IFCs: 3.50
+[2026-11-03 15:02:37,059] Summary of cluster space:
+[2026-11-03 15:02:37,060] - HARM    | cluster number: 8384 | IFC number: 75456
+[2026-11-03 15:02:37,060] - ANHARM3 | cluster number: 1054 | IFC number: 28458
+[2026-11-03 15:02:52,061] Cluster space generation finished, time cost: 0:01:37.070697.
+[2026-11-03 15:02:52,062] Finalize Pheasy, total time cost: 0:01:37.347509.
+[pheasy] symmetry constraints: pheasy-gpu --dim 2 2 1 -w 3 --c3 3.5 --eps 0.001 --symprec 1e-3 --fix_fc2 --fc2_fmt PHONOPY -c
+[2026-11-03 15:02:54,915] Start Pheasy.
+ _______           _______  _______  _______          
+(  ____ )|\     /|(  ____ \(  ___  )(  ____ \|\     /|
+| (    )|| )   ( || (    \/| (   ) || (    \/( \   / )
+| (____)|| (___) || (__    | (___) || (_____  \ (_) / 
+|  _____)|  ___  ||  __)   |  ___  |(_____  )  \   /  
+| (      | (   ) || (      | (   ) |      ) |   ) (   
+| )      | )   ( || (____/\| )   ( |/\____) |   | |   
+|/       |/     \|(_______/|/     \|\_______)   \_/  0.0.2
+[2026-11-03 15:02:54,924] System: C120Mg8
+[2026-11-03 15:02:54,924] Space group: C2/c (15), 4 symmetry operations found.
+[2026-11-03 15:02:54,925] Creating 2 x 2 x 1 supercell (512 atoms).
+[2026-11-03 15:02:55,150] Reading and generating cluster space from file, up to 3-order.
+[2026-11-03 15:03:01,638] Cutoff distance (A) for 2-order IFCs: inf
+[2026-11-03 15:03:01,638] Cutoff distance (A) for 3-order IFCs: 3.50
+[2026-11-03 15:03:01,638] Summary of cluster space:
+[2026-11-03 15:03:01,638] - HARM    | cluster number: 8384 | IFC number: 75456
+[2026-11-03 15:03:01,638] - ANHARM3 | cluster number: 1054 | IFC number: 28458
+[2026-11-03 15:03:01,638] Starting to construct symmetry constraints and null space.
+[2026-11-03 15:03:01,638] Symmmetry constraints are imposed in Cartesian coordinate.
+[2026-11-03 15:03:01,638] Symmetry constraints on 2-order IFCs:
+[2026-11-03 15:03:01,638] - Imposing space group and permuation symmetry.
+[2026-11-03 15:03:09,705] - Imposing translational invariance.
+[2026-11-03 15:04:15,551] - Calculating null space.
+[ASR] sparse mode ON, ns_mat: csc_matrix shape=(75456, 74304), nnz=75456, mem~0.6MB (thr=1e-10, col_blk=5000)
+[ASR] elimination mode (n_free=74304, 288 constraint rows)
+[ASR]   cons 1/32: n_free=74295, nnz=84468, t=0.1s
+[ASR]   cons 11/32: n_free=74205, nnz=257308, t=0.9s
+[ASR]   cons 21/32: n_free=74115, nnz=490948, t=2.0s
+[ASR]   cons 31/32: n_free=74025, nnz=657388, t=3.7s
+[ASR]   cons 32/32: n_free=74017, nnz=665410, t=3.9s
+[ASR] done: n_free=74017, eliminated=287, skipped=1, max|C@ns|=1.11e-16
+[2026-11-03 15:04:19,488] - [ns-rank] order 2: skipped (n_free=74017 > MAXCOL=5000)
+[2026-11-03 15:04:19,488] - Time cost: 0:01:17.849661.
+[2026-11-03 15:04:19,488] Symmetry constraints on 3-order IFCs:
+[2026-11-03 15:04:19,488] - Imposing space group and permuation symmetry.
+[2026-11-03 15:04:21,450] - Imposing translational invariance.
+[2026-11-03 15:04:24,418] - Calculating null space.
+[ASR] sparse mode ON, ns_mat: csc_matrix shape=(28458, 23378), nnz=28458, mem~0.2MB (thr=1e-10, col_blk=5000)
+[ASR] elimination mode (n_free=23378, 226368 constraint rows)
+[ASR]   cons 1/8384: n_free=23360, nnz=28836, t=0.1s
+[ASR]   cons 11/8384: n_free=23348, nnz=29044, t=0.2s
+[ASR]   cons 21/8384: n_free=23348, nnz=29044, t=0.3s
+[ASR]   cons 31/8384: n_free=23348, nnz=29044, t=0.4s
+[ASR]   cons 41/8384: n_free=23348, nnz=29044, t=0.5s
+[ASR]   cons 51/8384: n_free=23348, nnz=29044, t=0.6s
+[ASR]   cons 61/8384: n_free=23348, nnz=29044, t=0.7s
+[ASR]   cons 71/8384: n_free=23348, nnz=29044, t=0.8s
+[ASR]   cons 81/8384: n_free=23348, nnz=29044, t=0.9s
+[ASR]   cons 91/8384: n_free=23348, nnz=29044, t=1.0s
+[ASR]   cons 101/8384: n_free=23348, nnz=29044, t=1.1s
+[ASR]   cons 111/8384: n_free=23348, nnz=29044, t=1.2s
+[ASR]   cons 121/8384: n_free=23348, nnz=29044, t=1.3s
+[ASR]   cons 131/8384: n_free=23321, nnz=29425, t=1.4s
+[ASR]   cons 141/8384: n_free=23321, nnz=29425, t=1.5s
+[ASR]   cons 151/8384: n_free=23294, nnz=29506, t=1.7s
+[ASR]   cons 161/8384: n_free=23294, nnz=29506, t=1.8s
+[ASR]   cons 171/8384: n_free=23294, nnz=29506, t=1.9s
+[ASR]   cons 181/8384: n_free=23267, nnz=29959, t=2.0s
+[ASR]   cons 191/8384: n_free=23267, nnz=29959, t=2.1s
+[ASR]   cons 201/8384: n_free=23267, nnz=29959, t=2.2s
+[ASR]   cons 211/8384: n_free=23240, nnz=30067, t=2.4s
+[ASR]   cons 221/8384: n_free=23240, nnz=30067, t=2.5s
+[ASR]   cons 231/8384: n_free=23213, nnz=30229, t=2.6s
+[ASR]   cons 241/8384: n_free=23213, nnz=30229, t=2.7s
+[ASR]   cons 251/8384: n_free=23186, nnz=30723, t=2.9s
+[ASR]   cons 261/8384: n_free=23159, nnz=30957, t=3.1s
+[ASR]   cons 271/8384: n_free=23159, nnz=30957, t=3.2s
+[ASR]   cons 281/8384: n_free=23159, nnz=30957, t=3.3s
+[ASR]   cons 291/8384: n_free=23159, nnz=30957, t=3.4s
+[ASR]   cons 301/8384: n_free=23159, nnz=30957, t=3.5s
+[ASR]   cons 311/8384: n_free=23159, nnz=30957, t=3.6s
+[ASR]   cons 321/8384: n_free=23132, nnz=31362, t=3.7s
+[ASR]   cons 331/8384: n_free=23132, nnz=31362, t=3.8s
+[ASR]   cons 341/8384: n_free=23105, nnz=31857, t=4.0s
+[ASR]   cons 351/8384: n_free=23105, nnz=31857, t=4.1s
+[ASR]   cons 361/8384: n_free=23105, nnz=31857, t=4.2s
+[ASR]   cons 371/8384: n_free=23078, nnz=32788, t=4.4s
+[ASR]   cons 381/8384: n_free=23078, nnz=32788, t=4.5s
+[ASR]   cons 391/8384: n_free=23078, nnz=32788, t=4.6s
+[ASR]   cons 401/8384: n_free=23078, nnz=32788, t=4.7s
+[ASR]   cons 411/8384: n_free=23051, nnz=33724, t=4.9s
+[ASR]   cons 421/8384: n_free=23024, nnz=33936, t=5.0s
+[ASR]   cons 431/8384: n_free=23024, nnz=33936, t=5.2s
+[ASR]   cons 441/8384: n_free=23024, nnz=33936, t=5.3s
+[ASR]   cons 451/8384: n_free=23024, nnz=33936, t=5.4s
+[ASR]   cons 461/8384: n_free=23024, nnz=33936, t=5.5s
+[ASR]   cons 471/8384: n_free=23024, nnz=33936, t=5.6s
+[ASR]   cons 481/8384: n_free=23024, nnz=33936, t=5.7s
+[ASR]   cons 491/8384: n_free=22997, nnz=34071, t=5.9s
+[ASR]   cons 501/8384: n_free=22979, nnz=35023, t=6.0s
+[ASR]   cons 511/8384: n_free=22961, nnz=35590, t=6.1s
+[ASR]   cons 521/8384: n_free=22961, nnz=35590, t=6.3s
+[ASR]   cons 531/8384: n_free=22961, nnz=35590, t=6.4s
+[ASR]   cons 541/8384: n_free=22934, nnz=36310, t=6.5s
+[ASR]   cons 551/8384: n_free=22907, nnz=37048, t=6.7s
+[ASR]   cons 561/8384: n_free=22907, nnz=37048, t=6.8s
+[ASR]   cons 571/8384: n_free=22880, nnz=37840, t=7.0s
+[ASR]   cons 581/8384: n_free=22880, nnz=37840, t=7.1s
+[ASR]   cons 591/8384: n_free=22853, nnz=38731, t=7.3s
+[ASR]   cons 601/8384: n_free=22826, nnz=38839, t=7.4s
+[ASR]   cons 611/8384: n_free=22826, nnz=38839, t=7.5s
+[ASR]   cons 621/8384: n_free=22799, nnz=39730, t=7.7s
+[ASR]   cons 631/8384: n_free=22772, nnz=40666, t=7.9s
+[ASR]   cons 641/8384: n_free=22745, nnz=41674, t=8.1s
+[ASR]   cons 651/8384: n_free=22745, nnz=41674, t=8.2s
+[ASR]   cons 661/8384: n_free=22718, nnz=41782, t=8.4s
+[ASR]   cons 671/8384: n_free=22718, nnz=41782, t=8.5s
+[ASR]   cons 681/8384: n_free=22718, nnz=41782, t=8.6s
+[ASR]   cons 691/8384: n_free=22691, nnz=42889, t=8.8s
+[ASR]   cons 701/8384: n_free=22664, nnz=43024, t=9.0s
+[ASR]   cons 711/8384: n_free=22664, nnz=43024, t=9.1s
+[ASR]   cons 721/8384: n_free=22664, nnz=43024, t=9.2s
+[ASR]   cons 731/8384: n_free=22637, nnz=44140, t=9.4s
+[ASR]   cons 741/8384: n_free=22610, nnz=44401, t=9.6s
+[ASR]   cons 751/8384: n_free=22610, nnz=44401, t=9.7s
+[ASR]   cons 761/8384: n_free=22610, nnz=44401, t=9.8s
+[ASR]   cons 771/8384: n_free=22583, nnz=44788, t=10.0s
+[ASR]   cons 781/8384: n_free=22583, nnz=44788, t=10.1s
+[ASR]   cons 791/8384: n_free=22583, nnz=44788, t=10.3s
+[ASR]   cons 801/8384: n_free=22556, nnz=45337, t=10.4s
+[ASR]   cons 811/8384: n_free=22556, nnz=45337, t=10.6s
+[ASR]   cons 821/8384: n_free=22529, nnz=45976, t=10.8s
+[ASR]   cons 831/8384: n_free=22529, nnz=45976, t=10.9s
+[ASR]   cons 841/8384: n_free=22529, nnz=45976, t=11.0s
+[ASR]   cons 851/8384: n_free=22502, nnz=47515, t=11.2s
+[ASR]   cons 861/8384: n_free=22502, nnz=47515, t=11.4s
+[ASR]   cons 871/8384: n_free=22502, nnz=47515, t=11.5s
+[ASR]   cons 881/8384: n_free=22502, nnz=47515, t=11.6s
+[ASR]   cons 891/8384: n_free=22475, nnz=49072, t=11.8s
+[ASR]   cons 901/8384: n_free=22475, nnz=49072, t=12.0s
+[ASR]   cons 911/8384: n_free=22475, nnz=49072, t=12.1s
+[ASR]   cons 921/8384: n_free=22448, nnz=50638, t=12.3s
+[ASR]   cons 931/8384: n_free=22421, nnz=52375, t=12.6s
+[ASR]   cons 941/8384: n_free=22421, nnz=52375, t=12.7s
+[ASR]   cons 951/8384: n_free=22421, nnz=52375, t=12.9s
+[ASR]   cons 961/8384: n_free=22421, nnz=52375, t=13.0s
+[ASR]   cons 971/8384: n_free=22421, nnz=52375, t=13.2s
+[ASR]   cons 981/8384: n_free=22394, nnz=52627, t=13.4s
+[ASR]   cons 991/8384: n_free=22394, nnz=52627, t=13.5s
+[ASR]   cons 1001/8384: n_free=22376, nnz=52870, t=13.7s
+[ASR]   cons 1011/8384: n_free=22358, nnz=53419, t=13.9s
+[ASR]   cons 1021/8384: n_free=22331, nnz=54373, t=14.1s
+[ASR]   cons 1031/8384: n_free=22331, nnz=54373, t=14.3s
+[ASR]   cons 1041/8384: n_free=22304, nnz=55213, t=14.5s
+[ASR]   cons 1051/8384: n_free=22277, nnz=56056, t=14.7s
+[ASR]   cons 1061/8384: n_free=22277, nnz=56056, t=14.9s
+[ASR]   cons 1071/8384: n_free=22250, nnz=56941, t=15.1s
+[ASR]   cons 1081/8384: n_free=22250, nnz=56941, t=15.3s
+[ASR]   cons 1091/8384: n_free=22223, nnz=57103, t=15.5s
+[ASR]   cons 1101/8384: n_free=22196, nnz=57508, t=15.7s
+[ASR]   cons 1111/8384: n_free=22169, nnz=57922, t=15.9s
+[ASR]   cons 1121/8384: n_free=22142, nnz=58825, t=16.2s
+[ASR]   cons 1131/8384: n_free=22142, nnz=58825, t=16.3s
+[ASR]   cons 1141/8384: n_free=22142, nnz=58825, t=16.5s
+[ASR]   cons 1151/8384: n_free=22142, nnz=58825, t=16.7s
+[ASR]   cons 1161/8384: n_free=22115, nnz=58933, t=16.9s
+[ASR]   cons 1171/8384: n_free=22115, nnz=58933, t=17.1s
+[ASR]   cons 1181/8384: n_free=22061, nnz=59662, t=17.4s
+[ASR]   cons 1191/8384: n_free=22061, nnz=59662, t=17.5s
+[ASR]   cons 1201/8384: n_free=22034, nnz=60835, t=17.8s
+[ASR]   cons 1211/8384: n_free=22034, nnz=60835, t=18.0s
+[ASR]   cons 1221/8384: n_free=22034, nnz=60835, t=18.1s
+[ASR]   cons 1231/8384: n_free=22016, nnz=61999, t=18.3s
+[ASR]   cons 1241/8384: n_free=22016, nnz=61999, t=18.5s
+[ASR]   cons 1251/8384: n_free=22016, nnz=61999, t=18.7s
+[ASR]   cons 1261/8384: n_free=22016, nnz=61999, t=18.9s
+[ASR]   cons 1271/8384: n_free=22016, nnz=61999, t=19.1s
+[ASR]   cons 1281/8384: n_free=22016, nnz=61999, t=19.2s
+[ASR]   cons 1291/8384: n_free=22016, nnz=61999, t=19.4s
+[ASR]   cons 1301/8384: n_free=22016, nnz=61999, t=19.6s
+[ASR]   cons 1311/8384: n_free=22016, nnz=61999, t=19.8s
+[ASR]   cons 1321/8384: n_free=22016, nnz=61999, t=20.0s
+[ASR]   cons 1331/8384: n_free=22016, nnz=61999, t=20.1s
+[ASR]   cons 1341/8384: n_free=22016, nnz=61999, t=20.3s
+[ASR]   cons 1351/8384: n_free=22016, nnz=61999, t=20.5s
+[ASR]   cons 1361/8384: n_free=22016, nnz=61999, t=20.7s
+[ASR]   cons 1371/8384: n_free=22016, nnz=61999, t=20.9s
+[ASR]   cons 1381/8384: n_free=22016, nnz=61999, t=21.0s
+[ASR]   cons 1391/8384: n_free=22016, nnz=61999, t=21.2s
+[ASR]   cons 1401/8384: n_free=22016, nnz=61999, t=21.4s
+[ASR]   cons 1411/8384: n_free=22016, nnz=61999, t=21.6s
+[ASR]   cons 1421/8384: n_free=22016, nnz=61999, t=21.8s
+[ASR]   cons 1431/8384: n_free=22016, nnz=61999, t=21.9s
+[ASR]   cons 1441/8384: n_free=22016, nnz=61999, t=22.1s
+[ASR]   cons 1451/8384: n_free=22016, nnz=61999, t=22.3s
+[ASR]   cons 1461/8384: n_free=22016, nnz=61999, t=22.5s
+[ASR]   cons 1471/8384: n_free=22016, nnz=61999, t=22.7s
+[ASR]   cons 1481/8384: n_free=22016, nnz=61999, t=22.8s
+[ASR]   cons 1491/8384: n_free=21998, nnz=62737, t=23.1s
+[ASR]   cons 1501/8384: n_free=21971, nnz=64216, t=23.3s
+[ASR]   cons 1511/8384: n_free=21971, nnz=64216, t=23.5s
+[ASR]   cons 1521/8384: n_free=21944, nnz=65419, t=23.7s
+[ASR]   cons 1531/8384: n_free=21917, nnz=66592, t=24.0s
+[ASR]   cons 1541/8384: n_free=21917, nnz=66592, t=24.2s
+[ASR]   cons 1551/8384: n_free=21890, nnz=66862, t=24.4s
+[ASR]   cons 1561/8384: n_free=21863, nnz=67204, t=24.7s
+[ASR]   cons 1571/8384: n_free=21863, nnz=67204, t=24.9s
+[ASR]   cons 1581/8384: n_free=21863, nnz=67204, t=25.0s
+[ASR]   cons 1591/8384: n_free=21863, nnz=67204, t=25.2s
+[ASR]   cons 1601/8384: n_free=21836, nnz=68467, t=25.5s
+[ASR]   cons 1611/8384: n_free=21836, nnz=68467, t=25.7s
+[ASR]   cons 1621/8384: n_free=21809, nnz=68890, t=26.0s
+[ASR]   cons 1631/8384: n_free=21809, nnz=68890, t=26.1s
+[ASR]   cons 1641/8384: n_free=21782, nnz=69034, t=26.4s
+[ASR]   cons 1651/8384: n_free=21782, nnz=69034, t=26.6s
+[ASR]   cons 1661/8384: n_free=21782, nnz=69034, t=26.8s
+[ASR]   cons 1671/8384: n_free=21782, nnz=69034, t=27.0s
+[ASR]   cons 1681/8384: n_free=21755, nnz=70513, t=27.3s
+[ASR]   cons 1691/8384: n_free=21728, nnz=70594, t=27.5s
+[ASR]   cons 1701/8384: n_free=21728, nnz=70594, t=27.7s
+[ASR]   cons 1711/8384: n_free=21701, nnz=72280, t=28.0s
+[ASR]   cons 1721/8384: n_free=21683, nnz=72415, t=28.2s
+[ASR]   cons 1731/8384: n_free=21683, nnz=72415, t=28.4s
+[ASR]   cons 1741/8384: n_free=21683, nnz=72415, t=28.7s
+[ASR]   cons 1751/8384: n_free=21683, nnz=72415, t=28.9s
+[ASR]   cons 1761/8384: n_free=21683, nnz=72415, t=29.1s
+[ASR]   cons 1771/8384: n_free=21683, nnz=72415, t=29.3s
+[ASR]   cons 1781/8384: n_free=21683, nnz=72415, t=29.5s
+[ASR]   cons 1791/8384: n_free=21683, nnz=72415, t=29.7s
+[ASR]   cons 1801/8384: n_free=21683, nnz=72415, t=29.9s
+[ASR]   cons 1811/8384: n_free=21683, nnz=72415, t=30.1s
+[ASR]   cons 1821/8384: n_free=21683, nnz=72415, t=30.3s
+[ASR]   cons 1831/8384: n_free=21683, nnz=72415, t=30.5s
+[ASR]   cons 1841/8384: n_free=21683, nnz=72415, t=30.7s
+[ASR]   cons 1851/8384: n_free=21683, nnz=72415, t=30.9s
+[ASR]   cons 1861/8384: n_free=21683, nnz=72415, t=31.1s
+[ASR]   cons 1871/8384: n_free=21683, nnz=72415, t=31.3s
+[ASR]   cons 1881/8384: n_free=21683, nnz=72415, t=31.6s
+[ASR]   cons 1891/8384: n_free=21683, nnz=72415, t=31.8s
+[ASR]   cons 1901/8384: n_free=21683, nnz=72415, t=32.0s
+[ASR]   cons 1911/8384: n_free=21683, nnz=72415, t=32.2s
+[ASR]   cons 1921/8384: n_free=21683, nnz=72415, t=32.4s
+[ASR]   cons 1931/8384: n_free=21683, nnz=72415, t=32.6s
+[ASR]   cons 1941/8384: n_free=21683, nnz=72415, t=32.8s
+[ASR]   cons 1951/8384: n_free=21656, nnz=74191, t=33.1s
+[ASR]   cons 1961/8384: n_free=21629, nnz=76492, t=33.4s
+[ASR]   cons 1971/8384: n_free=21629, nnz=76492, t=33.6s
+[ASR]   cons 1981/8384: n_free=21575, nnz=79681, t=33.9s
+[ASR]   cons 1991/8384: n_free=21575, nnz=79681, t=34.1s
+[ASR]   cons 2001/8384: n_free=21575, nnz=79681, t=34.3s
+[ASR]   cons 2011/8384: n_free=21548, nnz=79843, t=34.6s
+[ASR]   cons 2021/8384: n_free=21548, nnz=79843, t=34.9s
+[ASR]   cons 2031/8384: n_free=21521, nnz=81778, t=35.2s
+[ASR]   cons 2041/8384: n_free=21521, nnz=81778, t=35.4s
+[ASR]   cons 2051/8384: n_free=21521, nnz=81778, t=35.6s
+[ASR]   cons 2061/8384: n_free=21521, nnz=81778, t=35.9s
+[ASR]   cons 2071/8384: n_free=21521, nnz=81778, t=36.1s
+[ASR]   cons 2081/8384: n_free=21521, nnz=81778, t=36.4s
+[ASR]   cons 2091/8384: n_free=21521, nnz=81778, t=36.6s
+[ASR]   cons 2101/8384: n_free=21467, nnz=83904, t=37.0s
+[ASR]   cons 2111/8384: n_free=21440, nnz=84012, t=37.3s
+[ASR]   cons 2121/8384: n_free=21440, nnz=84012, t=37.5s
+[ASR]   cons 2131/8384: n_free=21440, nnz=84012, t=37.8s
+[ASR]   cons 2141/8384: n_free=21413, nnz=84219, t=38.1s
+[ASR]   cons 2151/8384: n_free=21413, nnz=84219, t=38.3s
+[ASR]   cons 2161/8384: n_free=21413, nnz=84219, t=38.6s
+[ASR]   cons 2171/8384: n_free=21386, nnz=86226, t=38.9s
+[ASR]   cons 2181/8384: n_free=21386, nnz=86226, t=39.1s
+[ASR]   cons 2191/8384: n_free=21386, nnz=86226, t=39.4s
+[ASR]   cons 2201/8384: n_free=21386, nnz=86226, t=39.6s
+[ASR]   cons 2211/8384: n_free=21368, nnz=88248, t=39.9s
+[ASR]   cons 2221/8384: n_free=21368, nnz=88248, t=40.2s
+[ASR]   cons 2231/8384: n_free=21368, nnz=88248, t=40.5s
+[ASR]   cons 2241/8384: n_free=21368, nnz=88248, t=40.7s
+[ASR]   cons 2251/8384: n_free=21368, nnz=88248, t=41.0s
+[ASR]   cons 2261/8384: n_free=21368, nnz=88248, t=41.2s
+[ASR]   cons 2271/8384: n_free=21368, nnz=88248, t=41.5s
+[ASR]   cons 2281/8384: n_free=21368, nnz=88248, t=41.8s
+[ASR]   cons 2291/8384: n_free=21368, nnz=88248, t=42.1s
+[ASR]   cons 2301/8384: n_free=21368, nnz=88248, t=42.4s
+[ASR]   cons 2311/8384: n_free=21368, nnz=88248, t=42.7s
+[ASR]   cons 2321/8384: n_free=21368, nnz=88248, t=42.9s
+[ASR]   cons 2331/8384: n_free=21368, nnz=88248, t=43.2s
+[ASR]   cons 2341/8384: n_free=21368, nnz=88248, t=43.5s
+[ASR]   cons 2351/8384: n_free=21368, nnz=88248, t=43.7s
+[ASR]   cons 2361/8384: n_free=21368, nnz=88248, t=44.0s
+[ASR]   cons 2371/8384: n_free=21368, nnz=88248, t=44.2s
+[ASR]   cons 2381/8384: n_free=21368, nnz=88248, t=44.5s
+[ASR]   cons 2391/8384: n_free=21350, nnz=89370, t=44.8s
+[ASR]   cons 2401/8384: n_free=21338, nnz=90360, t=45.1s
+[ASR]   cons 2411/8384: n_free=21311, nnz=93228, t=45.4s
+[ASR]   cons 2421/8384: n_free=21284, nnz=94218, t=45.8s
+[ASR]   cons 2431/8384: n_free=21284, nnz=94218, t=46.1s
+[ASR]   cons 2441/8384: n_free=21284, nnz=94218, t=46.3s
+[ASR]   cons 2451/8384: n_free=21284, nnz=94218, t=46.6s
+[ASR]   cons 2461/8384: n_free=21284, nnz=94218, t=46.9s
+[ASR]   cons 2471/8384: n_free=21257, nnz=97278, t=47.2s
+[ASR]   cons 2481/8384: n_free=21230, nnz=100681, t=47.6s
+[ASR]   cons 2491/8384: n_free=21230, nnz=100681, t=47.9s
+[ASR]   cons 2501/8384: n_free=21230, nnz=100681, t=48.2s
+[ASR]   cons 2511/8384: n_free=21230, nnz=100681, t=48.5s
+[ASR]   cons 2521/8384: n_free=21230, nnz=100681, t=48.8s
+[ASR]   cons 2531/8384: n_free=21203, nnz=100816, t=49.2s
+[ASR]   cons 2541/8384: n_free=21203, nnz=100816, t=49.5s
+[ASR]   cons 2551/8384: n_free=21176, nnz=100924, t=49.8s
+[ASR]   cons 2561/8384: n_free=21176, nnz=100924, t=50.1s
+[ASR]   cons 2571/8384: n_free=21176, nnz=100924, t=50.4s
+[ASR]   cons 2581/8384: n_free=21149, nnz=101158, t=50.8s
+[ASR]   cons 2591/8384: n_free=21122, nnz=104663, t=51.1s
+[ASR]   cons 2601/8384: n_free=21122, nnz=104663, t=51.4s
+[ASR]   cons 2611/8384: n_free=21122, nnz=104663, t=51.8s
+[ASR]   cons 2621/8384: n_free=21095, nnz=105122, t=52.1s
+[ASR]   cons 2631/8384: n_free=21095, nnz=105122, t=52.4s
+[ASR]   cons 2641/8384: n_free=21095, nnz=105122, t=52.7s
+[ASR]   cons 2651/8384: n_free=21095, nnz=105122, t=53.0s
+[ASR]   cons 2661/8384: n_free=21077, nnz=105590, t=53.4s
+[ASR]   cons 2671/8384: n_free=21077, nnz=105590, t=53.7s
+[ASR]   cons 2681/8384: n_free=21077, nnz=105590, t=54.0s
+[ASR]   cons 2691/8384: n_free=21077, nnz=105590, t=54.3s
+[ASR]   cons 2701/8384: n_free=21077, nnz=105590, t=54.6s
+[ASR]   cons 2711/8384: n_free=21077, nnz=105590, t=54.9s
+[ASR]   cons 2721/8384: n_free=21077, nnz=105590, t=55.2s
+[ASR]   cons 2731/8384: n_free=21077, nnz=105590, t=55.5s
+[ASR]   cons 2741/8384: n_free=21077, nnz=105590, t=55.9s
+[ASR]   cons 2751/8384: n_free=21077, nnz=105590, t=56.1s
+[ASR]   cons 2761/8384: n_free=21077, nnz=105590, t=56.5s
+[ASR]   cons 2771/8384: n_free=21077, nnz=105590, t=56.8s
+[ASR]   cons 2781/8384: n_free=21077, nnz=105590, t=57.1s
+[ASR]   cons 2791/8384: n_free=21077, nnz=105590, t=57.4s
+[ASR]   cons 2801/8384: n_free=21077, nnz=105590, t=57.7s
+[ASR]   cons 2811/8384: n_free=21077, nnz=105590, t=58.0s
+[ASR]   cons 2821/8384: n_free=21059, nnz=107018, t=58.3s
+[ASR]   cons 2831/8384: n_free=21059, nnz=107018, t=58.6s
+[ASR]   cons 2841/8384: n_free=21059, nnz=107018, t=58.9s
+[ASR]   cons 2851/8384: n_free=21059, nnz=107018, t=59.3s
+[ASR]   cons 2861/8384: n_free=21059, nnz=107018, t=59.6s
+[ASR]   cons 2871/8384: n_free=21032, nnz=109583, t=60.0s
+[ASR]   cons 2881/8384: n_free=21005, nnz=110274, t=60.4s
+[ASR]   cons 2891/8384: n_free=20978, nnz=112845, t=60.7s
+[ASR]   cons 2901/8384: n_free=20978, nnz=112845, t=61.1s
+[ASR]   cons 2911/8384: n_free=20978, nnz=112845, t=61.4s
+[ASR]   cons 2921/8384: n_free=20978, nnz=112845, t=61.7s
+[ASR]   cons 2931/8384: n_free=20978, nnz=112845, t=62.1s
+[ASR]   cons 2941/8384: n_free=20978, nnz=112845, t=62.4s
+[ASR]   cons 2951/8384: n_free=20951, nnz=115566, t=62.8s
+[ASR]   cons 2961/8384: n_free=20951, nnz=115566, t=63.1s
+[ASR]   cons 2971/8384: n_free=20951, nnz=115566, t=63.5s
+[ASR]   cons 2981/8384: n_free=20951, nnz=115566, t=63.8s
+[ASR]   cons 2991/8384: n_free=20951, nnz=115566, t=64.1s
+[ASR]   cons 3001/8384: n_free=20951, nnz=115566, t=64.4s
+[ASR]   cons 3011/8384: n_free=20924, nnz=118254, t=64.8s
+[ASR]   cons 3021/8384: n_free=20924, nnz=118254, t=65.2s
+[ASR]   cons 3031/8384: n_free=20897, nnz=118362, t=65.6s
+[ASR]   cons 3041/8384: n_free=20897, nnz=118362, t=66.0s
+[ASR]   cons 3051/8384: n_free=20897, nnz=118362, t=66.3s
+[ASR]   cons 3061/8384: n_free=20870, nnz=121101, t=66.7s
+[ASR]   cons 3071/8384: n_free=20852, nnz=123858, t=67.1s
+[ASR]   cons 3081/8384: n_free=20852, nnz=123858, t=67.5s
+[ASR]   cons 3091/8384: n_free=20852, nnz=123858, t=67.9s
+[ASR]   cons 3101/8384: n_free=20852, nnz=123858, t=68.3s
+[ASR]   cons 3111/8384: n_free=20852, nnz=123858, t=68.6s
+[ASR]   cons 3121/8384: n_free=20852, nnz=123858, t=69.0s
+[ASR]   cons 3131/8384: n_free=20852, nnz=123858, t=69.4s
+[ASR]   cons 3141/8384: n_free=20852, nnz=123858, t=69.8s
+[ASR]   cons 3151/8384: n_free=20852, nnz=123858, t=70.1s
+[ASR]   cons 3161/8384: n_free=20852, nnz=123858, t=70.5s
+[ASR]   cons 3171/8384: n_free=20852, nnz=123858, t=70.9s
+[ASR]   cons 3181/8384: n_free=20852, nnz=123858, t=71.2s
+[ASR]   cons 3191/8384: n_free=20852, nnz=123858, t=71.6s
+[ASR]   cons 3201/8384: n_free=20852, nnz=123858, t=72.0s
+[ASR]   cons 3211/8384: n_free=20852, nnz=123858, t=72.4s
+[ASR]   cons 3221/8384: n_free=20852, nnz=123858, t=72.7s
+[ASR]   cons 3231/8384: n_free=20852, nnz=123858, t=73.1s
+[ASR]   cons 3241/8384: n_free=20834, nnz=124762, t=73.5s
+[ASR]   cons 3251/8384: n_free=20795, nnz=126759, t=74.0s
+[ASR]   cons 3261/8384: n_free=20795, nnz=126759, t=74.4s
+[ASR]   cons 3271/8384: n_free=20795, nnz=126759, t=74.8s
+[ASR]   cons 3281/8384: n_free=20768, nnz=127531, t=75.2s
+[ASR]   cons 3291/8384: n_free=20768, nnz=127531, t=75.6s
+[ASR]   cons 3301/8384: n_free=20768, nnz=127531, t=76.0s
+[ASR]   cons 3311/8384: n_free=20741, nnz=128929, t=76.4s
+[ASR]   cons 3321/8384: n_free=20741, nnz=128929, t=76.8s
+[ASR]   cons 3331/8384: n_free=20714, nnz=130175, t=77.3s
+[ASR]   cons 3341/8384: n_free=20714, nnz=130175, t=77.7s
+[ASR]   cons 3351/8384: n_free=20714, nnz=130175, t=78.0s
+[ASR]   cons 3361/8384: n_free=20687, nnz=131507, t=78.5s
+[ASR]   cons 3371/8384: n_free=20687, nnz=131507, t=78.9s
+[ASR]   cons 3381/8384: n_free=20660, nnz=132851, t=79.4s
+[ASR]   cons 3391/8384: n_free=20660, nnz=132851, t=79.8s
+[ASR]   cons 3401/8384: n_free=20633, nnz=134169, t=80.3s
+[ASR]   cons 3411/8384: n_free=20633, nnz=134169, t=80.7s
+[ASR]   cons 3421/8384: n_free=20633, nnz=134169, t=81.1s
+[ASR]   cons 3431/8384: n_free=20633, nnz=134169, t=81.5s
+[ASR]   cons 3441/8384: n_free=20633, nnz=134169, t=82.0s
+[ASR]   cons 3451/8384: n_free=20633, nnz=134169, t=82.4s
+[ASR]   cons 3461/8384: n_free=20633, nnz=134169, t=82.8s
+[ASR]   cons 3471/8384: n_free=20633, nnz=134169, t=83.2s
+[ASR]   cons 3481/8384: n_free=20633, nnz=134169, t=83.6s
+[ASR]   cons 3491/8384: n_free=20633, nnz=134169, t=84.0s
+[ASR]   cons 3501/8384: n_free=20606, nnz=135481, t=84.5s
+[ASR]   cons 3511/8384: n_free=20606, nnz=135481, t=84.9s
+[ASR]   cons 3521/8384: n_free=20588, nnz=136968, t=85.4s
+[ASR]   cons 3531/8384: n_free=20588, nnz=136968, t=85.8s
+[ASR]   cons 3541/8384: n_free=20588, nnz=136968, t=86.3s
+[ASR]   cons 3551/8384: n_free=20588, nnz=136968, t=86.7s
+[ASR]   cons 3561/8384: n_free=20588, nnz=136968, t=87.1s
+[ASR]   cons 3571/8384: n_free=20588, nnz=136968, t=87.5s
+[ASR]   cons 3581/8384: n_free=20588, nnz=136968, t=88.0s
+[ASR]   cons 3591/8384: n_free=20588, nnz=136968, t=88.4s
+[ASR]   cons 3601/8384: n_free=20588, nnz=136968, t=88.8s
+[ASR]   cons 3611/8384: n_free=20588, nnz=136968, t=89.2s
+[ASR]   cons 3621/8384: n_free=20588, nnz=136968, t=89.6s
+[ASR]   cons 3631/8384: n_free=20588, nnz=136968, t=90.1s
+[ASR]   cons 3641/8384: n_free=20561, nnz=139217, t=90.6s
+[ASR]   cons 3651/8384: n_free=20534, nnz=139433, t=91.1s
+[ASR]   cons 3661/8384: n_free=20534, nnz=139433, t=91.5s
+[ASR]   cons 3671/8384: n_free=20534, nnz=139433, t=91.9s
+[ASR]   cons 3681/8384: n_free=20534, nnz=139433, t=92.4s
+[ASR]   cons 3691/8384: n_free=20507, nnz=140640, t=92.9s
+[ASR]   cons 3701/8384: n_free=20507, nnz=140640, t=93.3s
+[ASR]   cons 3711/8384: n_free=20453, nnz=145902, t=93.9s
+[ASR]   cons 3721/8384: n_free=20453, nnz=145902, t=94.4s
+[ASR]   cons 3731/8384: n_free=20426, nnz=148330, t=94.9s
+[ASR]   cons 3741/8384: n_free=20426, nnz=148330, t=95.4s
+[ASR]   cons 3751/8384: n_free=20426, nnz=148330, t=95.9s
+[ASR]   cons 3761/8384: n_free=20399, nnz=150753, t=96.4s
+[ASR]   cons 3771/8384: n_free=20399, nnz=150753, t=96.9s
+[ASR]   cons 3781/8384: n_free=20399, nnz=150753, t=97.4s
+[ASR]   cons 3791/8384: n_free=20399, nnz=150753, t=97.8s
+[ASR]   cons 3801/8384: n_free=20399, nnz=150753, t=98.3s
+[ASR]   cons 3811/8384: n_free=20399, nnz=150753, t=98.8s
+[ASR]   cons 3821/8384: n_free=20399, nnz=150753, t=99.3s
+[ASR]   cons 3831/8384: n_free=20399, nnz=150753, t=99.8s
+[ASR]   cons 3841/8384: n_free=20399, nnz=150753, t=100.2s
+[ASR]   cons 3851/8384: n_free=20399, nnz=150753, t=100.7s
+[ASR]   cons 3861/8384: n_free=20399, nnz=150753, t=101.2s
+[ASR]   cons 3871/8384: n_free=20372, nnz=150888, t=101.7s
+[ASR]   cons 3881/8384: n_free=20372, nnz=150888, t=102.2s
+[ASR]   cons 3891/8384: n_free=20354, nnz=153311, t=102.8s
+[ASR]   cons 3901/8384: n_free=20354, nnz=153311, t=103.2s
+[ASR]   cons 3911/8384: n_free=20354, nnz=153311, t=103.7s
+[ASR]   cons 3921/8384: n_free=20354, nnz=153311, t=104.2s
+[ASR]   cons 3931/8384: n_free=20354, nnz=153311, t=104.7s
+[ASR]   cons 3941/8384: n_free=20354, nnz=153311, t=105.2s
+[ASR]   cons 3951/8384: n_free=20354, nnz=153311, t=105.6s
+[ASR]   cons 3961/8384: n_free=20354, nnz=153311, t=106.1s
+[ASR]   cons 3971/8384: n_free=20354, nnz=153311, t=106.6s
+[ASR]   cons 3981/8384: n_free=20354, nnz=153311, t=107.1s
+[ASR]   cons 3991/8384: n_free=20354, nnz=153311, t=107.5s
+[ASR]   cons 4001/8384: n_free=20354, nnz=153311, t=108.0s
+[ASR]   cons 4011/8384: n_free=20354, nnz=153311, t=108.5s
+[ASR]   cons 4021/8384: n_free=20336, nnz=154839, t=109.1s
+[ASR]   cons 4031/8384: n_free=20336, nnz=154839, t=109.6s
+[ASR]   cons 4041/8384: n_free=20336, nnz=154839, t=110.0s
+[ASR]   cons 4051/8384: n_free=20336, nnz=154839, t=110.5s
+[ASR]   cons 4061/8384: n_free=20336, nnz=154839, t=111.0s
+[ASR]   cons 4071/8384: n_free=20336, nnz=154839, t=111.5s
+[ASR]   cons 4081/8384: n_free=20336, nnz=154839, t=112.0s
+[ASR]   cons 4091/8384: n_free=20309, nnz=158102, t=112.5s
+[ASR]   cons 4101/8384: n_free=20282, nnz=159314, t=113.1s
+[ASR]   cons 4111/8384: n_free=20282, nnz=159314, t=113.6s
+[ASR]   cons 4121/8384: n_free=20282, nnz=159314, t=114.1s
+[ASR]   cons 4131/8384: n_free=20255, nnz=160352, t=114.7s
+[ASR]   cons 4141/8384: n_free=20255, nnz=160352, t=115.3s
+[ASR]   cons 4151/8384: n_free=20255, nnz=160352, t=115.8s
+[ASR]   cons 4161/8384: n_free=20228, nnz=163369, t=116.4s
+[ASR]   cons 4171/8384: n_free=20228, nnz=163369, t=116.9s
+[ASR]   cons 4181/8384: n_free=20228, nnz=163369, t=117.4s
+[ASR]   cons 4191/8384: n_free=20228, nnz=163369, t=117.9s
+[ASR]   cons 4201/8384: n_free=20201, nnz=166374, t=118.6s
+[ASR]   cons 4211/8384: n_free=20201, nnz=166374, t=119.1s
+[ASR]   cons 4221/8384: n_free=20201, nnz=166374, t=119.6s
+[ASR]   cons 4231/8384: n_free=20201, nnz=166374, t=120.1s
+[ASR]   cons 4241/8384: n_free=20201, nnz=166374, t=120.7s
+[ASR]   cons 4251/8384: n_free=20201, nnz=166374, t=121.2s
+[ASR]   cons 4261/8384: n_free=20201, nnz=166374, t=121.7s
+[ASR]   cons 4271/8384: n_free=20201, nnz=166374, t=122.2s
+[ASR]   cons 4281/8384: n_free=20201, nnz=166374, t=122.8s
+[ASR]   cons 4291/8384: n_free=20174, nnz=166509, t=123.4s
+[ASR]   cons 4301/8384: n_free=20174, nnz=166509, t=123.9s
+[ASR]   cons 4311/8384: n_free=20174, nnz=166509, t=124.5s
+[ASR]   cons 4321/8384: n_free=20156, nnz=169523, t=125.0s
+[ASR]   cons 4331/8384: n_free=20156, nnz=169523, t=125.6s
+[ASR]   cons 4341/8384: n_free=20156, nnz=169523, t=126.1s
+[ASR]   cons 4351/8384: n_free=20156, nnz=169523, t=126.7s
+[ASR]   cons 4361/8384: n_free=20156, nnz=169523, t=127.2s
+[ASR]   cons 4371/8384: n_free=20156, nnz=169523, t=127.8s
+[ASR]   cons 4381/8384: n_free=20138, nnz=171178, t=128.4s
+[ASR]   cons 4391/8384: n_free=20126, nnz=173103, t=129.0s
+[ASR]   cons 4401/8384: n_free=20126, nnz=173103, t=129.5s
+[ASR]   cons 4411/8384: n_free=20126, nnz=173103, t=130.1s
+[ASR]   cons 4421/8384: n_free=20126, nnz=173103, t=130.7s
+[ASR]   cons 4431/8384: n_free=20126, nnz=173103, t=131.2s
+[ASR]   cons 4441/8384: n_free=20099, nnz=176643, t=131.9s
+[ASR]   cons 4451/8384: n_free=20099, nnz=176643, t=132.5s
+[ASR]   cons 4461/8384: n_free=20072, nnz=178471, t=133.1s
+[ASR]   cons 4471/8384: n_free=20072, nnz=178471, t=133.7s
+[ASR]   cons 4481/8384: n_free=20072, nnz=178471, t=134.3s
+[ASR]   cons 4491/8384: n_free=20045, nnz=181897, t=134.9s
+[ASR]   cons 4501/8384: n_free=20045, nnz=181897, t=135.5s
+[ASR]   cons 4511/8384: n_free=20045, nnz=181897, t=136.1s
+[ASR]   cons 4521/8384: n_free=20045, nnz=181897, t=136.7s
+[ASR]   cons 4531/8384: n_free=20018, nnz=185146, t=137.4s
+[ASR]   cons 4541/8384: n_free=20018, nnz=185146, t=138.0s
+[ASR]   cons 4551/8384: n_free=20018, nnz=185146, t=138.7s
+[ASR]   cons 4561/8384: n_free=20018, nnz=185146, t=139.3s
+[ASR]   cons 4571/8384: n_free=19991, nnz=188358, t=140.0s
+[ASR]   cons 4581/8384: n_free=19991, nnz=188358, t=140.6s
+[ASR]   cons 4591/8384: n_free=19991, nnz=188358, t=141.2s
+[ASR]   cons 4601/8384: n_free=19991, nnz=188358, t=141.8s
+[ASR]   cons 4611/8384: n_free=19991, nnz=188358, t=142.5s
+[ASR]   cons 4621/8384: n_free=19991, nnz=188358, t=143.1s
+[ASR]   cons 4631/8384: n_free=19991, nnz=188358, t=143.7s
+[ASR]   cons 4641/8384: n_free=19991, nnz=188358, t=144.3s
+[ASR]   cons 4651/8384: n_free=19964, nnz=188520, t=145.0s
+[ASR]   cons 4661/8384: n_free=19964, nnz=188520, t=145.7s
+[ASR]   cons 4671/8384: n_free=19964, nnz=188520, t=146.3s
+[ASR]   cons 4681/8384: n_free=19937, nnz=188736, t=147.0s
+[ASR]   cons 4691/8384: n_free=19919, nnz=192025, t=147.7s
+[ASR]   cons 4701/8384: n_free=19919, nnz=192025, t=148.3s
+[ASR]   cons 4711/8384: n_free=19919, nnz=192025, t=149.0s
+[ASR]   cons 4721/8384: n_free=19919, nnz=192025, t=149.6s
+[ASR]   cons 4731/8384: n_free=19901, nnz=193139, t=150.3s
+[ASR]   cons 4741/8384: n_free=19901, nnz=193139, t=150.9s
+[ASR]   cons 4751/8384: n_free=19874, nnz=195297, t=151.7s
+[ASR]   cons 4761/8384: n_free=19874, nnz=195297, t=152.3s
+[ASR]   cons 4771/8384: n_free=19874, nnz=195297, t=153.0s
+[ASR]   cons 4781/8384: n_free=19874, nnz=195297, t=153.6s
+[ASR]   cons 4791/8384: n_free=19874, nnz=195297, t=154.2s
+[ASR]   cons 4801/8384: n_free=19874, nnz=195297, t=154.9s
+[ASR]   cons 4811/8384: n_free=19847, nnz=196254, t=155.6s
+[ASR]   cons 4821/8384: n_free=19847, nnz=196254, t=156.2s
+[ASR]   cons 4831/8384: n_free=19847, nnz=196254, t=156.8s
+[ASR]   cons 4841/8384: n_free=19847, nnz=196254, t=157.4s
+[ASR]   cons 4851/8384: n_free=19847, nnz=196254, t=158.1s
+[ASR]   cons 4861/8384: n_free=19847, nnz=196254, t=158.7s
+[ASR]   cons 4871/8384: n_free=19847, nnz=196254, t=159.3s
+[ASR]   cons 4881/8384: n_free=19847, nnz=196254, t=160.0s
+[ASR]   cons 4891/8384: n_free=19847, nnz=196254, t=160.6s
+[ASR]   cons 4901/8384: n_free=19847, nnz=196254, t=161.3s
+[ASR]   cons 4911/8384: n_free=19820, nnz=198150, t=162.0s
+[ASR]   cons 4921/8384: n_free=19793, nnz=200306, t=162.8s
+[ASR]   cons 4931/8384: n_free=19793, nnz=200306, t=163.4s
+[ASR]   cons 4941/8384: n_free=19793, nnz=200306, t=164.1s
+[ASR]   cons 4951/8384: n_free=19793, nnz=200306, t=164.7s
+[ASR]   cons 4961/8384: n_free=19793, nnz=200306, t=165.4s
+[ASR]   cons 4971/8384: n_free=19766, nnz=202477, t=166.2s
+[ASR]   cons 4981/8384: n_free=19766, nnz=202477, t=166.8s
+[ASR]   cons 4991/8384: n_free=19766, nnz=202477, t=167.5s
+[ASR]   cons 5001/8384: n_free=19766, nnz=202477, t=168.2s
+[ASR]   cons 5011/8384: n_free=19766, nnz=202477, t=168.9s
+[ASR]   cons 5021/8384: n_free=19766, nnz=202477, t=169.6s
+[ASR]   cons 5031/8384: n_free=19766, nnz=202477, t=170.2s
+[ASR]   cons 5041/8384: n_free=19739, nnz=202585, t=171.0s
+[ASR]   cons 5051/8384: n_free=19721, nnz=204801, t=171.8s
+[ASR]   cons 5061/8384: n_free=19721, nnz=204801, t=172.5s
+[ASR]   cons 5071/8384: n_free=19703, nnz=207132, t=173.2s
+[ASR]   cons 5081/8384: n_free=19703, nnz=207132, t=173.9s
+[ASR]   cons 5091/8384: n_free=19703, nnz=207132, t=174.6s
+[ASR]   cons 5101/8384: n_free=19703, nnz=207132, t=175.3s
+[ASR]   cons 5111/8384: n_free=19676, nnz=209362, t=176.1s
+[ASR]   cons 5121/8384: n_free=19676, nnz=209362, t=176.8s
+[ASR]   cons 5131/8384: n_free=19676, nnz=209362, t=177.5s
+[ASR]   cons 5141/8384: n_free=19676, nnz=209362, t=178.2s
+[ASR]   cons 5151/8384: n_free=19676, nnz=209362, t=178.9s
+[ASR]   cons 5161/8384: n_free=19676, nnz=209362, t=179.6s
+[ASR]   cons 5171/8384: n_free=19676, nnz=209362, t=180.3s
+[ASR]   cons 5181/8384: n_free=19676, nnz=209362, t=181.1s
+[ASR]   cons 5191/8384: n_free=19676, nnz=209362, t=181.8s
+[ASR]   cons 5201/8384: n_free=19676, nnz=209362, t=182.5s
+[ASR]   cons 5211/8384: n_free=19676, nnz=209362, t=183.2s
+[ASR]   cons 5221/8384: n_free=19676, nnz=209362, t=183.9s
+[ASR]   cons 5231/8384: n_free=19649, nnz=211952, t=184.7s
+[ASR]   cons 5241/8384: n_free=19622, nnz=214109, t=185.5s
+[ASR]   cons 5251/8384: n_free=19622, nnz=214109, t=186.2s
+[ASR]   cons 5261/8384: n_free=19622, nnz=214109, t=187.0s
+[ASR]   cons 5271/8384: n_free=19595, nnz=214244, t=187.8s
+[ASR]   cons 5281/8384: n_free=19595, nnz=214244, t=188.5s
+[ASR]   cons 5291/8384: n_free=19595, nnz=214244, t=189.3s
+[ASR]   cons 5301/8384: n_free=19595, nnz=214244, t=190.0s
+[ASR]   cons 5311/8384: n_free=19595, nnz=214244, t=190.7s
+[ASR]   cons 5321/8384: n_free=19595, nnz=214244, t=191.4s
+[ASR]   cons 5331/8384: n_free=19595, nnz=214244, t=192.1s
+[ASR]   cons 5341/8384: n_free=19595, nnz=214244, t=192.9s
+[ASR]   cons 5351/8384: n_free=19568, nnz=215978, t=193.7s
+[ASR]   cons 5361/8384: n_free=19568, nnz=215978, t=194.4s
+[ASR]   cons 5371/8384: n_free=19550, nnz=217694, t=195.2s
+[ASR]   cons 5381/8384: n_free=19550, nnz=217694, t=195.9s
+[ASR]   cons 5391/8384: n_free=19532, nnz=219270, t=196.7s
+[ASR]   cons 5401/8384: n_free=19532, nnz=219270, t=197.4s
+[ASR]   cons 5411/8384: n_free=19532, nnz=219270, t=198.2s
+[ASR]   cons 5421/8384: n_free=19532, nnz=219270, t=198.9s
+[ASR]   cons 5431/8384: n_free=19532, nnz=219270, t=199.6s
+[ASR]   cons 5441/8384: n_free=19532, nnz=219270, t=200.4s
+[ASR]   cons 5451/8384: n_free=19532, nnz=219270, t=201.1s
+[ASR]   cons 5461/8384: n_free=19532, nnz=219270, t=201.8s
+[ASR]   cons 5471/8384: n_free=19532, nnz=219270, t=202.5s
+[ASR]   cons 5481/8384: n_free=19505, nnz=223648, t=203.4s
+[ASR]   cons 5491/8384: n_free=19478, nnz=227297, t=204.2s
+[ASR]   cons 5501/8384: n_free=19451, nnz=231057, t=205.1s
+[ASR]   cons 5511/8384: n_free=19424, nnz=234923, t=206.0s
+[ASR]   cons 5521/8384: n_free=19424, nnz=234923, t=206.8s
+[ASR]   cons 5531/8384: n_free=19424, nnz=234923, t=207.6s
+[ASR]   cons 5541/8384: n_free=19424, nnz=234923, t=208.4s
+[ASR]   cons 5551/8384: n_free=19424, nnz=234923, t=209.2s
+[ASR]   cons 5561/8384: n_free=19424, nnz=234923, t=210.0s
+[ASR]   cons 5571/8384: n_free=19424, nnz=234923, t=210.8s
+[ASR]   cons 5581/8384: n_free=19424, nnz=234923, t=211.6s
+[ASR]   cons 5591/8384: n_free=19424, nnz=234923, t=212.4s
+[ASR]   cons 5601/8384: n_free=19424, nnz=234923, t=213.2s
+[ASR]   cons 5611/8384: n_free=19424, nnz=234923, t=213.9s
+[ASR]   cons 5621/8384: n_free=19424, nnz=234923, t=214.7s
+[ASR]   cons 5631/8384: n_free=19424, nnz=234923, t=215.5s
+[ASR]   cons 5641/8384: n_free=19424, nnz=234923, t=216.3s
+[ASR]   cons 5651/8384: n_free=19424, nnz=234923, t=217.1s
+[ASR]   cons 5661/8384: n_free=19370, nnz=242802, t=218.1s
+[ASR]   cons 5671/8384: n_free=19343, nnz=246782, t=219.0s
+[ASR]   cons 5681/8384: n_free=19325, nnz=250765, t=219.9s
+[ASR]   cons 5691/8384: n_free=19307, nnz=252673, t=220.9s
+[ASR]   cons 5701/8384: n_free=19307, nnz=252673, t=221.8s
+[ASR]   cons 5711/8384: n_free=19307, nnz=252673, t=222.6s
+[ASR]   cons 5721/8384: n_free=19280, nnz=256298, t=223.6s
+[ASR]   cons 5731/8384: n_free=19280, nnz=256298, t=224.5s
+[ASR]   cons 5741/8384: n_free=19280, nnz=256298, t=225.4s
+[ASR]   cons 5751/8384: n_free=19280, nnz=256298, t=226.3s
+[ASR]   cons 5761/8384: n_free=19280, nnz=256298, t=227.2s
+[ASR]   cons 5771/8384: n_free=19280, nnz=256298, t=228.1s
+[ASR]   cons 5781/8384: n_free=19280, nnz=256298, t=229.0s
+[ASR]   cons 5791/8384: n_free=19280, nnz=256298, t=229.9s
+[ASR]   cons 5801/8384: n_free=19280, nnz=256298, t=230.8s
+[ASR]   cons 5811/8384: n_free=19280, nnz=256298, t=231.7s
+[ASR]   cons 5821/8384: n_free=19280, nnz=256298, t=232.6s
+[ASR]   cons 5831/8384: n_free=19253, nnz=258984, t=233.6s
+[ASR]   cons 5841/8384: n_free=19253, nnz=258984, t=234.5s
+[ASR]   cons 5851/8384: n_free=19226, nnz=261851, t=235.5s
+[ASR]   cons 5861/8384: n_free=19226, nnz=261851, t=236.4s
+[ASR]   cons 5871/8384: n_free=19199, nnz=264685, t=237.4s
+[ASR]   cons 5881/8384: n_free=19172, nnz=264847, t=238.4s
+[ASR]   cons 5891/8384: n_free=19172, nnz=264847, t=239.3s
+[ASR]   cons 5901/8384: n_free=19145, nnz=267732, t=240.4s
+[ASR]   cons 5911/8384: n_free=19145, nnz=267732, t=241.3s
+[ASR]   cons 5921/8384: n_free=19145, nnz=267732, t=242.2s
+[ASR]   cons 5931/8384: n_free=19127, nnz=270662, t=243.2s
+[ASR]   cons 5941/8384: n_free=19127, nnz=270662, t=244.1s
+[ASR]   cons 5951/8384: n_free=19127, nnz=270662, t=245.1s
+[ASR]   cons 5961/8384: n_free=19127, nnz=270662, t=246.0s
+[ASR]   cons 5971/8384: n_free=19109, nnz=273202, t=247.0s
+[ASR]   cons 5981/8384: n_free=19109, nnz=273202, t=247.9s
+[ASR]   cons 5991/8384: n_free=19109, nnz=273202, t=248.9s
+[ASR]   cons 6001/8384: n_free=19082, nnz=276800, t=250.0s
+[ASR]   cons 6011/8384: n_free=19082, nnz=276800, t=250.9s
+[ASR]   cons 6021/8384: n_free=19082, nnz=276800, t=251.9s
+[ASR]   cons 6031/8384: n_free=19082, nnz=276800, t=252.8s
+[ASR]   cons 6041/8384: n_free=19082, nnz=276800, t=253.8s
+[ASR]   cons 6051/8384: n_free=19082, nnz=276800, t=254.7s
+[ASR]   cons 6061/8384: n_free=19082, nnz=276800, t=255.7s
+[ASR]   cons 6071/8384: n_free=19082, nnz=276800, t=256.7s
+[ASR]   cons 6081/8384: n_free=19082, nnz=276800, t=257.7s
+[ASR]   cons 6091/8384: n_free=19082, nnz=276800, t=258.7s
+[ASR]   cons 6101/8384: n_free=19082, nnz=276800, t=259.6s
+[ASR]   cons 6111/8384: n_free=19055, nnz=277811, t=260.7s
+[ASR]   cons 6121/8384: n_free=19055, nnz=277811, t=261.7s
+[ASR]   cons 6131/8384: n_free=19001, nnz=281340, t=262.9s
+[ASR]   cons 6141/8384: n_free=19001, nnz=281340, t=263.8s
+[ASR]   cons 6151/8384: n_free=18974, nnz=284773, t=264.9s
+[ASR]   cons 6161/8384: n_free=18947, nnz=288272, t=266.0s
+[ASR]   cons 6171/8384: n_free=18947, nnz=288272, t=267.0s
+[ASR]   cons 6181/8384: n_free=18920, nnz=291825, t=268.2s
+[ASR]   cons 6191/8384: n_free=18920, nnz=291825, t=269.2s
+[ASR]   cons 6201/8384: n_free=18902, nnz=295378, t=270.3s
+[ASR]   cons 6211/8384: n_free=18902, nnz=295378, t=271.4s
+[ASR]   cons 6221/8384: n_free=18902, nnz=295378, t=272.4s
+[ASR]   cons 6231/8384: n_free=18902, nnz=295378, t=273.5s
+[ASR]   cons 6241/8384: n_free=18884, nnz=298807, t=274.6s
+[ASR]   cons 6251/8384: n_free=18884, nnz=298807, t=275.7s
+[ASR]   cons 6261/8384: n_free=18884, nnz=298807, t=276.7s
+[ASR]   cons 6271/8384: n_free=18857, nnz=301993, t=277.9s
+[ASR]   cons 6281/8384: n_free=18857, nnz=301993, t=278.9s
+[ASR]   cons 6291/8384: n_free=18857, nnz=301993, t=280.0s
+[ASR]   cons 6301/8384: n_free=18830, nnz=304894, t=281.2s
+[ASR]   cons 6311/8384: n_free=18830, nnz=304894, t=282.2s
+[ASR]   cons 6321/8384: n_free=18830, nnz=304894, t=283.3s
+[ASR]   cons 6331/8384: n_free=18830, nnz=304894, t=284.3s
+[ASR]   cons 6341/8384: n_free=18830, nnz=304894, t=285.4s
+[ASR]   cons 6351/8384: n_free=18830, nnz=304894, t=286.4s
+[ASR]   cons 6361/8384: n_free=18830, nnz=304894, t=287.5s
+[ASR]   cons 6371/8384: n_free=18803, nnz=308707, t=288.7s
+[ASR]   cons 6381/8384: n_free=18803, nnz=308707, t=289.8s
+[ASR]   cons 6391/8384: n_free=18803, nnz=308707, t=290.8s
+[ASR]   cons 6401/8384: n_free=18776, nnz=313491, t=292.1s
+[ASR]   cons 6411/8384: n_free=18776, nnz=313491, t=293.2s
+[ASR]   cons 6421/8384: n_free=18749, nnz=318311, t=294.4s
+[ASR]   cons 6431/8384: n_free=18722, nnz=323143, t=295.6s
+[ASR]   cons 6441/8384: n_free=18722, nnz=323143, t=296.8s
+[ASR]   cons 6451/8384: n_free=18695, nnz=323323, t=298.1s
+[ASR]   cons 6461/8384: n_free=18677, nnz=328164, t=299.3s
+[ASR]   cons 6471/8384: n_free=18677, nnz=328164, t=300.5s
+[ASR]   cons 6481/8384: n_free=18677, nnz=328164, t=301.7s
+[ASR]   cons 6491/8384: n_free=18677, nnz=328164, t=302.9s
+[ASR]   cons 6501/8384: n_free=18659, nnz=333320, t=304.2s
+[ASR]   cons 6511/8384: n_free=18659, nnz=333320, t=305.5s
+[ASR]   cons 6521/8384: n_free=18632, nnz=338272, t=306.8s
+[ASR]   cons 6531/8384: n_free=18605, nnz=344000, t=308.2s
+[ASR]   cons 6541/8384: n_free=18605, nnz=344000, t=309.5s
+[ASR]   cons 6551/8384: n_free=18605, nnz=344000, t=310.8s
+[ASR]   cons 6561/8384: n_free=18605, nnz=344000, t=312.0s
+[ASR]   cons 6571/8384: n_free=18605, nnz=344000, t=313.3s
+[ASR]   cons 6581/8384: n_free=18605, nnz=344000, t=314.6s
+[ASR]   cons 6591/8384: n_free=18605, nnz=344000, t=315.8s
+[ASR]   cons 6601/8384: n_free=18605, nnz=344000, t=317.1s
+[ASR]   cons 6611/8384: n_free=18605, nnz=344000, t=318.4s
+[ASR]   cons 6621/8384: n_free=18578, nnz=347484, t=319.8s
+[ASR]   cons 6631/8384: n_free=18578, nnz=347484, t=321.1s
+[ASR]   cons 6641/8384: n_free=18551, nnz=350219, t=322.5s
+[ASR]   cons 6651/8384: n_free=18551, nnz=350219, t=323.7s
+[ASR]   cons 6661/8384: n_free=18524, nnz=354747, t=325.1s
+[ASR]   cons 6671/8384: n_free=18524, nnz=354747, t=326.4s
+[ASR]   cons 6681/8384: n_free=18470, nnz=359431, t=328.0s
+[ASR]   cons 6691/8384: n_free=18452, nnz=363983, t=329.4s
+[ASR]   cons 6701/8384: n_free=18452, nnz=363983, t=330.7s
+[ASR]   cons 6711/8384: n_free=18452, nnz=363983, t=332.0s
+[ASR]   cons 6721/8384: n_free=18452, nnz=363983, t=333.3s
+[ASR]   cons 6731/8384: n_free=18452, nnz=363983, t=334.7s
+[ASR]   cons 6741/8384: n_free=18434, nnz=367071, t=336.1s
+[ASR]   cons 6751/8384: n_free=18434, nnz=367071, t=337.5s
+[ASR]   cons 6761/8384: n_free=18407, nnz=373354, t=339.0s
+[ASR]   cons 6771/8384: n_free=18407, nnz=373354, t=340.5s
+[ASR]   cons 6781/8384: n_free=18380, nnz=379641, t=342.0s
+[ASR]   cons 6791/8384: n_free=18380, nnz=379641, t=343.5s
+[ASR]   cons 6801/8384: n_free=18380, nnz=379641, t=344.9s
+[ASR]   cons 6811/8384: n_free=18380, nnz=379641, t=346.3s
+[ASR]   cons 6821/8384: n_free=18353, nnz=384605, t=347.9s
+[ASR]   cons 6831/8384: n_free=18353, nnz=384605, t=349.3s
+[ASR]   cons 6841/8384: n_free=18353, nnz=384605, t=350.8s
+[ASR]   cons 6851/8384: n_free=18326, nnz=389722, t=352.4s
+[ASR]   cons 6861/8384: n_free=18299, nnz=395040, t=354.0s
+[ASR]   cons 6871/8384: n_free=18299, nnz=395040, t=355.5s
+[ASR]   cons 6881/8384: n_free=18299, nnz=395040, t=357.0s
+[ASR]   cons 6891/8384: n_free=18245, nnz=400631, t=358.7s
+[ASR]   cons 6901/8384: n_free=18245, nnz=400631, t=360.2s
+[ASR]   cons 6911/8384: n_free=18245, nnz=400631, t=361.7s
+[ASR]   cons 6921/8384: n_free=18218, nnz=400850, t=363.3s
+[ASR]   cons 6931/8384: n_free=18218, nnz=400850, t=364.9s
+[ASR]   cons 6941/8384: n_free=18218, nnz=400850, t=366.4s
+[ASR]   cons 6951/8384: n_free=18200, nnz=406276, t=368.0s
+[ASR]   cons 6961/8384: n_free=18182, nnz=410234, t=369.7s
+[ASR]   cons 6971/8384: n_free=18182, nnz=410234, t=371.2s
+[ASR]   cons 6981/8384: n_free=18182, nnz=410234, t=372.8s
+[ASR]   cons 6991/8384: n_free=18182, nnz=410234, t=374.3s
+[ASR]   cons 7001/8384: n_free=18155, nnz=417250, t=376.1s
+[ASR]   cons 7011/8384: n_free=18128, nnz=423450, t=377.8s
+[ASR]   cons 7021/8384: n_free=18128, nnz=423450, t=379.7s
+[ASR]   cons 7031/8384: n_free=18128, nnz=423450, t=381.3s
+[ASR]   cons 7041/8384: n_free=18101, nnz=429767, t=383.0s
+[ASR]   cons 7051/8384: n_free=18101, nnz=429767, t=384.6s
+[ASR]   cons 7061/8384: n_free=18101, nnz=429767, t=386.3s
+[ASR]   cons 7071/8384: n_free=18101, nnz=429767, t=387.9s
+[ASR]   cons 7081/8384: n_free=18047, nnz=445255, t=389.8s
+[ASR]   cons 7091/8384: n_free=18047, nnz=445255, t=391.4s
+[ASR]   cons 7101/8384: n_free=18047, nnz=445255, t=393.1s
+[ASR]   cons 7111/8384: n_free=18020, nnz=455465, t=394.9s
+[ASR]   cons 7121/8384: n_free=17993, nnz=465708, t=396.9s
+[ASR]   cons 7131/8384: n_free=17993, nnz=465708, t=398.7s
+[ASR]   cons 7141/8384: n_free=17975, nnz=475894, t=400.7s
+[ASR]   cons 7151/8384: n_free=17975, nnz=475894, t=402.5s
+[ASR]   cons 7161/8384: n_free=17957, nnz=480253, t=404.4s
+[ASR]   cons 7171/8384: n_free=17957, nnz=480253, t=406.3s
+[ASR]   cons 7181/8384: n_free=17930, nnz=485858, t=408.3s
+[ASR]   cons 7191/8384: n_free=17903, nnz=486611, t=410.2s
+[ASR]   cons 7201/8384: n_free=17903, nnz=486611, t=412.2s
+[ASR]   cons 7211/8384: n_free=17876, nnz=491656, t=414.3s
+[ASR]   cons 7221/8384: n_free=17876, nnz=491656, t=416.2s
+[ASR]   cons 7231/8384: n_free=17876, nnz=491656, t=418.1s
+[ASR]   cons 7241/8384: n_free=17876, nnz=491656, t=420.0s
+[ASR]   cons 7251/8384: n_free=17849, nnz=495636, t=422.1s
+[ASR]   cons 7261/8384: n_free=17849, nnz=495636, t=424.0s
+[ASR]   cons 7271/8384: n_free=17849, nnz=495636, t=425.9s
+[ASR]   cons 7281/8384: n_free=17849, nnz=495636, t=427.9s
+[ASR]   cons 7291/8384: n_free=17849, nnz=495636, t=429.8s
+[ASR]   cons 7301/8384: n_free=17822, nnz=500780, t=432.0s
+[ASR]   cons 7311/8384: n_free=17822, nnz=500780, t=434.0s
+[ASR]   cons 7321/8384: n_free=17795, nnz=505887, t=436.2s
+[ASR]   cons 7331/8384: n_free=17768, nnz=511051, t=438.3s
+[ASR]   cons 7341/8384: n_free=17723, nnz=521792, t=440.7s
+[ASR]   cons 7351/8384: n_free=17705, nnz=527579, t=442.9s
+[ASR]   cons 7361/8384: n_free=17705, nnz=527579, t=445.0s
+[ASR]   cons 7371/8384: n_free=17678, nnz=536451, t=447.3s
+[ASR]   cons 7381/8384: n_free=17651, nnz=537054, t=449.6s
+[ASR]   cons 7391/8384: n_free=17651, nnz=537054, t=451.7s
+[ASR]   cons 7401/8384: n_free=17651, nnz=537054, t=453.7s
+[ASR]   cons 7411/8384: n_free=17624, nnz=542954, t=456.1s
+[ASR]   cons 7421/8384: n_free=17624, nnz=542954, t=458.3s
+[ASR]   cons 7431/8384: n_free=17624, nnz=542954, t=460.5s
+[ASR]   cons 7441/8384: n_free=17624, nnz=542954, t=462.7s
+[ASR]   cons 7451/8384: n_free=17624, nnz=542954, t=464.9s
+[ASR]   cons 7461/8384: n_free=17624, nnz=542954, t=467.1s
+[ASR]   cons 7471/8384: n_free=17624, nnz=542954, t=469.2s
+[ASR]   cons 7481/8384: n_free=17624, nnz=542954, t=471.4s
+[ASR]   cons 7491/8384: n_free=17597, nnz=549503, t=473.8s
+[ASR]   cons 7501/8384: n_free=17543, nnz=562266, t=476.4s
+[ASR]   cons 7511/8384: n_free=17516, nnz=568070, t=478.9s
+[ASR]   cons 7521/8384: n_free=17498, nnz=573895, t=481.2s
+[ASR]   cons 7531/8384: n_free=17480, nnz=578725, t=483.7s
+[ASR]   cons 7541/8384: n_free=17453, nnz=584813, t=486.2s
+[ASR]   cons 7551/8384: n_free=17453, nnz=584813, t=488.5s
+[ASR]   cons 7561/8384: n_free=17453, nnz=584813, t=490.9s
+[ASR]   cons 7571/8384: n_free=17426, nnz=595490, t=493.4s
+[ASR]   cons 7581/8384: n_free=17426, nnz=595490, t=495.9s
+[ASR]   cons 7591/8384: n_free=17426, nnz=595490, t=498.3s
+[ASR]   cons 7601/8384: n_free=17426, nnz=595490, t=500.7s
+[ASR]   cons 7611/8384: n_free=17426, nnz=595490, t=503.2s
+[ASR]   cons 7621/8384: n_free=17426, nnz=595490, t=505.6s
+[ASR]   cons 7631/8384: n_free=17426, nnz=595490, t=508.1s
+[ASR]   cons 7641/8384: n_free=17426, nnz=595490, t=510.5s
+[ASR]   cons 7651/8384: n_free=17372, nnz=616478, t=513.3s
+[ASR]   cons 7661/8384: n_free=17345, nnz=628902, t=516.1s
+[ASR]   cons 7671/8384: n_free=17300, nnz=653855, t=519.0s
+[ASR]   cons 7681/8384: n_free=17300, nnz=653855, t=521.7s
+[ASR]   cons 7691/8384: n_free=17282, nnz=657655, t=524.6s
+[ASR]   cons 7701/8384: n_free=17282, nnz=657655, t=527.3s
+[ASR]   cons 7711/8384: n_free=17282, nnz=657655, t=530.0s
+[ASR]   cons 7721/8384: n_free=17282, nnz=657655, t=532.6s
+[ASR]   cons 7731/8384: n_free=17255, nnz=665080, t=535.6s
+[ASR]   cons 7741/8384: n_free=17255, nnz=665080, t=538.3s
+[ASR]   cons 7751/8384: n_free=17255, nnz=665080, t=541.0s
+[ASR]   cons 7761/8384: n_free=17255, nnz=665080, t=543.8s
+[ASR]   cons 7771/8384: n_free=17228, nnz=671511, t=546.7s
+[ASR]   cons 7781/8384: n_free=17228, nnz=671511, t=549.5s
+[ASR]   cons 7791/8384: n_free=17228, nnz=671511, t=552.3s
+[ASR]   cons 7801/8384: n_free=17174, nnz=681986, t=555.6s
+[ASR]   cons 7811/8384: n_free=17147, nnz=689170, t=558.7s
+[ASR]   cons 7821/8384: n_free=17129, nnz=696336, t=561.8s
+[ASR]   cons 7831/8384: n_free=17111, nnz=702826, t=564.9s
+[ASR]   cons 7841/8384: n_free=17111, nnz=702826, t=567.8s
+[ASR]   cons 7851/8384: n_free=17084, nnz=709851, t=570.9s
+[ASR]   cons 7861/8384: n_free=17057, nnz=713094, t=574.1s
+[ASR]   cons 7871/8384: n_free=17030, nnz=724905, t=577.5s
+[ASR]   cons 7881/8384: n_free=17003, nnz=727440, t=581.0s
+[ASR]   cons 7891/8384: n_free=17003, nnz=727440, t=584.0s
+[ASR]   cons 7901/8384: n_free=16976, nnz=737065, t=587.6s
+[ASR]   cons 7911/8384: n_free=16949, nnz=753103, t=591.2s
+[ASR]   cons 7921/8384: n_free=16949, nnz=753103, t=594.5s
+[ASR]   cons 7931/8384: n_free=16931, nnz=765959, t=597.9s
+[ASR]   cons 7941/8384: n_free=16931, nnz=765959, t=601.2s
+[ASR]   cons 7951/8384: n_free=16913, nnz=770764, t=604.7s
+[ASR]   cons 7961/8384: n_free=16913, nnz=770764, t=608.0s
+[ASR]   cons 7971/8384: n_free=16886, nnz=783240, t=611.6s
+[ASR]   cons 7981/8384: n_free=16859, nnz=792021, t=615.6s
+[ASR]   cons 7991/8384: n_free=16832, nnz=794954, t=619.3s
+[ASR]   cons 8001/8384: n_free=16805, nnz=805945, t=623.1s
+[ASR]   cons 8011/8384: n_free=16805, nnz=805945, t=626.7s
+[ASR]   cons 8021/8384: n_free=16778, nnz=806197, t=630.5s
+[ASR]   cons 8031/8384: n_free=16778, nnz=806197, t=634.0s
+[ASR]   cons 8041/8384: n_free=16778, nnz=806197, t=637.5s
+[ASR]   cons 8051/8384: n_free=16778, nnz=806197, t=641.0s
+[ASR]   cons 8061/8384: n_free=16742, nnz=824915, t=645.2s
+[ASR]   cons 8071/8384: n_free=16742, nnz=824915, t=648.8s
+[ASR]   cons 8081/8384: n_free=16715, nnz=840771, t=652.9s
+[ASR]   cons 8091/8384: n_free=16688, nnz=860396, t=656.9s
+[ASR]   cons 8101/8384: n_free=16661, nnz=860504, t=661.2s
+[ASR]   cons 8111/8384: n_free=16634, nnz=860900, t=665.4s
+[ASR]   cons 8121/8384: n_free=16616, nnz=878626, t=669.6s
+[ASR]   cons 8131/8384: n_free=16616, nnz=878626, t=673.6s
+[ASR]   cons 8141/8384: n_free=16616, nnz=878626, t=677.7s
+[ASR]   cons 8151/8384: n_free=16616, nnz=878626, t=681.8s
+[ASR]   cons 8161/8384: n_free=16598, nnz=886266, t=686.3s
+[ASR]   cons 8171/8384: n_free=16598, nnz=886266, t=690.3s
+[ASR]   cons 8181/8384: n_free=16544, nnz=911688, t=695.5s
+[ASR]   cons 8191/8384: n_free=16517, nnz=924891, t=700.3s
+[ASR]   cons 8201/8384: n_free=16499, nnz=935132, t=705.1s
+[ASR]   cons 8211/8384: n_free=16499, nnz=935132, t=709.3s
+[ASR]   cons 8221/8384: n_free=16499, nnz=935132, t=713.7s
+[ASR]   cons 8231/8384: n_free=16499, nnz=935132, t=718.0s
+[ASR]   cons 8241/8384: n_free=16481, nnz=946686, t=722.5s
+[ASR]   cons 8251/8384: n_free=16481, nnz=946686, t=726.8s
+[ASR]   cons 8261/8384: n_free=16455, nnz=974966, t=731.5s
+[ASR]   cons 8271/8384: n_free=16455, nnz=974966, t=736.1s
+[ASR]   cons 8281/8384: n_free=16455, nnz=974966, t=742.1s
+[ASR]   cons 8291/8384: n_free=16437, nnz=986824, t=748.9s
+[ASR]   cons 8301/8384: n_free=16419, nnz=1019399, t=755.8s
+[ASR]   cons 8311/8384: n_free=16419, nnz=1019399, t=763.9s
+[ASR]   cons 8321/8384: n_free=16401, nnz=1049759, t=771.2s
+[ASR]   cons 8331/8384: n_free=16401, nnz=1049759, t=776.0s
+[ASR]   cons 8341/8384: n_free=16383, nnz=1080849, t=781.4s
+[ASR]   cons 8351/8384: n_free=16374, nnz=1089447, t=786.9s
+[ASR]   cons 8361/8384: n_free=16329, nnz=1116332, t=793.0s
+[ASR]   cons 8371/8384: n_free=16311, nnz=1147795, t=799.2s
+[ASR]   cons 8381/8384: n_free=16311, nnz=1147795, t=805.5s
+[ASR]   cons 8384/8384: n_free=16311, nnz=1147795, t=807.6s
+[ASR] done: n_free=16311, eliminated=7067, skipped=219301, max|C@ns|=1.97e-15
+[2026-11-03 15:17:52,154] - [ns-rank] order 3: skipped (n_free=16311 > MAXCOL=5000)
+[2026-11-03 15:17:52,154] - Time cost: 0:13:32.666439.
+[2026-11-03 15:17:52,173] Summary of IFCs:
+[2026-11-03 15:17:52,173] - HARM    | IFC number: 75456 | Free IFC number: 74017
+[2026-11-03 15:17:52,320] - ANHARM3 | IFC number: 28458 | Free IFC number: 16311
+[2026-11-03 15:17:52,754] Total number of free IFCs: 90328
+[2026-11-03 15:17:52,770] Construction of symmetry constraints finished, time cost: 0:14:51.131977.
+[2026-11-03 15:17:52,792] Finalize Pheasy, total time cost: 0:14:57.879429.
+[pheasy] displacement matrix: pheasy-gpu --dim 2 2 1 -w 3 --c3 3.5 --eps 0.001 --symprec 1e-3 --fix_fc2 --fc2_fmt PHONOPY -d --ndata 296 --disp_file
+[2026-11-03 15:17:55,060] Start Pheasy.
+      ___         ___           ___           ___           ___                 
+     /\  \       /\  \         /\__\         /\  \         /\__\                
+    /::\  \      \:\  \       /:/ _/_       /::\  \       /:/ _/_         ___   
+   /:/\:\__\      \:\  \     /:/ /\__\     /:/\:\  \     /:/ /\  \       /|  |  
+  /:/ /:/  /  ___ /::\  \   /:/ /:/ _/_   /:/ /::\  \   /:/ /::\  \     |:|  |  
+ /:/_/:/  /  /\  /:/\:\__\ /:/_/:/ /\__\ /:/_/:/\:\__\ /:/_/:/\:\__\    |:|  |  
+ \:\/:/  /   \:\/:/  \/__/ \:\/:/ /:/  / \:\/:/  \/__/ \:\/:/ /:/  /  __|:|__|  
+  \::/__/     \::/__/       \::/_/:/  /   \::/__/       \::/ /:/  /  /::::\  \  
+   \:\  \      \:\  \        \:\/:/  /     \:\  \        \/_/:/  /   ~~~~\:\  \ 
+    \:\__\      \:\__\        \::/  /       \:\__\         /:/  /         \:\__\\
+     \/__/       \/__/         \/__/         \/__/         \/__/           \/__/ 
+                                                                                0.0.2
+[2026-11-03 15:17:55,068] System: C120Mg8
+[2026-11-03 15:17:55,068] Space group: C2/c (15), 4 symmetry operations found.
+[2026-11-03 15:17:55,068] Creating 2 x 2 x 1 supercell (512 atoms).
+[2026-11-03 15:17:55,279] Reading and generating cluster space from file, up to 3-order.
+[2026-11-03 15:18:02,521] Cutoff distance (A) for 2-order IFCs: inf
+[2026-11-03 15:18:02,521] Cutoff distance (A) for 3-order IFCs: 3.50
+[2026-11-03 15:18:02,522] Summary of cluster space:
+[2026-11-03 15:18:02,522] - HARM    | cluster number: 8384 | IFC number: 75456
+[2026-11-03 15:18:02,522] - ANHARM3 | cluster number: 1054 | IFC number: 28458
+[2026-11-03 15:18:02,522] Starting to construct sensing (displacement) matrix.
+[2026-11-03 15:18:02,522] Reading displaced configurations from file.
+[2026-11-03 15:18:14,832] - Parallel sensing matrix construction: 56 workers.
+[2026-11-03 15:20:28,288 - run_pheasy][ERROR] - Parallel sensing-matrix workers failed (TerminatedWorkerError: A worker process managed by the executor was unexpectedly terminated. This could be caused by a segmentation fault while calling the function or by an excessive memory usage causing the Operating System to kill the worker.
+
+The exit codes of the workers are {SIGTERM(-15)}
+Detailed tracebacks of the workers should have been printed to stderr in the executor process if faulthandler was not disabled.). This is almost always the OOM killer: every worker holds its own copy of the cluster space. Falling back to serial construction; set PHEASY_N_JOBS=1 to skip this attempt next time. (run_pheasy.py:602)
+[2026-11-03 15:23:12,763] - Sensing matrix: 10 / 296 configurations.
+[2026-11-03 15:25:56,728] - Sensing matrix: 20 / 296 configurations.
+[2026-11-03 15:28:42,410] - Sensing matrix: 30 / 296 configurations.
+[2026-11-03 15:31:29,498] - Sensing matrix: 40 / 296 configurations.
+[2026-11-03 15:34:15,433] - Sensing matrix: 50 / 296 configurations.
+[2026-11-03 15:37:01,569] - Sensing matrix: 60 / 296 configurations.
+[2026-11-03 15:39:47,938] - Sensing matrix: 70 / 296 configurations.
+[2026-11-03 15:42:34,081] - Sensing matrix: 80 / 296 configurations.
+[2026-11-03 15:45:19,239] - Sensing matrix: 90 / 296 configurations.
+[2026-11-03 15:48:04,861] - Sensing matrix: 100 / 296 configurations.
+[2026-11-03 15:50:47,163] - Sensing matrix: 110 / 296 configurations.
+[2026-11-03 15:53:25,037] - Sensing matrix: 120 / 296 configurations.
+[2026-11-03 15:56:03,783] - Sensing matrix: 130 / 296 configurations.
+[2026-11-03 15:58:40,032] - Sensing matrix: 140 / 296 configurations.
+[2026-11-03 16:01:17,733] - Sensing matrix: 150 / 296 configurations.
+[2026-11-03 16:04:21,253] - Sensing matrix: 160 / 296 configurations.
+[2026-11-03 16:07:58,266] - Sensing matrix: 170 / 296 configurations.
+[2026-11-03 16:11:17,963] - Sensing matrix: 180 / 296 configurations.
+[2026-11-03 16:15:07,690] - Sensing matrix: 190 / 296 configurations.
+[2026-11-03 16:18:17,657] - Sensing matrix: 200 / 296 configurations.
+[2026-11-03 16:21:52,778] - Sensing matrix: 210 / 296 configurations.
+[2026-11-03 16:25:22,938] - Sensing matrix: 220 / 296 configurations.
+[2026-11-03 16:28:58,624] - Sensing matrix: 230 / 296 configurations.
+[2026-11-03 16:32:29,842] - Sensing matrix: 240 / 296 configurations.
+[2026-11-03 16:35:57,583] - Sensing matrix: 250 / 296 configurations.
+[2026-11-03 16:38:57,847] - Sensing matrix: 260 / 296 configurations.
+[2026-11-03 16:42:22,574] - Sensing matrix: 270 / 296 configurations.
+[2026-11-03 16:45:42,656] - Sensing matrix: 280 / 296 configurations.
+[2026-11-03 16:49:18,549] - Sensing matrix: 290 / 296 configurations.
+[2026-11-03 16:51:13,216] - Sensing matrix: 296 / 296 configurations.
+[SM] streaming dense->sparse float32 conversion of 296 blocks...
+[SM] blocks converted in 9.3s, vstacking...
+[SM] vstack done in 1.0s: shape=(454656, 103914), nnz=1076099712, mem=8.61 GB (float32 sparse CSR)
+[2026-11-03 16:51:45,213] Construction of sensing (displacement) matrix finished, time cost: 1:33:42.690881.
+[2026-11-03 16:51:45,213] Finalize Pheasy, total time cost: 1:33:50.156357.
+[FIX_FC2] RFE plan: n=454656 p=16311 SM=29.7 GB Gram(19.2 GB raw) avail=203.8 GB GRAM_GB=21
+[FIX_FC2] using explicit PHEASY_RFE_GRAM_GB=21 (>= planned 21)
+[pheasy] fit: pheasy-gpu --dim 2 2 1 -w 3 --c3 3.5 --eps 0.001 --symprec 1e-3 --fix_fc2 --fc2_fmt PHONOPY -f --ndata 296 --full_ifc -l LASSO --hdf5 --seed 666666 --cv 5 --nmu 40 --mu_min -8 --mu_max -5 --max_iter 100000 --tol 1e-05
+[2026-11-03 16:51:52,767] Start Pheasy.
+/^^^^^^^  /^^     /^^/^^^^^^^^      /^         /^^ ^^  /^^      /^^
+/^^    /^^/^^     /^^/^^           /^ ^^     /^^    /^^ /^^    /^^ 
+/^^    /^^/^^     /^^/^^          /^  /^^     /^^        /^^ /^^   
+/^^^^^^^  /^^^^^^ /^^/^^^^^^     /^^   /^^      /^^        /^^     
+/^^       /^^     /^^/^^        /^^^^^^ /^^        /^^     /^^     
+/^^       /^^     /^^/^^       /^^       /^^ /^^    /^^    /^^     
+/^^       /^^     /^^/^^^^^^^^/^^         /^^  /^^ ^^      /^^  0.0.2
+[2026-11-03 16:51:52,792] System: C120Mg8
+[2026-11-03 16:51:52,793] Space group: C2/c (15), 4 symmetry operations found.
+[2026-11-03 16:51:52,793] Creating 2 x 2 x 1 supercell (512 atoms).
+[2026-11-03 16:51:53,174] Reading and generating cluster space from file, up to 3-order.
+[2026-11-03 16:52:02,228] Cutoff distance (A) for 2-order IFCs: inf
+[2026-11-03 16:52:02,228] Cutoff distance (A) for 3-order IFCs: 3.50
+[2026-11-03 16:52:02,229] Summary of cluster space:
+[2026-11-03 16:52:02,229] - HARM    | cluster number: 8384 | IFC number: 75456
+[2026-11-03 16:52:02,229] - ANHARM3 | cluster number: 1054 | IFC number: 28458
+[2026-11-03 16:52:02,229] Reconstructing null space of symmetry constraints from file.
+[2026-11-03 16:52:02,368] Summary of IFCs:
+[2026-11-03 16:52:02,368] - HARM    | IFC number: 75456 | Free IFC number: 74017
+[2026-11-03 16:52:02,368] - ANHARM3 | IFC number: 28458 | Free IFC number: 16311
+[2026-11-03 16:52:02,368] Total number of free IFCs: 90328
+[2026-11-03 16:52:02,368] Reconstructing sensing (displacement) matrix from file.
+[SM] sm_prime.npz load (narrow): shape=(454656, 103914) nnz=1076099712 data=4.30 GB indices=int32 (4.30 GB) indptr=int64 total=8.61 GB
+[2026-11-03 16:52:27,053] Starting to fit interatomic force constants.
+[2026-11-03 16:52:27,064] SM_prime kept sparse float32 CSR: shape=(454656, 103914), nnz=1076099712, mem=8.61 GB
+[2026-11-03 16:52:27,064 - run_pheasy][WARNING] - SM_prime is 8.6 GB in float32. Set PHEASY_SM_DTYPE=float32 to halve it (all matrices stay consistent). (run_pheasy.py:790)
+[2026-11-03 16:52:27,064] Reading interatomic forces, 296 configurations.
+[2026-11-03 16:52:27,180] Fix second-order IFCs during fitting.
+[2026-11-03 16:52:28,506] Reading second-order IFCs from fc.hdf5.
+[PATCH fix_fc2] parallel sparse.dot: (454656, 28458) x (28458, 16311), threads=56
+[PATCH fix_fc2] parallel sparse.dot done, SM=(454656, 16311)
+[SM-cache fix_fc2] saving sm_dense_fixfc2.npy (29.7 GB)...
+[SM-cache fix_fc2] saved in 43.3s
+[run_pheasy] PHEASY_USE_RFE=1 detected, switching LASSO -> RFE-OLS
+[2026-11-03 17:08:49,458] [HARM_DENSE] ignored: FIX_FC2 already removes the harmonic block from the fit.
+[2026-11-03 17:08:49,459] Fitting force constants via Recursive Feature Elimination (RFE-OLS) with OLS base estimator (scale-invariant importance, grouped CV).
+[RFE] START n_features=16311, step=0.05, cv=5, min_features=1, patience=5, solver=lstsq, ridge_alpha=0.00e+00
+[OK] RFE START early check: n_features=16311 step=0.05 ridge=0.0
+[RFE] exact Gram CV from round 0 (n_active=16311): per-fold float64 Grams (5 folds, 12.77 GB) built in 649.2s; this and every later round are solved exactly (no iterative precision floor)
+[RFE] Round   0: n_active=16311  CV_RMSE=6.890690e-03 (+-1.49e-05)  nonzero=16311
+[RFE] Round   1: n_active=15495  CV_RMSE=6.874634e-03 (+-1.49e-05)  nonzero=15495
+[RFE] Round   2: n_active=14720  CV_RMSE=6.860237e-03 (+-1.49e-05)  nonzero=14720
+[RFE] Round   3: n_active=13984  CV_RMSE=6.847907e-03 (+-1.48e-05)  nonzero=13984
+[RFE] Round   4: n_active=13285  CV_RMSE=6.839065e-03 (+-1.46e-05)  nonzero=13285
+[RFE] Round   5: n_active=12621  CV_RMSE=6.831547e-03 (+-1.45e-05)  nonzero=12621
+[RFE] Round   6: n_active=11990  CV_RMSE=6.826399e-03 (+-1.44e-05)  nonzero=11990
+[RFE] Round   7: n_active=11390  CV_RMSE=6.824913e-03 (+-1.44e-05)  nonzero=11390
+[RFE] Round   8: n_active=10820  CV_RMSE=6.826312e-03 (+-1.41e-05)  nonzero=10820
+[RFE] Round   9: n_active=10279  CV_RMSE=6.830469e-03 (+-1.39e-05)  nonzero=10279
+[RFE] Round  10: n_active= 9765  CV_RMSE=6.839079e-03 (+-1.36e-05)  nonzero=9765
+[RFE] Round  11: n_active= 9277  CV_RMSE=6.853827e-03 (+-1.36e-05)  nonzero=9277
+[RFE] Round  12: n_active= 8813  CV_RMSE=6.870226e-03 (+-1.36e-05)  nonzero=8813
+[RFE] CV 连续 5 轮无改善, 提前停止.
+[RFE] argmin: n_active=11390, CV=6.824913e-03
+[RFE] selected: n_active=9765, CV=6.839079e-03 (+-1.36e-05)
+[RFE] final refit: direct least-squares solve (dense QR/SVD) on 9765 features
+<gpu-host>:/home/miniconda3/envs/mace-gpu/lib/python3.11/site-packages/torch/cuda/__init__.py:716: UserWarning: Can't initialize NVML
+  warnings.warn("Can't initialize NVML")
+[GPU] PHEASY_GPU_DEVICE unset: auto-selected cuda:1 (most free VRAM: 23.43 GiB of 5 visible)
+[2026-11-03 19:00:24,477] [fix_fc2] relative force error: 7.580312e-03 of the total forces (8.986450e-02 of the anharmonic residual the fit saw)
+[2026-11-03 19:00:24,487] Summary of force constants fitting:
+[2026-11-03 19:00:24,488] - RFE finished after 12 rounds.
+[2026-11-03 19:00:24,488] - feature-count criterion: CV + 1-SE
+[2026-11-03 19:00:24,488] - ridge_alpha: 0.0
+[2026-11-03 19:00:24,488] - best CV RMSE: 0.0068390789909476305 eV/A
+[2026-11-03 19:00:24,488] - selected features: 9765 of 16311
+[2026-11-03 19:00:24,488] - RMSE: 0.006582625110633144 eV/A
+[2026-11-03 19:00:24,488] - Relative error: 0.08986450177984051
+[2026-11-03 19:00:24,488] - Number of coefficient columns: 16311 (numerical rank not estimated)
+[2026-11-03 19:00:24,488] - Free IFC terms: 16311
+[2026-11-03 19:00:24,488] - Non-zero IFC terms: 9765
+[2026-11-03 19:00:24,492] [fit] alignment check OK (worst corr=1.0000)
+[2026-11-03 19:03:39,294] Writing third-order force constants into file.
+[2026-11-03 19:03:39,295] Force constant fitting finished, time cost: 2:11:12.241518.
+[2026-11-03 19:03:39,933] Finalize Pheasy, total time cost: 2:11:47.170484.
+[OK] FIX_FC2 scan standard verified from pheasy manifest: {'PHEASY_RFE_STEP': '0.05', 'PHEASY_RFE_RIDGE_ALPHA': '0', 'PHEASY_RFE_1SE': '1', 'PHEASY_SM_DTYPE': 'float32', 'PHEASY_RFE_GRAM_GB': '21'}
+[OK] FIX_FC2 artifact check: NDATA {'log': 296, 'cmdline': 296, 'prep': 296, 'pkl': 296, 'sm_meta': 296} + SM matrix (454656, 16311)
+[OK] FIX_FC2 gate: fix_fc2 contract satisfied
+[OK] FIX_FC2 re_total_forces=0.00758 <= 0.05
+[DONE] fit_pheasy: method=RFE-OLS ndata=296 dim=2 2 1

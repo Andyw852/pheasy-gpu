@@ -1,0 +1,1 @@
+pheasy-gpu --dim 2 2 1 -w 3 --c3 3.5 --eps 0.001 -f --ndata 296 --full_ifc -l LASSO --hdf5 --seed 666666 --cv 5 --nmu 40 --mu_min -8 --mu_max -5 --max_iter 100000 --tol 1e-05

@@ -1,0 +1,171 @@
+{
+  "pheasy_rmse_train": 0.006582625110633144,
+  "pheasy_relative_error": 0.08986450177984051,
+  "pheasy_re_total_forces": 0.007580311922715871,
+  "pheasy_rmse_cv": 0.0068390789909476305,
+  "pheasy_worst_force_correlation": 1.0,
+  "pheasy_free_ifcs": 16311,
+  "pheasy_cv_hit_cap": false,
+  "pheasy_cv_warning": false,
+  "pheasy_gpu_evidence": [],
+  "pheasy_gpu_used": false,
+  "fix_self_proof": {
+    "ok": true,
+    "fails": [],
+    "start_n_features": 16311,
+    "plan_p": 16311
+  },
+  "mem_probe": {
+    "via": "import",
+    "module": "pheasy_gpu.core.optimizer",
+    "file": "<gpu-host>:/home/software/pheasy-gpu-gh/core/optimizer.py",
+    "md5": "846e8322f61a4467ddd1884b630745c1"
+  },
+  "driver_md5": "f069d1aa9a3af63a3242a1882ac84bfe",
+  "fix_scan_active": true,
+  "rfe_plan": {
+    "n": 454656,
+    "p": 16311,
+    "sm_bytes": 29663576064,
+    "gram_bytes": 19155507912,
+    "gram_gb": 21,
+    "avail_bytes": 203783639040,
+    "sm_gb": 29.66,
+    "gram_gb_raw": 19.16,
+    "errors": [],
+    "gram_gb_override": 21
+  },
+  "scan_check": {
+    "ok": true,
+    "checks": {
+      "present_PHEASY_RFE_STEP": true,
+      "present_PHEASY_RFE_RIDGE_ALPHA": true,
+      "present_PHEASY_RFE_1SE": true,
+      "present_PHEASY_SM_DTYPE": true,
+      "present_PHEASY_RFE_GRAM_GB": true,
+      "manifest_step": true,
+      "manifest_ridge": true,
+      "manifest_1se": true,
+      "manifest_sm_dtype": true,
+      "gram_gb": true,
+      "gram_from_round0": true,
+      "execution_backend": true,
+      "rfe_gram_n_features": true,
+      "start_fields": true,
+      "pheasy_code_md5": true
+    },
+    "reasons": [],
+    "manifest_environment": {
+      "PHEASY_RFE_STEP": "0.05",
+      "PHEASY_RFE_RIDGE_ALPHA": "0",
+      "PHEASY_RFE_1SE": "1",
+      "PHEASY_SM_DTYPE": "float32",
+      "PHEASY_RFE_GRAM_GB": "21"
+    },
+    "manifest_code": {
+      "optimizer": {
+        "md5": "846e8322f61a4467ddd1884b630745c1",
+        "path": "<gpu-host>:/home/software/pheasy-gpu-gh/core/optimizer.py"
+      },
+      "run_pheasy": {
+        "md5": "9390b4cd2a5416e6e8332d71a261512f",
+        "path": "<gpu-host>:/home/software/pheasy-gpu-gh/run_pheasy.py"
+      }
+    },
+    "present": {
+      "PHEASY_RFE_STEP": true,
+      "PHEASY_RFE_RIDGE_ALPHA": true,
+      "PHEASY_RFE_1SE": true,
+      "PHEASY_SM_DTYPE": true,
+      "PHEASY_RFE_GRAM_GB": true
+    },
+    "start_line": "[RFE] START n_features=16311, step=0.05, cv=5, min_features=1, patience=5, solver=lstsq, ridge_alpha=0.00e+00",
+    "start_params": {
+      "n_features": 16311,
+      "step": 0.05,
+      "cv": 5,
+      "min_features": 1,
+      "patience": 5,
+      "solver": "lstsq",
+      "ridge_alpha": 0.0
+    },
+    "exact_gram_log_line": true,
+    "code_md5": "846e8322f61a4467ddd1884b630745c1",
+    "probe_md5": "846e8322f61a4467ddd1884b630745c1",
+    "failed_checks": []
+  },
+  "rfe_start_mismatch": false,
+  "fit_artifact_check": {
+    "checks": {
+      "force_matrix_not_short": true,
+      "ndata_all_present": true,
+      "ndata_consistent": true,
+      "pkl_rows": true,
+      "sm_ok": true
+    },
+    "reasons": [],
+    "ndata": {
+      "log": 296,
+      "cmdline": 296,
+      "prep": 296,
+      "pkl": 296,
+      "sm_meta": 296
+    },
+    "short_force_matrix_warning": null,
+    "sm": {
+      "checks": {
+        "sm_dtype": true,
+        "sm_shape": true,
+        "meta_dtype": true,
+        "meta_ndata": true,
+        "meta_excluded_empty": true,
+        "meta_shape_p": true
+      },
+      "reasons": [],
+      "sm_shape": [
+        454656,
+        16311
+      ],
+      "sm_dtype": "float32",
+      "meta": {
+        "src": [
+          "sm_prime.npz",
+          8610617741,
+          1793695905209932468
+        ],
+        "smp3_shape": [
+          454656,
+          28458
+        ],
+        "smp3_nnz": 377748096,
+        "smp3_digest": "097be65e17fa3b03dc3cd5cd0ac67cc7d375f31ab4bb7820f0710ef255e7f89a",
+        "ns_shape": [
+          28458,
+          16311
+        ],
+        "ns_digest": "5b4e1a45e9897f3fc94b8ae22bc509338e94b09a096fecd3a8fe3938623c701f",
+        "excluded_configs": [],
+        "dtype": "float32",
+        "ndata": 296
+      },
+      "ok": true,
+      "failed_checks": []
+    },
+    "ok": true,
+    "failed_checks": []
+  },
+  "pheasy_method": "RFE-OLS",
+  "fit_method_configured": "RFE-OLS",
+  "fit_method_delivered": "RFE-OLS",
+  "alpha_star": null,
+  "alpha_star_source": "not_applicable",
+  "pheasy_gpu_requested": false,
+  "pheasy_gpu_resident": false,
+  "pheasy_lasso_twolevel": false,
+  "fix_fc2": {
+    "enabled": true,
+    "sha256": "264eae0f807e7fc40e0714c548fbc3062c66f76400a6c92e215fcc564aee6b5f",
+    "gate": "pass",
+    "reason": "fix_fc2 contract satisfied"
+  }
+}
