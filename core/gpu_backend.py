@@ -2456,6 +2456,36 @@ def _cuda_spmv_block_budget_counts(row_shape, row_nnz, trans_shape, trans_nnz,
     return resident + vectors + workspace
 
 
+_CUDA_INT32_LIMIT = 2 ** 31 - 1
+# 10% headroom: _balanced_shard_edges equalises nonzeros per shard, but the
+# boundary rounding at a row can leave a shard a little above the target.
+_CUDA_SHARD_SAFE_NNZ = int(_CUDA_INT32_LIMIT * 0.90)
+
+
+def row_shard_count(nnz, n_dev):
+    """How many row shards a split must have for the int32 CUDA CSR path.
+
+    The natural choice is one shard per card, but that is only valid while a
+    shard stays under 2**31-1 nonzeros: at c3=4.5 (nnz=4.82e9) two cards put
+    2.41e9 nonzeros on each (int32 wrap / instant "exceeds the int32 index
+    range" failure, and the whole fit then fell back to the SERIAL CPU SpMV --
+    106% CPU for hours per RFE round), and at c3=5.0 even four are not enough.
+    Splitting into MORE shards than cards keeps every block representable and
+    leaves the per-card footprint unchanged (the shards on one card add up to
+    the same nnz); the cost is one extra kernel launch per shard.
+
+    Rounded up to a multiple of n_dev so every card carries the same number of
+    shards.  PHEASY_GPU_SM_SHARDS overrides it (debugging/tests).
+    """
+    forced = os.environ.get("PHEASY_GPU_SM_SHARDS", "").strip()
+    if forced:
+        return max(1, int(forced))
+    n_dev = max(1, int(n_dev))
+    need = -(-int(nnz) // _CUDA_SHARD_SAFE_NNZ)
+    need = max(need, n_dev)
+    return int(np.ceil(need / float(n_dev))) * n_dev
+
+
 class GpuSparseMV(object):
     """Row-split SM_prime (+ transpose) across GPUs for TwoLevelSM matvec/rmatvec.
 
@@ -2490,14 +2520,21 @@ class GpuSparseMV(object):
             raise RuntimeError("no usable CUDA device")
         self._devs = devs
         G = len(devs)
+        # [int32] Shard count is NOT the card count: a block must stay under
+        # 2**31-1 nonzeros or the int32 CUDA CSR cast is refused and the fit drops
+        # to the serial CPU SpMV.  row_shard_count() raises the number of blocks
+        # (and rounds it up to a multiple of G) so each card may hold several.
+        n_shards = row_shard_count(int(sm_prime.nnz), G)
+        self._n_shards = n_shards
+        self._block_devs = [devs[i % G] for i in range(n_shards)]
         # Equal-NNZ boundaries, not equal index counts: the c3=5.0 factors put
         # most of their nonzeros in the first uniform quarter, so shard 0 needed
         # 19.00 GiB of CUDA CSR while the even-split estimate said 22.54 GB for a
         # shard's whole host footprint (see _balanced_shard_edges).
-        self._rs = _row_shard_edges(sm_prime, G)
-        self._cs = _col_shard_edges(sm_prime, G)
-        _mem_trace("GpuSparseMV nnz-balanced row edges %s (N=%d)"
-                   % ([int(x) for x in self._rs], int(self._rs[-1])))
+        self._rs = _row_shard_edges(sm_prime, n_shards)
+        self._cs = _col_shard_edges(sm_prime, n_shards)
+        _mem_trace("GpuSparseMV nnz-balanced row edges %s (N=%d, %d shard(s) on %d card(s))"
+                   % ([int(x) for x in self._rs], int(self._rs[-1]), n_shards, G))
         # [low-mem] Optional half-memory layout: keep ONLY the row blocks and
         # derive the adjoint from them.  torch CSRs expose .t() as a CSC VIEW
         # that shares the same buffers (verified: same data_ptr, exact results),
@@ -2519,7 +2556,8 @@ class GpuSparseMV(object):
             # materialising both blocks first.
             _row_counts = np.diff(sm_prime.indptr)
             _col_counts = _col_nnz_cached(sm_prime)
-            for i, d in enumerate(devs):
+            for i in range(n_shards):
+                d = self._block_devs[i]
                 dev = t.device("cuda:%d" % d)
                 r0, r1 = int(self._rs[i]), int(self._rs[i + 1])
                 c0, c1 = int(self._cs[i]), int(self._cs[i + 1])
@@ -2528,8 +2566,8 @@ class GpuSparseMV(object):
                 # Per-block host footprint.  This loop is the only host-memory
                 # step of the GPU-SM path, so the trace says whether a kill came
                 # from the blocks or from somewhere upstream.
-                _mem_trace("GpuSparseMV host blocks %d/%d (nnz %d+%d)"
-                           % (i + 1, G, _row_nnz, _col_nnz))
+                _mem_trace("GpuSparseMV host blocks %d/%d on gpu%d (nnz %d+%d)"
+                           % (i + 1, n_shards, d, _row_nnz, _col_nnz))
                 # Pre-flight from COUNTS, before either block exists: at c3=5.0
                 # they are 10.7 GB each, so building both just to measure doubled
                 # this loop's transient for no benefit.
@@ -2629,9 +2667,10 @@ class GpuSparseMV(object):
         np = self._np
         ys = []
         for i, B in enumerate(blocks):
-            with t.cuda.device(self._devs[i]):
-                xi = t.as_tensor(x0, dtype=self._dt64, device=self._devs[i])
-                ys.append((self._devs[i], B @ xi, xi))
+            dev = self._block_devs[i]
+            with t.cuda.device(dev):
+                xi = t.as_tensor(x0, dtype=self._dt64, device=dev)
+                ys.append((dev, B @ xi, xi))
         parts = []
         for _d, _y, _keep in ys:
             with t.cuda.device(_d):
@@ -2665,9 +2704,10 @@ class GpuSparseMV(object):
         for i, R in enumerate(self._R):
             r0 = int(self._rs[i])
             r1 = int(self._rs[i + 1])
-            with t.cuda.device(self._devs[i]):
-                ui = t.as_tensor(u[r0:r1], dtype=self._dt64, device=self._devs[i])
-                ys.append((self._devs[i], R.t() @ ui, ui))
+            dev = self._block_devs[i]
+            with t.cuda.device(dev):
+                ui = t.as_tensor(u[r0:r1], dtype=self._dt64, device=dev)
+                ys.append((dev, R.t() @ ui, ui))
         acc = None
         for _d, _y, _keep in ys:
             with t.cuda.device(_d):

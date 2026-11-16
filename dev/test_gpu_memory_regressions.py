@@ -41,6 +41,10 @@ class _SparseTensor:
     def __matmul__(self, vector):
         return _Result(self.matrix @ vector)
 
+    def t(self):
+        # mirrors torch's zero-copy CSC view of a CSR tensor
+        return _SparseTensor(self.matrix.T)
+
 
 class _FakeTorch:
     float64 = np.float64
@@ -148,6 +152,61 @@ class GpuMemoryRegressions(unittest.TestCase):
         np.testing.assert_allclose(gpu.matvec(x), matrix @ x, rtol=1e-13, atol=1e-13)
         np.testing.assert_allclose(gpu.rmatvec(u), matrix.T @ u, rtol=1e-13, atol=1e-13)
         gpu.close()
+
+    def test_row_shard_count_covers_the_int32_index_limit(self):
+        # c3=4.5: nnz=4,816,356,048.  Two cards -> 2.41e9 per block, which int32
+        # cannot represent; the split must grow to 4 shards (2 per card).
+        nnz = 4816356048
+        limit = gb._CUDA_INT32_LIMIT
+        self.assertEqual(gb.row_shard_count(nnz, 1), 3)
+        self.assertEqual(gb.row_shard_count(nnz, 2), 4)
+        self.assertEqual(gb.row_shard_count(nnz, 3), 3)
+        self.assertEqual(gb.row_shard_count(nnz, 5), 5)
+        # c3=5.0-sized problem: even 4 cards need 4 shards of >= 2 shards/card.
+        for n_dev in (1, 2, 5):
+            n_shards = gb.row_shard_count(6_000_000_000, n_dev)
+            self.assertEqual(n_shards % n_dev, 0)
+            self.assertLessEqual(-(-6_000_000_000 // n_shards), limit)
+        # small matrices keep the one-block-per-card layout.
+        self.assertEqual(gb.row_shard_count(10_000, 3), 3)
+        with patch.dict(os.environ, {"PHEASY_GPU_SM_SHARDS": "7"}):
+            self.assertEqual(gb.row_shard_count(10_000, 3), 7)
+
+    def test_more_shards_than_cards_match_cpu(self):
+        # Two cards, four shards: every block below the int32 limit, two blocks
+        # per card, matvec concatenates in ROW order and the adjoint sums.
+        rng = np.random.default_rng(23)
+        matrix = sp.random(37, 19, density=0.35, random_state=rng, format="csr")
+        with patch.dict(os.environ, {"PHEASY_GPU_SM_SHARDS": "4"}):
+            gpu = gb.GpuSparseMV(matrix, n_gpu=2, device_ids=[0, 1])
+            try:
+                self.assertEqual(gpu._devs, [0, 1])
+                self.assertEqual(gpu._n_shards, 4)
+                self.assertEqual(gpu._block_devs, [0, 1, 0, 1])
+                self.assertEqual(len(gpu._R), 4)
+                x, u = rng.normal(size=19), rng.normal(size=37)
+                np.testing.assert_allclose(gpu.matvec(x), matrix @ x,
+                                           rtol=1e-13, atol=1e-13)
+                np.testing.assert_allclose(gpu.rmatvec(u), matrix.T @ u,
+                                           rtol=1e-13, atol=1e-13)
+            finally:
+                gpu.close()
+
+    def test_low_mem_more_shards_than_cards_match_cpu(self):
+        rng = np.random.default_rng(29)
+        matrix = sp.random(41, 23, density=0.3, random_state=rng, format="csr")
+        with patch.dict(os.environ, {"PHEASY_GPU_SM_SHARDS": "4",
+                                     "PHEASY_GPU_SM_LOWMEM": "1"}):
+            gpu = gb.GpuSparseMV(matrix, n_gpu=2, device_ids=[0, 1])
+            try:
+                self.assertEqual(gpu._T, [])
+                x, u = rng.normal(size=23), rng.normal(size=41)
+                np.testing.assert_allclose(gpu.matvec(x), matrix @ x,
+                                           rtol=1e-13, atol=1e-13)
+                np.testing.assert_allclose(gpu.rmatvec(u), matrix.T @ u,
+                                           rtol=1e-13, atol=1e-13)
+            finally:
+                gpu.close()
 
 
 if __name__ == "__main__":
