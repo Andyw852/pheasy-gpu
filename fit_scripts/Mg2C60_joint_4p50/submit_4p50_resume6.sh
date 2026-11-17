@@ -6,10 +6,13 @@
 # (13.2 GiB/card) cannot be built there.  A new job picks again.  Two layouts are
 # supported by the sharding fix (main 9a7064d):
 #   3 cards -> 3 shards, 1.60e9 nnz/block, 13.2 GiB/card
-#   2 cards -> 4 shards, 1.20e9 nnz/block, 19.8 GiB/card (needs LOWMEM=1 and an
-#              explicit device list, because the auto filter sizes a stored
-#              transpose at 35.9 GiB/card)
-# Selection: 3 cards with >=14 GiB free, else 2 cards with >=20.5 GiB free, else
+#     3 cards -> 25.7 GB: impossible on a 24 GB card
+# [FIX LOWMEM] The low-memory layout does NOT halve this: torch materialises a
+# CSR copy of the block inside "R.t() @ u" (measured: the rmatvec of the 3-card
+# run asked for 11.96 GiB, one full block, on top of the 11.40 GiB it still had
+# free), so its peak equals the stored-transpose footprint.  Job 7620 died there,
+# after the matrix had been built and the RFE had started.
+# Selection: 5 cards with >=17 GiB free, else 4 cards with >=21.5 GiB free, else
 # abort (PHEASY_GPU_FALLBACK=0: never run the fit on one CPU core).
 #
 # sm_prime.npz (57.8 GB) and ns_*.npz are reused: FCFIT_REUSE_SM=1 keeps the
@@ -36,7 +39,7 @@ export MKL_NUM_THREADS=${SLURM_CPUS_PER_TASK:-32}
 export PHEASY_USE_GPU=1
 export PHEASY_GPU_SM=1
 export PHEASY_GPU_FALLBACK=0
-export PHEASY_GPU_SM_LOWMEM=1
+export PHEASY_GPU_SM_LOWMEM=0
 export PHEASY_TWOLEVEL_CACHE_T=0
 export PHEASY_LASSO_TWOLEVEL=1
 export PHEASY_LASSO_SPARSE=1
@@ -60,12 +63,12 @@ export FCFIT_REUSE_SM=1
 COLNORMS=$CASE/colnorms_4p50.npy
 unset PHEASY_COL_NORMS_FILE
 
-echo "[4p50r6] start $(date) host=$(hostname) c3=4.5 fallback=0 lowmem=1"
+echo "[4p50r6] start $(date) host=$(hostname) c3=4.5 fallback=0 lowmem=0"
 echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<unset>} SLURM_JOB_GPUS=${SLURM_JOB_GPUS:-?}"
 
 SEL=$(python - <<PYGPU
 import sys, torch
-limit3, limit2 = 14 * 2**30, 20.5 * 2**30
+lim5, lim4 = 17 * 2**30, 21.5 * 2**30
 free = []
 for i in range(torch.cuda.device_count()):
     try:
@@ -77,19 +80,19 @@ for i in range(torch.cuda.device_count()):
           file=sys.stderr)
     free.append((f, i))
 free.sort(reverse=True)
-pick = [i for f, i in free if f >= limit3][:3]
-if len(pick) == 3:
-    print("3:" + ",".join(str(i) for i in pick))
+pick = [i for f, i in free if f >= lim5][:5]
+if len(pick) >= 5:
+    print("5:" + ",".join(str(i) for i in pick[:5]))
 else:
-    pick = [i for f, i in free if f >= limit2][:2]
-    print("2:" + ",".join(str(i) for i in pick) if len(pick) == 2 else "NO_GPUS")
+    pick = [i for f, i in free if f >= lim4][:4]
+    print("4:" + ",".join(str(i) for i in pick) if len(pick) == 4 else "NO_GPUS")
 PYGPU
 )
 echo "[gpu] selection: $SEL"
 NGPU=${SEL%%:*}
 DEVS=${SEL#*:}
 if [ "$SEL" = "NO_GPUS" ] || [ -z "${DEVS:-}" ]; then
-    echo "[ABORT] not enough free VRAM: need 3 cards >=14 GiB or 2 cards >=20.5 GiB"
+    echo "[ABORT] not enough free VRAM: need 5 cards >=17 GiB or 4 cards >=21.5 GiB (stored-transpose layout)"
     exit 3
 fi
 echo "[gpu] NGPU=$NGPU devs=$DEVS"
