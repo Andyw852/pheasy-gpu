@@ -1403,7 +1403,7 @@ def _cgroup_inactive_file(base, keys):
     return 0
 
 
-def _cgroup_memory_headroom():
+def _cgroup_memory_headroom(reclaim_active_file=False):
     """Bytes left under this process's cgroup memory limit, or None (no limit).
 
     A batch job (slurm --mem) may be capped far below the node's MemAvailable;
@@ -1417,6 +1417,13 @@ def _cgroup_memory_headroom():
     cgroup (a job that has read a 19-38 GB SM cache or a 29 GB fc3 looks that
     much fuller).  The headroom is limit minus the working set, usage minus
     inactive_file (the kubelet / cAdvisor definition).
+
+    reclaim_active_file=True also subtracts active_file: for a caller whose
+    own large file I/O is the page cache in question.  The streaming RFE Gram
+    store ([RFE-GRAM-STREAM]) reads 100+ GB of clean memmap pages several times
+    per round; on a big file LRU the kernel lets the active list grow to
+    ~sqrt(10 x GB) times the inactive one, so usage - inactive_file counts
+    almost all of that reclaimable cache as working set.
     """
     try:
         with open(_PROC_CGROUP_PATH) as fh:
@@ -1432,11 +1439,13 @@ def _cgroup_memory_headroom():
         if hier == "0" and controllers == "":               # cgroup v2
             root, files = _CGROUP_ROOT, ("memory.max", "memory.current")
             cache_keys = ("inactive_file",)
+            active_keys = ("active_file",)
         elif "memory" in controllers.split(","):            # cgroup v1
             root = os.path.join(_CGROUP_ROOT, "memory")
             files = ("memory.limit_in_bytes", "memory.usage_in_bytes")
             # usage_in_bytes is hierarchical: so is total_inactive_file
             cache_keys = ("total_inactive_file", "inactive_file")
+            active_keys = ("total_active_file", "active_file")
         else:
             continue
         rel = path.strip("/")
@@ -1450,13 +1459,16 @@ def _cgroup_memory_headroom():
             except (OSError, ValueError):
                 continue
             if limit is not None and usage is not None and limit < (1 << 60):
-                working_set = max(usage - _cgroup_inactive_file(base, cache_keys), 0)
+                cache = _cgroup_inactive_file(base, cache_keys)
+                if reclaim_active_file:
+                    cache += _cgroup_inactive_file(base, active_keys)
+                working_set = max(usage - cache, 0)
                 room = max(limit - working_set, 0)
                 best = room if best is None else min(best, room)
     return best
 
 
-def _available_memory_bytes():
+def _available_memory_bytes(reclaim_file_cache=False):
     """RAM this process can allocate now, in bytes (None if undetectable).
 
     [FIX P26] the dense/iterative dispatch, the exact-Gram budgets and the RFE
@@ -1467,6 +1479,10 @@ def _available_memory_bytes():
     (66-69 GB Gram) always fell back to LSMR.  Now: MemAvailable, capped by the
     cgroup headroom of a memory-limited job; MemFree only when /proc/meminfo
     has no MemAvailable (non-Linux, kernels before 3.14).
+
+    reclaim_file_cache=True counts the cgroup's active page cache as
+    reclaimable too (see _cgroup_memory_headroom); only the streaming RFE Gram
+    engine asks for it.
     """
     avail = _meminfo_available_bytes()
     if avail is None:
@@ -1474,7 +1490,7 @@ def _available_memory_bytes():
             avail = int(os.sysconf("SC_AVPHYS_PAGES")) * int(os.sysconf("SC_PAGE_SIZE"))
         except (ValueError, OSError, AttributeError):
             avail = None
-    room = _cgroup_memory_headroom()
+    room = _cgroup_memory_headroom(reclaim_active_file=reclaim_file_cache)
     if room is not None:
         avail = room if avail is None else min(avail, room)
     return avail
@@ -6005,7 +6021,7 @@ def _rfe_stream_budget_bytes():
     raw = os.environ.get("PHEASY_RFE_GRAM_GB")
     if raw is not None and raw.strip() != "":
         return max(0.0, float(raw)) * 1e9
-    avail = _available_memory_bytes()
+    avail = _available_memory_bytes(reclaim_file_cache=True)
     if avail is None:
         raise RuntimeError("[RFE-GRAM-STREAM] cannot detect the available RAM; set "
                            "PHEASY_RFE_GRAM_GB to the budget in GB")
@@ -6231,7 +6247,7 @@ def _spd_solve_inplace(M, rhs, ridge, rebuild):
         pass
     # eigh needs the eigenvectors (s x s) plus dsyevd's ~2 s^2 workspace
     _need = 3.0 * 8.0 * s * s
-    _avail = _available_memory_bytes()
+    _avail = _available_memory_bytes(reclaim_file_cache=True)
     if _avail is not None and _need > _avail:
         raise MemoryError(
             "[RFE-GRAM-STREAM] the %d x %d system is not numerically positive "
@@ -6557,7 +6573,9 @@ class _RFEStreamGramCV(object):
         s = int(loc.size)
         full = bool(s == self.p and np.array_equal(loc, np.arange(self.p)))
         need = self._round_bytes(s)
-        avail = _available_memory_bytes()
+        # the store's own clean memmap pages are reclaimable page cache, even
+        # when the kernel has them on the active list (_cgroup_memory_headroom)
+        avail = _available_memory_bytes(reclaim_file_cache=True)
         if avail is not None and need > avail:
             raise MemoryError(
                 "[RFE-GRAM-STREAM] round on %d features needs %.1f GB of float64 "

@@ -192,6 +192,39 @@ class Guards(_EnvCase):
                 self.assertRaisesRegex(MemoryError, "do not fit"):
             opt._rfe_stream_plan(1040112, 77063, 5, 200e9, self.store_dir)
 
+    def test_round_check_counts_active_page_cache_as_reclaimable(self):
+        # A memory-limited job whose disk store reads filled the cgroup with
+        # ACTIVE page cache: usage at the limit, almost no inactive_file.  The
+        # default accounting (usage - inactive_file) saw ~2 kB free and the
+        # round check raised MemoryError -- after the whole accumulation.
+        eng = self.engine(self.A, self.y, self.splits, PHEASY_RFE_GRAM_STORE="disk")
+        p = self.A.shape[1]
+        root = os.path.join(self.tmp.name, "cg")
+        os.makedirs(os.path.join(root, "job"))
+        limit = 100_000_000
+
+        def write(rel, text):
+            with open(os.path.join(self.tmp.name, rel), "w") as fh:
+                fh.write(text)
+        write("cg/job/memory.max", str(limit))
+        write("cg/job/memory.current", str(limit - 1000))
+        write("cg/job/memory.stat", "anon 100000\nactive_file %d\ninactive_file 900\n"
+              % (limit - 101000))
+        write("self_cgroup", "0::/job\n")
+        write("meminfo", "MemTotal: 1000000000 kB\nMemFree: 1000 kB\n"
+                         "MemAvailable: 900000000 kB\n")
+        try:
+            with patch.object(opt, "_MEMINFO_PATH", os.path.join(self.tmp.name, "meminfo")), \
+                    patch.object(opt, "_PROC_CGROUP_PATH",
+                                 os.path.join(self.tmp.name, "self_cgroup")), \
+                    patch.object(opt, "_CGROUP_ROOT", root):
+                need = eng._round_bytes(p)
+                self.assertLess(opt._available_memory_bytes(), need)
+                self.assertGreater(opt._available_memory_bytes(reclaim_file_cache=True), need)
+                eng.round(np.arange(p))           # must not raise
+        finally:
+            eng.release()
+
     def test_dropped_row_block_is_caught(self):
         real = opt._rfe_stream_blocks
 

@@ -1683,6 +1683,16 @@ reached.
 | `PHEASY_RFE_GRAM_GPU_PANEL` / `_GB` / `_FRACTION` / `_MAX_WAVES` | `2048` / unset / `0.9` / `4` | panel width, per-device byte cap, fraction of free VRAM, max passes per fold |
 | `PHEASY_RFE_GRAM_F32_MAXERR` | `1e-4` | largest predicted float32 storage error accepted |
 
+**Page cache is not working set.**  The engine's memory checks (default
+budget, per-round buffers, eigh fallback) count all of the cgroup's file page
+cache as reclaimable, `active_file` as well as `inactive_file`
+(`_available_memory_bytes(reclaim_file_cache=True)`).  A disk store is read
+several times per round, so its clean memmap pages migrate to the active
+list.  Under a `--mem` cgroup the default accounting (usage - inactive_file)
+then reported a 180 GB job as a few GB from full, and the round-1 check would
+have raised `MemoryError` after the whole accumulation.  The rest of pheasy
+keeps the default accounting.
+
 **float32 storage is guarded twice.** With float32 storage the solution moves
 by about `cond(scaled system) x 2^-24`; LAPACK `dpocon` estimates the condition
 number after every factorization.  The validation SSE
