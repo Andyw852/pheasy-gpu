@@ -1694,6 +1694,18 @@ CV_RMSE error**, outside the 1e-4 tolerance even though the coefficient guard
 passes.  The engine therefore refuses float32 when either estimate exceeds
 `PHEASY_RFE_GRAM_F32_MAXERR`.  On a high-SNR fit, use float64.
 
+The same two guards cover float32 **GPU accumulation**
+(`PHEASY_RFE_GRAM_GPU_DTYPE=float32`), whose store is still float64.  Its
+entry error is modelled as `2^-24 (2 + sqrt(k) + sqrt(L/k))` for k-row blocks
+and float64 flushes every L rows: ~49 x 2^-24 = 2.9e-6 at the c3=4.5 defaults
+(1622-row blocks, 65536-row flush).  On the torch CPU device the model
+over-predicts the measured error by 8-28x; cuBLAS has not been measured.  At
+that entry error the condition guard alone refuses any system with condition
+above ~35, i.e. practically every fit.  float32 GPU accumulation therefore only
+runs when `PHEASY_RFE_GRAM_F32_MAXERR` is raised deliberately.  (Before
+[RFE-GRAM-STREAM] guard fix the guards keyed on the storage dtype, and this
+path was not checked at all.)
+
 **Sizes at c3=4.5** (`n = 1,040,112`, `p = 77,063`, K = 5, float64):
 
 | item | value |

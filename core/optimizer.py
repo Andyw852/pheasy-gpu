@@ -5965,6 +5965,33 @@ class _RFEGramCV(object):
 _F32_UNIT = float(np.finfo(np.float32).eps) / 2.0      # 2**-24
 
 
+def _rfe_entry_roundoff(store_dtype, gacc):
+    """(u, source): relative error of the stored Gram entries from float32.
+
+    Two independent sources, added: float32 STORAGE rounds every entry once
+    (u = 2^-24), and float32 GPU GEMM accumulation rounds the inputs (~2u) and
+    sums in float32 over the GEMM inner dimension (the block rows k) and over
+    the L/k panel updates between float64 flushes.  The random-walk model
+    u (2 + sqrt(k) + sqrt(L/k)) is deliberately conservative: on the torch CPU
+    device it over-predicts the measured max-entry error by 8-28x (block
+    256-4096 rows, flush 512-65536); cuBLAS is not measured yet.  (0, None)
+    when everything is float64 -- then the guards below have nothing to check.
+    """
+    parts = []
+    if np.dtype(store_dtype) == np.float32:
+        parts.append((_F32_UNIT, "float32 Gram storage (PHEASY_RFE_GRAM_DTYPE)"))
+    if gacc is not None and np.dtype(gacc.np_dtype) == np.float32:
+        k = float(max(1, gacc.block_rows))
+        L = float(gacc.flush_rows or k)
+        growth = 2.0 + np.sqrt(k) + np.sqrt(max(1.0, L / k))
+        parts.append((_F32_UNIT * growth,
+                      "float32 GPU accumulation (PHEASY_RFE_GRAM_GPU_DTYPE, %d-row blocks, "
+                      "float64 flush every %d rows)" % (int(k), int(L))))
+    if not parts:
+        return 0.0, None
+    return float(sum(u for u, _ in parts)), " + ".join(name for _, name in parts)
+
+
 def _rfe_stream_requested():
     """PHEASY_RFE_GRAM_CV=1: use the streaming Gram engine for every RFE round."""
     return _env_on("PHEASY_RFE_GRAM_CV", "0")
@@ -6336,6 +6363,14 @@ class _RFEStreamGramCV(object):
             # here; there is no silent switch to host accumulation.
             gacc = _gbm.GpuGramAccumulator(p, block_rows=plan["block_rows"])
         self.gpu_plan = gacc.describe() if gacc is not None else None
+        # [guard] float32 anywhere in the Gram (storage OR GPU accumulation) is
+        # checked against the condition number and the SSE cancellation below
+        self.entry_unit, self.entry_source = _rfe_entry_roundoff(self.dtype, gacc)
+        if self.entry_unit > 0:
+            print("[RFE-GRAM-STREAM] float32 in the Gram: %s; effective entry error "
+                  "~%.1e, guarded by PHEASY_RFE_GRAM_F32_MAXERR=%s"
+                  % (self.entry_source, self.entry_unit,
+                     os.environ.get("PHEASY_RFE_GRAM_F32_MAXERR", "1e-4")), flush=True)
         print("[RFE-GRAM-STREAM] p=%d K=%d n=%d: store=%s%s dtype=%s total=%s "
               "round-buffers=%d; Grams %.1f GB, host peak %.1f GB of %.1f GB budget "
               "(one float64 Gram = %.1f GB, row blocks of %d rows = %.2f GB); "
@@ -6484,33 +6519,35 @@ class _RFEStreamGramCV(object):
     def _check_condition(self, rcond, what):
         cond = (1.0 / rcond) if rcond > 0 else float("inf")
         self.max_cond = max(self.max_cond, cond)
-        if self.dtype == np.float32:
+        if self.entry_unit > 0:
             maxerr = float(os.environ.get("PHEASY_RFE_GRAM_F32_MAXERR", "1e-4"))
-            if cond * _F32_UNIT > maxerr:
+            if cond * self.entry_unit > maxerr:
                 raise RuntimeError(
-                    "[RFE-GRAM-STREAM] float32 Gram storage is too coarse for this "
-                    "system: the Jacobi-scaled %s has condition ~%.2e, so the 2^-24 "
-                    "storage rounding moves the solution by ~%.1e (limit "
-                    "PHEASY_RFE_GRAM_F32_MAXERR=%.1e).  Use PHEASY_RFE_GRAM_DTYPE=float64."
-                    % (what, cond, cond * _F32_UNIT, maxerr))
+                    "[RFE-GRAM-STREAM] %s is too coarse for this system: the "
+                    "Jacobi-scaled %s has condition ~%.2e, so an entry error of ~%.1e "
+                    "moves the solution by ~%.1e (limit PHEASY_RFE_GRAM_F32_MAXERR=%.1e).  "
+                    "Use float64 (PHEASY_RFE_GRAM_DTYPE / PHEASY_RFE_GRAM_GPU_DTYPE)."
+                    % (self.entry_source, what, cond, self.entry_unit,
+                       cond * self.entry_unit, maxerr))
 
     def _check_cancellation(self, gk, sse, k):
         """The validation SSE is ||y_k||^2 - 2 x.b_k + x.G_k.x: a difference of
         terms ~||y_k||^2 / SSE_k larger than the result.  The stored G_k enters
         only through x.G_k.x, so its rounding moves CV_RMSE by about
-        0.5 u |x.G_k.x| / SSE_k (u = 2^-24 for float32 storage)."""
+        0.5 u |x.G_k.x| / SSE_k, u = the effective entry error of float32
+        storage and/or float32 GPU accumulation (_rfe_entry_roundoff)."""
         amp = abs(gk) / max(sse, np.finfo(np.float64).tiny)
         self.max_sse_amplification = max(getattr(self, "max_sse_amplification", 0.0), amp)
-        if self.dtype == np.float32:
+        if self.entry_unit > 0:
             maxerr = float(os.environ.get("PHEASY_RFE_GRAM_F32_MAXERR", "1e-4"))
-            est = 0.5 * _F32_UNIT * amp
+            est = 0.5 * self.entry_unit * amp
             if est > maxerr:
                 raise RuntimeError(
-                    "[RFE-GRAM-STREAM] float32 Gram storage cannot resolve the "
-                    "validation error of fold %d: x.G_k.x is %.2e times SSE_k, so the "
-                    "2^-24 storage rounding moves CV_RMSE by ~%.1e (limit "
-                    "PHEASY_RFE_GRAM_F32_MAXERR=%.1e).  Use PHEASY_RFE_GRAM_DTYPE=float64."
-                    % (k, amp, est, maxerr))
+                    "[RFE-GRAM-STREAM] %s cannot resolve the validation error of fold "
+                    "%d: x.G_k.x is %.2e times SSE_k, so an entry error of ~%.1e moves "
+                    "CV_RMSE by ~%.1e (limit PHEASY_RFE_GRAM_F32_MAXERR=%.1e).  Use "
+                    "float64 (PHEASY_RFE_GRAM_DTYPE / PHEASY_RFE_GRAM_GPU_DTYPE)."
+                    % (self.entry_source, k, amp, self.entry_unit, est, maxerr))
 
     def round(self, loc, want_cv=True, final=False):
         """(coef on the full data, cv_mean, cv_se, rss) for the support loc."""
@@ -6586,6 +6623,8 @@ class _RFEStreamGramCV(object):
                 "block_rows": int(self.plan["block_rows"]), "gpu": self.gpu_plan,
                 "max_condition_estimate": float(self.max_cond),
                 "max_sse_amplification": float(getattr(self, "max_sse_amplification", 0.0)),
+                "float32_entry_error": float(self.entry_unit),
+                "float32_source": self.entry_source,
                 "round_seconds": [float(t) for t in self.round_seconds]}
 
 

@@ -370,7 +370,10 @@ of both engines; in streaming mode its default is 0.8 of the available RAM.
    test problem (cond ~1e3, 1% noise) float32 storage gave 2e-7 coefficient
    error but 1.6e-4 CV_RMSE error.  The engine refuses float32 when that
    estimate, or `cond x 2^-24` from LAPACK `dpocon`, exceeds
-   `PHEASY_RFE_GRAM_F32_MAXERR` (1e-4).
+   `PHEASY_RFE_GRAM_F32_MAXERR` (1e-4).  The same guards apply to float32
+   GPU GEMM accumulation, with a larger, conservatively modelled entry error
+   (~2.9e-6 at the c3=4.5 defaults; GPU.md).  That makes the "3090 float32
+   GEMM, ~7 min" option refuse unless the tolerance is raised on purpose.
 7. **"Per-round CV_RMSE within 1e-4 of the resident run" is not attainable.**
    The resident rounds are LSMR iterates at the 5000-iteration cap (istop=7),
    not least-squares solutions.  [FIX RFE-GRAM] measured the same support

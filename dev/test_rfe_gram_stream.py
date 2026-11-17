@@ -284,6 +284,31 @@ class GpuAccumulator(_EnvCase):
                 self.assertRaisesRegex(MemoryError, "needs"):
             gb.GpuGramAccumulator(1000, block_rows=100)
 
+    def test_float32_gpu_accumulation_is_guarded(self):
+        # PHEASY_RFE_GRAM_GPU_DTYPE=float32 keeps a float64 STORE, so a guard
+        # keyed on the storage dtype alone let it run unchecked
+        A, y, g = small_problem()
+        splits = opt._make_cv_splits(A.shape[0], 5, 0, g)
+        loc = np.arange(A.shape[1])
+        eng = self.engine(A, y, splits, PHEASY_RFE_GRAM_STORE="ram", PHEASY_RFE_GRAM_GPU="1",
+                          PHEASY_RFE_GRAM_GPU_DTYPE="float32",
+                          PHEASY_RFE_GRAM_GPU_DEVICES="cpu", PHEASY_RFE_GRAM_GPU_GB="1")
+        ref = opt._RFEGramCV(A, y, loc, splits)
+        try:
+            self.assertEqual(eng.dtype, np.float64)
+            self.assertIn("float32 GPU accumulation", self.last_log)
+            self.assertGreater(eng.entry_unit, opt._F32_UNIT)
+            with self.assertRaisesRegex(RuntimeError, "float32 GPU accumulation"):
+                eng.round(loc)
+            # accepted on purpose: it runs, and the real error is inside the estimate
+            with patch.dict(os.environ, {"PHEASY_RFE_GRAM_F32_MAXERR": "1"}):
+                got = eng.round(loc)
+            want = ref.round(loc)
+            est = 0.5 * eng.entry_unit * eng.max_sse_amplification
+            self.assertLess(abs(got[1] / want[1] - 1.0), est)
+        finally:
+            eng.release()
+
     def test_engine_gpu_matches_host_and_does_not_fall_back(self):
         A, y, g = small_problem()
         splits = opt._make_cv_splits(A.shape[0], 5, 0, g)
@@ -294,6 +319,7 @@ class GpuAccumulator(_EnvCase):
                           PHEASY_RFE_GRAM_GPU_PANEL="32")
         try:
             self.assertIn("GPU float64 GEMM on cpu", self.last_log)
+            self.assertEqual(gpu.entry_unit, 0.0)      # float64 throughout: no guard
             h, gg = host.round(loc), gpu.round(loc)
             np.testing.assert_allclose(gg[0], h[0], rtol=0, atol=1e-11 * np.abs(h[0]).max())
             self.assertAlmostEqual(gg[1] / h[1], 1.0, delta=1e-11)
