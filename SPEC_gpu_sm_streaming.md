@@ -393,3 +393,80 @@ of both engines; in streaming mode its default is 0.8 of the available RAM.
    accumulates, and only when asked.
 5. `GpuTwoLevelOperator`: untouched (not used by this path).
 
+---
+
+## 10. First production attempt at c3=4.5 (2026-11-17/18): measurements, and why it was stopped
+
+Job 7622, run CPU-only on the RTX-3090 box while another user held all five GPUs.
+Configuration: p = 77,063, K = 5, `store=disk` float64, `PHEASY_RFE_GRAM_TOTAL=0`,
+`PHEASY_RFE_GRAM_GB=120`, `--mem=180G`, 32 CPUs. The engine's plan line:
+
+```
+[RFE-GRAM-STREAM] p=77063 K=5 n=1040112: store=disk(258.8 GB free) dtype=float64
+  total=off round-buffers=2; Grams 237.5 GB, host peak 97.0 GB of 120.0 GB budget
+  (one float64 Gram = 47.5 GB, row blocks of 1622 rows = 1.00 GB);
+  accumulation: host dsyrk (float64)
+```
+
+### Gram accumulation: 33,307.4 s (9.25 h), not the ~3 h the design assumed
+
+| artifact | value |
+|---|---|
+| total, as logged | `per-fold float64 Grams (5 folds, 237.55 GB, streamed, store=disk) built in 33307.4s` |
+| fold 4/5 | 208,320 rows in 129 blocks, 5,873.1 s |
+| fold 5/5 | 206,832 rows in 128 blocks, 7,759.4 s |
+| per-fold wall time from the store mtimes | 2.08 / 1.72 / 1.65 / 1.63 / 2.15 h |
+
+**Root cause of the 3x underestimate: the folds are not contiguous row ranges.**
+`PHEASY_CV_GROUP_SIZE=1488` makes the splits group-aware, so each fold is a
+scattered set of row blocks.  The fold-by-fold accumulator design assumed
+"each fold is one row range, and the K folds together are still one pass"
+(section 9); with grouped splits the engine needs **one full pass per fold** —
+five passes over 1,040,112 rows, i.e. 5 x (SpGEMM that forms 641 GB of dense
+SM@NS rows + the GEMM), and the measured 1.6-2.2 h per fold is exactly that.
+Section 9's "K folds together are one pass" holds only for contiguous splits.
+
+### Round 0: stopped after 6.65 h with zero rounds completed
+
+Round 0 (s = 77,063) started at 21:02 and was still running at 03:41 when the
+job was stopped.  Observed during it: ~20 CPUs busy and RSS peaking at 194 GB.
+
+Both numbers point at the `_spd_solve_inplace` **eigendecomposition fallback**
+rather than its Cholesky path: the fallback pre-flights `3 s^2 x 8 B = 142 GB`
+of workspace at this size, which together with the 47.5 GB fold Gram reproduces
+the 194 GB peak, and dsyevd is highly parallel.  Cholesky for all five folds
+would have been ~26 min in total.
+
+The root cause is not confirmed: the `cholesky`/`eigh_min_norm` marker never
+reached the log because the child's stdout is block-buffered through a pipe.
+Candidates, in order:
+1. a fold's train Gram has zero-variance / collinear columns (the round ridge is
+   1e-11), so the Jacobi-scaled Cholesky fails on a genuinely non-PD system;
+2. the upper-triangle store is not mirrored back before the solve.
+
+### Cost of the attempt and state left behind
+
+* 14 h wall clock (9.25 h accumulation + 6.65 h of round 0), no fc2/fc3.
+* 237.5 GB of disk backed the store; it was removed after stopping (disk back
+  to 239 GB free), `sm_prime.npz` (57.8 GB), `ns_*.npz` and the column norms
+  were kept.
+* The driver's `-d` reuse patch (fullerene-kappa-db `14dd7f6`) means a later
+  attempt pays `-c` (39 min) + the RFE, not the 4 h rebuild.
+
+### What to fix before trying streaming at this size again
+
+1. **Report the solve method.** Print `method`/`rcond` per fold at round 0 (or
+   flush the child's stdout) so the eigh fallback is visible immediately.
+2. **Round cost.** 9 rounds at `O(s^3)` with a 142 GB eigh workspace is not
+   viable; either make the round-0 system Cholesky-safe (ridge / column
+   pruning) or accept a different elimination schedule.
+3. **Fold layout.** Either make the streaming splits contiguous (documented
+   comparability note required) or budget 5 passes, i.e. ~9 h for the
+   accumulation at this p.
+4. **GPU accumulation** is worth it only on big-FP64 parts: on A800 (9.7 TFLOPS
+   FP64) 6.2e15 flops is ~11 min; on the 3090 (0.556 TFLOPS) it is the same
+   ~3 h as the host dsyrk, and the 23.8 GB triangle does not fit one 24 GB card
+   anyway (2-3 waves, with the host SpGEMM repeated per wave).
+5. Streaming at this p therefore remains a **fallback for when no GPU is
+   available**, not the production route: the resident GPU path (5 cards at
+   c3=4.5) is still the fast one, once the cards are free.
