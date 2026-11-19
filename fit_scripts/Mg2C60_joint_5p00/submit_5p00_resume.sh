@@ -40,6 +40,15 @@ export PHEASY_USE_GPU=1
 export PHEASY_GPU_SM=1
 export PHEASY_GPU_FALLBACK=0
 export PHEASY_GPU_SM_LOWMEM=1
+# [FITS 5 CARDS] nnz=7.54e9 -> 12.07 GB resident per card no matter how the rows
+# are split, and the low-mem adjoint makes torch materialise a CSR copy of the
+# whole BLOCK inside "R.t() @ u" (measured at c3=4.5: 11.96 GiB = exactly one
+# block).  The transient is per block, so it shrinks with the shard count:
+#   5 shards  -> 12.07 + 12.07 = 24.1 GB = 22.5 GiB/card  (does not fit)
+#   10 shards -> 12.07 +  6.03 = 18.1 GB = 16.9 GiB/card
+#   30 shards -> 12.07 +  2.01 = 14.1 GB = 13.1 GiB/card  (chosen: fits even a
+#                card another user is partly holding)
+export PHEASY_GPU_SM_SHARDS=30
 export PHEASY_TWOLEVEL_CACHE_T=0
 export PHEASY_LASSO_TWOLEVEL=1
 export PHEASY_LASSO_SPARSE=1
@@ -59,15 +68,22 @@ export PHEASY_SM_DTYPE=float32
 # (90.5 GB) and narrowing at load halves the resident matrix.
 export PHEASY_SM_INDEX_DTYPE=int32
 export FCFIT_REUSE_SM=1
+# [KEEP_CS] The -c pass took 2:29:48 at c3=5.0 (measured 2026-11-19) and pheasy -f
+# re-validates the cs.pkl / ns_*.npz fingerprints before using them, so the cache
+# left by the previous attempt is reused and -s/-c are skipped.
+export FCFIT_KEEP_CS=1
 COLNORMS=$CASE/colnorms_5p00.npy
 unset PHEASY_COL_NORMS_FILE
 
-echo "[5p00r] start $(date) host=$(hostname) c3=5.0 fallback=0 lowmem=1"
+echo "[5p00r] start $(date) host=$(hostname) c3=5.0 fallback=0 lowmem=1 shards=10"
 echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<unset>} SLURM_JOB_GPUS=${SLURM_JOB_GPUS:-?}"
 
 SEL=$(python - <<PYGPU
 import sys, torch
-lim5, lim4 = 13 * 2**30, 16 * 2**30
+# 30 shards (6 per card): resident 12.07 GB + per-call copy 2.01 GB ~= 14.1 GB
+# = 13.1 GiB per card; require 14.5 GiB for margin.  No 4-card fallback (a card
+# would need 24.1 GB of resident blocks).
+lim5 = 14.5 * 2**30
 free = []
 for i in range(torch.cuda.device_count()):
     try:
@@ -80,18 +96,14 @@ for i in range(torch.cuda.device_count()):
     free.append((f, i))
 free.sort(reverse=True)
 pick = [i for f, i in free if f >= lim5][:5]
-if len(pick) >= 5:
-    print("5:" + ",".join(str(i) for i in pick[:5]))
-else:
-    pick = [i for f, i in free if f >= lim4][:4]
-    print("4:" + ",".join(str(i) for i in pick) if len(pick) == 4 else "NO_GPUS")
+print("5:" + ",".join(str(i) for i in pick) if len(pick) == 5 else "NO_GPUS")
 PYGPU
 )
 echo "[gpu] selection: $SEL"
 NGPU=${SEL%%:*}
 DEVS=${SEL#*:}
 if [ "$SEL" = "NO_GPUS" ] || [ -z "${DEVS:-}" ]; then
-    echo "[ABORT] not enough free VRAM: need 5 cards >=13 GiB or 4 cards >=16 GiB"
+    echo "[ABORT] not enough free VRAM: c3=5.0 needs 5 cards with >=14.5 GiB free (30 shards, low-mem)"
     exit 3
 fi
 echo "[gpu] NGPU=$NGPU devs=$DEVS"

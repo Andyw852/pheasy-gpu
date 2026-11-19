@@ -14,9 +14,20 @@ BLOCK_BYTES = 64 << 20
 
 
 def load_prime(case):
+    """Load sm_prime.npz as CSR, narrowing the COLUMN indices to int32.
+
+    The npz stores int64 indices (the narrow int32 layout is only used by the
+    fit's loader).  At c3=5.0 that is 60 GB of index data on top of the 30 GB of
+    values, so the load alone would need ~91 GB; the column indices are below
+    2**31 by construction (they index <=136,251 columns), so int32 is exact and
+    halves the load.  The indptr stays int64: nnz=7.5e9 does not fit int32.
+    """
     z = np.load(os.path.join(case, "sm_prime.npz"))
     shape = tuple(int(x) for x in z["shape"])
-    return sp.csr_matrix((z["data"], z["indices"], z["indptr"]), shape=shape)
+    idx = z["indices"]
+    if idx.dtype == np.int64 and idx.size and int(idx.max()) < 2**31:
+        idx = idx.astype(np.int32)
+    return sp.csr_matrix((z["data"], idx, z["indptr"]), shape=shape)
 
 
 def load_ns(case):
