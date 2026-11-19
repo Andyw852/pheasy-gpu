@@ -7,6 +7,10 @@ real cards before trusting a fit on it: it builds GpuSparseMV on the given
 devices with the given shard count and compares matvec / rmatvec against a
 float64 scipy reference computed in row chunks (no full float64 copy).
 
+PHEASY_GPU_SM_LOWMEM is retired: it makes torch copy every block inside
+"R.t() @ u" and never lowered the peak (SPEC_gpu_sm_streaming.md section 10),
+so the stored transpose is the only layout.
+
 Always pass the card list (--devices).  Without an explicit list GpuSparseMV's
 auto filter sizes every card for a STORED transpose (2 x SM / n_gpu): for the
 c3=4.5 matrix on 2 cards that is 35.9 GiB per card, so no 24 GB card qualifies
@@ -15,15 +19,15 @@ runs.  With --devices the per-block VRAM pre-flight is the only guard.
 
 Examples (run from the repository root):
 
-  # c3=4.5 matrix, 2 cards, 4 shards, low-mem layout (~19.7 GiB per card)
+  # c3=4.5 matrix, 2 cards, 4 shards (stored transpose: 2 x nnz x 8 B / cards)
   python dev/check_gpu_sm_shards.py --npz $CASE/sm_prime.npz \\
-      --devices 0,1 --shards 4 --lowmem
+      --devices 0,1 --shards 4
 
-  # synthetic smoke test, 2 cards, 4 shards, both layouts
+  # synthetic smoke test, 2 cards, 4 shards
   python dev/check_gpu_sm_shards.py --synthetic 400000x20000 --density 2e-3 \\
       --devices 0,1 --shards 4
   python dev/check_gpu_sm_shards.py --synthetic 400000x20000 --density 2e-3 \\
-      --devices 0,1 --shards 4 --lowmem
+      --devices 0,1 --shards 4
 
 Exit status 0 when both relative errors are below --rtol, 1 otherwise.
 """
@@ -94,7 +98,7 @@ def _rel(a, b):
     return float(np.linalg.norm(a - b)) / (den if den > 0 else 1.0)
 
 
-def check(sm, devices, shards=None, lowmem=False, seed=0, backend=None,
+def check(sm, devices, shards=None, seed=0, backend=None,
           reps=1, log=print):
     """Build GpuSparseMV(sm) on `devices`, compare matvec/rmatvec to scipy.
 
@@ -106,7 +110,6 @@ def check(sm, devices, shards=None, lowmem=False, seed=0, backend=None,
     devices = [int(d) for d in devices]
     env = {
         "PHEASY_GPU_SM_SHARDS": shards if shards else None,
-        "PHEASY_GPU_SM_LOWMEM": "1" if lowmem else "0",
         "PHEASY_GPU_SM_DEVICES": ",".join(str(d) for d in devices),
     }
     with _env(**env):
@@ -118,9 +121,8 @@ def check(sm, devices, shards=None, lowmem=False, seed=0, backend=None,
         rs = [int(r) for r in op._rs]
         row_nnz = [int(sm.indptr[b] - sm.indptr[a]) for a, b in zip(rs[:-1], rs[1:])]
         log("[check] %d shard(s) on cards %s (row_shard_count would give %d), "
-            "layout=%s, build %.1fs"
-            % (op._n_shards, op._block_devs, derived,
-               "low-mem" if lowmem else "stored-transpose", t_build))
+            "stored-transpose layout, build %.1fs"
+            % (op._n_shards, op._block_devs, derived, t_build))
         log("[check] per-shard row nnz %s (max %d, int32 limit %d)"
             % (row_nnz, max(row_nnz), gb._CUDA_INT32_LIMIT))
         rng = np.random.default_rng(seed)
@@ -178,8 +180,6 @@ def main(argv=None):
                    help="comma-separated CUDA indices, e.g. 0,1 (required)")
     p.add_argument("--shards", type=int, default=0,
                    help="force PHEASY_GPU_SM_SHARDS (0 = row_shard_count)")
-    p.add_argument("--lowmem", action="store_true",
-                   help="PHEASY_GPU_SM_LOWMEM=1 (row blocks only)")
     p.add_argument("--reps", type=int, default=3)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--rtol", type=float, default=0.0,
@@ -193,7 +193,7 @@ def main(argv=None):
           % (sm.shape, sm.nnz, sm.dtype, time.time() - t0), flush=True)
     rtol = args.rtol or (1e-4 if sm.dtype == np.float32 else 1e-12)
     res = check(sm, [d for d in args.devices.split(",") if d.strip()],
-                shards=args.shards or None, lowmem=args.lowmem,
+                shards=args.shards or None,
                 seed=args.seed, reps=args.reps,
                 log=lambda s: print(s, flush=True))
     ok = res["matvec_rel_err"] <= rtol and res["rmatvec_rel_err"] <= rtol

@@ -1,5 +1,16 @@
 # GPU-SM row split beyond the card count (int32 CUDA CSR limit)
 
+> **RETIRED 2026-11-20 -- the low-memory layout.**  Everything below about
+> `PHEASY_GPU_SM_LOWMEM=1` is history: the layout is now REFUSED at construction.
+> It never lowered the peak, because torch materialises a CSR copy of the whole
+> block inside `R.t() @ u` (measured 11.96 GiB = one c3=4.5 block, job 7620;
+> 3.81 GiB per c3=5.0 block, job 7664), and with several shards per card those
+> copies pile up above the stored-transpose footprint.  Both production attempts
+> died of it.  The only layout is the stored transpose
+> (`2 x nnz x 8 B / n_cards`); c3=5.0 does not fit five 24 GB cards at all and
+> runs on A800.  Measurements below taken with the low-mem layout stay as
+> measurements, not as a recommendation.
+
 Date: 2026-11-16
 Scope: `core/gpu_backend.py` (`GpuSparseMV`), `dev/test_gpu_memory_regressions.py`;
 follow-up: `core/optimizer.py` (required mode at construction),

@@ -200,21 +200,21 @@ class GpuMemoryRegressions(unittest.TestCase):
             finally:
                 gpu.close()
 
-    def test_low_mem_more_shards_than_cards_match_cpu(self):
+    def test_low_mem_layout_is_retired(self):
+        # PHEASY_GPU_SM_LOWMEM=1 rendered the adjoint as "R.t() @ u", which makes
+        # torch copy every block (~11.96 GiB at c3=4.5 job 7620, ~3.81 GiB per
+        # c3=5.0 block job 7664); both runs died of it and the layout never
+        # lowered the peak.  It must be refused, not silently used.
         rng = np.random.default_rng(29)
         matrix = sp.random(41, 23, density=0.3, random_state=rng, format="csr")
         with patch.dict(os.environ, {"PHEASY_GPU_SM_SHARDS": "4",
                                      "PHEASY_GPU_SM_LOWMEM": "1"}):
-            gpu = gb.GpuSparseMV(matrix, n_gpu=2, device_ids=[0, 1])
-            try:
-                self.assertEqual(gpu._T, [])
-                x, u = rng.normal(size=23), rng.normal(size=41)
-                np.testing.assert_allclose(gpu.matvec(x), matrix @ x,
-                                           rtol=1e-13, atol=1e-13)
-                np.testing.assert_allclose(gpu.rmatvec(u), matrix.T @ u,
-                                           rtol=1e-13, atol=1e-13)
-            finally:
-                gpu.close()
+            with self.assertRaises(RuntimeError) as ctx:
+                gb.GpuSparseMV(matrix, n_gpu=2, device_ids=[0, 1])
+        msg = str(ctx.exception)
+        self.assertIn("retired", msg)
+        self.assertIn("7620", msg)
+        self.assertIn("7664", msg)
 
     def test_real_gpu_check_script_logic(self):
         # dev/check_gpu_sm_shards.py is the real-GPU validation of the path above;
@@ -225,15 +225,12 @@ class GpuMemoryRegressions(unittest.TestCase):
         spec.loader.exec_module(chk)
         rng = np.random.default_rng(31)
         matrix = sp.random(53, 17, density=0.3, random_state=rng, format="csr")
-        for lowmem in (False, True):
-            with self.subTest(lowmem=lowmem):
-                res = chk.check(matrix, [0, 1], shards=4, lowmem=lowmem,
-                                backend=gb, log=lambda _s: None)
-                self.assertEqual(res["n_shards"], 4)
-                self.assertEqual(res["block_devs"], [0, 1, 0, 1])
-                self.assertEqual(sum(res["row_nnz"]), matrix.nnz)
-                self.assertLess(res["matvec_rel_err"], 1e-12)
-                self.assertLess(res["rmatvec_rel_err"], 1e-12)
+        res = chk.check(matrix, [0, 1], shards=4, backend=gb, log=lambda _s: None)
+        self.assertEqual(res["n_shards"], 4)
+        self.assertEqual(res["block_devs"], [0, 1, 0, 1])
+        self.assertEqual(sum(res["row_nnz"]), matrix.nnz)
+        self.assertLess(res["matvec_rel_err"], 1e-12)
+        self.assertLess(res["rmatvec_rel_err"], 1e-12)
         # The script must not leak its env overrides into the caller.
         self.assertNotIn("PHEASY_GPU_SM_SHARDS", os.environ)
         # ... and it must flag a wrong result: drop one shard's rows.

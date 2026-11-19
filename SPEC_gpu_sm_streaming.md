@@ -470,3 +470,13 @@ Candidates, in order:
 5. Streaming at this p therefore remains a **fallback for when no GPU is
    available**, not the production route: the resident GPU path (5 cards at
    c3=4.5) is still the fast one, once the cards are free.
+
+### Retired: `PHEASY_GPU_SM_LOWMEM` (2026-11-20)
+
+The low-memory resident layout described in section 9 and in
+REPORT_gpu_sm_sharding_20261116.md is **refused at construction** now.  It does
+not lower the peak: torch copies every block into CSR inside `R.t() @ u`
+(11.96 GiB at c3=4.5, job 7620; 3.81 GiB per c3=5.0 block, job 7664), and the
+per-block copies do not share a caching-allocator buffer, so several shards per
+card exceed the stored-transpose footprint.  Both runs OOMed there.  Size the
+stored transpose instead (`2 x nnz x 8 B / n_cards`) and put c3=5.0 on A800.

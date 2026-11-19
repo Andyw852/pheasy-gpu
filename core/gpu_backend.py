@@ -2542,14 +2542,27 @@ class GpuSparseMV(object):
         self._cs = _col_shard_edges(sm_prime, n_shards)
         _mem_trace("GpuSparseMV nnz-balanced row edges %s (N=%d, %d shard(s) on %d card(s))"
                    % ([int(x) for x in self._rs], int(self._rs[-1]), n_shards, G))
-        # [low-mem] Optional half-memory layout: keep ONLY the row blocks and
-        # derive the adjoint from them.  torch CSRs expose .t() as a CSC VIEW
-        # that shares the same buffers (verified: same data_ptr, exact results),
-        # so R_i.t() @ u[row shard] summed over shards IS SM_prime.T @ u.  The
-        # default stays the stored-transpose layout; this is opt-in because the
-        # CSC SpMV can be slower than a stored CSR transpose.
-        self._lowmem = os.environ.get("PHEASY_GPU_SM_LOWMEM", "0").strip().lower() in (
-            "1", "true", "yes", "on")
+        # [RETIRED low-mem] PHEASY_GPU_SM_LOWMEM=1 used to keep ONLY the row
+        # blocks and derive the adjoint from the zero-copy CSC view
+        # (R.t() @ u summed over shards).  It does NOT save memory: torch
+        # materialises a CSR copy of the whole block inside that product, so the
+        # peak is resident + one block (~11.96 GiB at c3=4.5, job 7620;
+        # ~3.81 GiB per c3=5.0 block, job 7664), and because the per-block copies
+        # differ in size they do not share a caching-allocator buffer, so several
+        # shards per card pile up ABOVE the stored-transpose peak.  Both runs
+        # died of it.  Refuse it instead of letting it run: size the
+        # stored-transpose layout (2 x nnz x 8 B / n_cards) or free a card.
+        if os.environ.get("PHEASY_GPU_SM_LOWMEM", "0").strip().lower() in (
+                "1", "true", "yes", "on"):
+            raise RuntimeError(
+                "[GPU-SM] PHEASY_GPU_SM_LOWMEM is retired and refused: the "
+                "low-memory adjoint makes torch copy every block inside "
+                "'R.t() @ u' (~11.96 GiB at c3=4.5, ~3.81 GiB at c3=5.0), so its "
+                "peak is not lower than the stored-transpose layout and it "
+                "OOMed jobs 7620/7664.  Unset it and size the stored-transpose "
+                "layout (2 x nnz x 8 B / n_cards); see "
+                "SPEC_gpu_sm_streaming.md section 10.")
+        self._lowmem = False
         self._R = []
         self._T = []
         # [low-mem] per-block column slices instead of one full transpose:
@@ -2578,14 +2591,9 @@ class GpuSparseMV(object):
                 # Pre-flight from COUNTS, before either block exists: at c3=5.0
                 # they are 10.7 GB each, so building both just to measure doubled
                 # this loop's transient for no benefit.
-                if self._lowmem:
-                    required = _cuda_spmv_block_budget_counts(
-                        (r1 - r0, M), _row_nnz, (0, 0), 0,
-                        self._value_itemsize)
-                else:
-                    required = _cuda_spmv_block_budget_counts(
-                        (r1 - r0, M), _row_nnz, (c1 - c0, N), _col_nnz,
-                        self._value_itemsize)
+                required = _cuda_spmv_block_budget_counts(
+                    (r1 - r0, M), _row_nnz, (c1 - c0, N), _col_nnz,
+                    self._value_itemsize)
                 free = _device_free_bytes(d)
                 if free is not None and required > free:
                     raise MemoryError(
@@ -2603,11 +2611,10 @@ class GpuSparseMV(object):
                     _check_cuda_csr_indices(Ri)
                     self._R.append(self._csr_to_torch(Ri, dev))
                     del Ri
-                    if not self._lowmem:
-                        Ti = sm_prime[:, c0:c1].T.tocsr()
-                        _check_cuda_csr_indices(Ti)
-                        self._T.append(self._csr_to_torch(Ti, dev))
-                        del Ti
+                    Ti = sm_prime[:, c0:c1].T.tocsr()
+                    _check_cuda_csr_indices(Ti)
+                    self._T.append(self._csr_to_torch(Ti, dev))
+                    del Ti
         except Exception:
             # A failure on card k must release cards 0..k before CPU fallback.
             self.close()
@@ -2694,36 +2701,7 @@ class GpuSparseMV(object):
     def rmatvec(self, u):
         """SM_prime.T @ u -> (M,) numpy f64. u: (N,) numpy."""
         u = np.ascontiguousarray(u, dtype=np.float64)
-        if not getattr(self, "_lowmem", False):
-            return self._mv_blocks(self._T, u)
-        return self._rmatvec_from_row_blocks(u)
-
-    def _rmatvec_from_row_blocks(self, u):
-        """SM_prime.T @ u using ONLY the row blocks, via the zero-copy CSC view.
-
-        R_i is SM_prime[r0:r1, :]; R_i.t() shares its buffers (torch returns a
-        sparse CSC view), and (SM_prime.T @ u)[:] is the SUM over shards of
-        R_i.t() @ u[r0:r1] -- not a concatenation, unlike matvec.
-        """
-        t = self._t
-        np = self._np
-        ys = []
-        for i, R in enumerate(self._R):
-            r0 = int(self._rs[i])
-            r1 = int(self._rs[i + 1])
-            dev = self._block_devs[i]
-            with t.cuda.device(dev):
-                ui = t.as_tensor(u[r0:r1], dtype=self._dt64, device=dev)
-                ys.append((dev, R.t() @ ui, ui))
-        acc = None
-        for _d, _y, _keep in ys:
-            with t.cuda.device(_d):
-                part = _y.cpu().numpy().astype(np.float64)
-            acc = part if acc is None else acc + part
-        self._n_calls = getattr(self, "_n_calls", 0) + 1
-        if self._n_calls % 50 == 0:
-            t.cuda.empty_cache()
-        return acc
+        return self._mv_blocks(self._T, u)
 
     def close(self):
         """Release the GPU tensors (clear the lists, not just loop vars)."""
