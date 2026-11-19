@@ -2452,7 +2452,17 @@ def _cuda_spmv_block_budget_counts(row_shape, row_nnz, trans_shape, trans_nnz,
                 + (int(row_shape[0]) + int(trans_shape[0]) + 2) * 4)
     vectors = (sum(int(x) for x in row_shape)
                + sum(int(x) for x in trans_shape)) * _vi
-    workspace = max(256 << 20, (resident + vectors + 9) // 10)
+    # cuSPARSE's SpMV workspace is a few MB; the 10% reserve is a conservative
+    # guard against block-size rounding, not a measurement.  At c3=5.0 the
+    # stored-transpose layout needs 22.48 GiB of a 23.43 GiB card, so the default
+    # 10% (2.25 GiB) turns a 0.95 GiB fit into a refusal -- PHEASY_GPU_SM_WS_FRAC
+    # lets a run trade that margin explicitly (validate with
+    # dev/check_gpu_sm_shards.py on the real matrix first).
+    try:
+        _frac = float(os.environ.get("PHEASY_GPU_SM_WS_FRAC", "0.10"))
+    except ValueError:
+        _frac = 0.10
+    workspace = max(256 << 20, int((resident + vectors) * _frac))
     return resident + vectors + workspace
 
 
