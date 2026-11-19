@@ -80,7 +80,7 @@ if md5(o) != "e348c1f73eda8fb57b1ea4db9dc3b7f1":
 for name in ("sm_prime.npz", "disp_matrix.pkl", "cs.pkl", "ns_harm.npz",
              "ns_anharm3.npz", "colnorms_5p00.npy", "fc_dataset.json"):
     print("  %-22s %.1f MB" % (name, os.path.getsize(name) / 1e6))
-print("row_shard_count(7.5438e9, 5) =", o.row_shard_count(7543798128, 5))
+print("row_shard_count(7.5438e9, 5) =", g.row_shard_count(7543798128, 5))
 print("per-card resident = 2 x 7.5438e9 x 8 / 5 = %.2f GiB"
       % (2 * 7543798128 * 8 / 5 / 2**30))
 print("WS_FRAC =", os.environ.get("PHEASY_GPU_SM_WS_FRAC"))

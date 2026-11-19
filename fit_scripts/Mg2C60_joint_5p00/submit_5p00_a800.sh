@@ -81,7 +81,7 @@ for name in ("sm_prime.npz", "disp_matrix.pkl", "cs.pkl", "ns_harm.npz",
     print("  %-22s %.1f MB" % (name, os.path.getsize(name) / 1e6))
 print("row_shard_count(%.4e, cards):" % 7.543798128e9)
 for n in (3, 4, 5):
-    print("   %d cards -> %d shards" % (n, o.row_shard_count(7543798128, n)))
+    print("   %d cards -> %d shards" % (n, g.row_shard_count(7543798128, n)))
 print("HARM_DENSE OK:", o.harm_dense_setting("RFE-OLS"))
 PYCHK
 [ $? -ne 0 ] && exit 1
