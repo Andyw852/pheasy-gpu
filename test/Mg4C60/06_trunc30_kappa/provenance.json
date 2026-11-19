@@ -1,0 +1,48 @@
+{
+  "purpose": "kappa with 3.5A joint (exactgram) FC2+FC3, FC3 truncated to 3.0 A neighbour range",
+  "source_fc2": {
+    "file": "fc2.hdf5",
+    "md5": "dd90672d1fded6473f5f458cd7eb722b",
+    "origin": "Mg4C60_joint_3p50_exactgram (3.5 A joint refit)"
+  },
+  "source_fc3": {
+    "file": "fc3.hdf5",
+    "md5": "45594abf25958414e2aae76fc7beaf64",
+    "origin": "Mg4C60_joint_3p50_exactgram"
+  },
+  "output_fc3": {
+    "file": "fc3_trunc3p0.hdf5",
+    "md5": "85f165e391eb13ebdb524a313258dfa2",
+    "bytes": 37999642
+  },
+  "cutoff_A": 3,
+  "distance_convention": "minimum-image distance in the 512-atom 2x2x1 supercell (lattice 18.478/19.412/16.095 A; nearest pair 1.3681 A)",
+  "validation": {
+    "triplets_before": 73328,
+    "triplets_kept": 50336,
+    "triplets_zeroed": 22992,
+    "zeroed_fraction_pct": 31.36,
+    "kept_set_equals_3p0fit_set": true,
+    "ref_3p0fit_triplets": 50336,
+    "ref_3p0fit_max_pair_dist_A": 2.9966,
+    "ref_3p0fit_violations_over_cutoff": 0,
+    "coeff_terms_compared": 1096320,
+    "coeff_rel_diff_vs_3p0fit_pct": 2.034,
+    "coeff_max_abs_diff": 2.2505,
+    "asr_ref_max_abs_sum_j": 4.2157e-12,
+    "asr_truncated_max_abs_sum_j": 3.139,
+    "asr_violation_ratio_pct_of_max_entry": 1.765
+  },
+  "kappa_job": {
+    "cluster": "jzzn",
+    "jobid": "5872569",
+    "chunks": 25,
+    "mesh": "8x8x8",
+    "read_gamma": false,
+    "cores": 16,
+    "time_limit": "23:59:00",
+    "qos": "regular",
+    "exclude": "cu59"
+  },
+  "note": "truncated FC3 is NOT re-constrained to the acoustic sum rule (the fitted reference is); this is an intrinsic approximation of the truncation approach"
+}

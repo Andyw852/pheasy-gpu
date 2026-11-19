@@ -1,0 +1,268 @@
+{
+  "FIT_DONE": true,
+  "dataset": {
+    "dataset_sha256": "b5a7cdf865b75908d4888ce7e5892a1925c68749860391843ffead562f907f5a",
+    "dataset_forces_sha256": "328a4b107f6291924ca7d8d573a0e423424806c6240987156d7c9e7f460f883c",
+    "dataset_n_frames": 297,
+    "dataset_displacement_rms": 0.01727573622803458,
+    "dataset_displacement_max": 0.08939029523195442,
+    "source_frames_total": 297,
+    "coords_mode": "fractional",
+    "equilibrium_frame": true
+  },
+  "rfe": {
+    "n_active": 7360,
+    "n_candidates": 10540,
+    "support_file": "rfe_support.npy",
+    "gram_exact_rounds": 11,
+    "rfe_criterion": null,
+    "solver": null
+  },
+  "job_id": "slurm-7628",
+  "engine": "pheasy",
+  "fit_method": "RFE-OLS",
+  "enable_fc": 3,
+  "n_frames": 296,
+  "natom_super": 512,
+  "stable": false,
+  "status": "stable",
+  "imaginary_frequency": true,
+  "min_frequency_THz": -6.567566033384141e-07,
+  "min_freq_nonac_THz": -6.568e-07,
+  "min_freq_nac_THz": null,
+  "nac_used_for_verdict": false,
+  "is_2d": false,
+  "shengbte_export": true,
+  "fit_quality_gate_failed": true,
+  "tool_ok": true,
+  "stability_verdict": "pass",
+  "imag": {
+    "verdict": "pass",
+    "imag_class": "noise",
+    "min_freq_THz": -6.567566033384141e-07,
+    "min_freq_cm1": -2.190704253116351e-05,
+    "q_at_min_frac": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "q_norm_at_min": 0.0,
+    "branch_at_min": 0,
+    "n_neg_qpoints": 1,
+    "thresholds": {
+      "IMAG_THR": 0.1,
+      "IMAG_THR_STRICT": 0.1,
+      "IMAG_QGAMMA": 0.05,
+      "IMAG_QGAMMA_GRACE": 1.2,
+      "IMAG_QGAMMA_EFFECTIVE": 0.06,
+      "near_gamma": "声学支：|q|_frac < IMAG_QGAMMA × IMAG_QGAMMA_GRACE（=0.06）；Petretto 严格窗口 = |q|_frac < IMAG_QGAMMA（=0.05）",
+      "q_norm_def": "分数坐标去掉真空轴分量后的欧氏范数（3D 用三分量）",
+      "IMAG_THR_semantics": "近 Γ 声学支上限（不是全局阈值）",
+      "IMAG_QGAMMA_GRACE_semantics": "用户 2026-09-22 批准：同一条近 Γ 软模跨 0.05 边界时不被升格为 fail；1.0 = 严格口径",
+      "refs": [
+        "Petretto et al., Scientific Data 5, 180065 (2018)：0 < |q| < 0.05 失稳窗口、5 cm^-1 阈值",
+        "Lin, Poncé, Marzari, npj Comput. Mater. 8, 236 (2022)：远离 Γ 的虚频是真失稳特征"
+      ]
+    },
+    "policy_version": "imag_policy/1.0"
+  },
+  "imag_policy_refs": [
+    "Petretto et al., Scientific Data 5, 180065 (2018)：0 < |q| < 0.05 失稳窗口、5 cm^-1 阈值",
+    "Lin, Poncé, Marzari, npj Comput. Mater. 8, 236 (2022)：远离 Γ 的虚频是真失稳特征"
+  ],
+  "imag_class": "noise",
+  "min_freq_THz": -6.567566033384141e-07,
+  "fc2_symmetry": {
+    "spread_THz": 1.6342482922482304e-13,
+    "n_ops": 4,
+    "n_q": 12,
+    "symprec": 1e-05,
+    "tol_THz": 0.001,
+    "broken": false
+  },
+  "note": "min_freq(no-NAC)=-0.000 THz; imag_policy=pass/noise; imag_policy min=-0.0000 THz (-0.00 cm-1); fc2 symmetry spread=1.63e-13 THz over 4 ops (tol 1e-03) -> no significant imaginary frequency",
+  "fit_rmse_eV_per_A": 0.006712340209761862,
+  "fit_rmse_relative": 0.007760381543235343,
+  "fit_rmse_frames_used": 8,
+  "fit_rmse_fc3_sampled": true,
+  "self_check": "fix_fc2_rmse_reference",
+  "self_check_hiphive_re": 0.007760381543235343,
+  "self_check_frames": 8,
+  "self_check_fc3_sampled": true,
+  "fix_fc2_rmse_check": {
+    "reference": "<gpu-host>:/data/taskflow/work/Mg4C60_c3scan_ols/Mg4C60_joint_3p50_exactgram/fit_manifest.json",
+    "tol": 0.01,
+    "run_rmse": 0.006712340209761862,
+    "ref_rmse": 0.006656042643695232,
+    "rel_diff": 0.008458113789273412
+  },
+  "fix_fc2_self_check_ok": true,
+  "pheasy_rmse_train": 0.0067371547828896225,
+  "pheasy_relative_error": 0.09197469968864612,
+  "pheasy_re_total_forces": 0.007758262679122608,
+  "pheasy_rmse_cv": 0.006949742780495179,
+  "pheasy_worst_force_correlation": 1.0,
+  "pheasy_free_ifcs": 10540,
+  "pheasy_cv_hit_cap": false,
+  "pheasy_cv_warning": false,
+  "pheasy_gpu_evidence": [],
+  "pheasy_gpu_used": false,
+  "fix_self_proof": {
+    "ok": true,
+    "fails": [],
+    "start_n_features": 10540,
+    "plan_p": 10540
+  },
+  "mem_probe": {
+    "via": "import",
+    "module": "pheasy_gpu.core.optimizer",
+    "file": "<gpu-host>:/home/software/pheasy-gpu-gh/core/optimizer.py",
+    "md5": "e348c1f73eda8fb57b1ea4db9dc3b7f1"
+  },
+  "driver_md5": "f069d1aa9a3af63a3242a1882ac84bfe",
+  "fix_scan_active": true,
+  "rfe_plan": {
+    "n": 454656,
+    "p": 10540,
+    "sm_bytes": 19168296960,
+    "gram_bytes": 7998595200,
+    "gram_gb": 9,
+    "avail_bytes": 101829292032,
+    "sm_gb": 19.17,
+    "gram_gb_raw": 8.0,
+    "errors": []
+  },
+  "scan_check": {
+    "ok": true,
+    "checks": {
+      "present_PHEASY_RFE_STEP": true,
+      "present_PHEASY_RFE_RIDGE_ALPHA": true,
+      "present_PHEASY_RFE_1SE": true,
+      "present_PHEASY_SM_DTYPE": true,
+      "present_PHEASY_RFE_GRAM_GB": true,
+      "manifest_step": true,
+      "manifest_ridge": true,
+      "manifest_1se": true,
+      "manifest_sm_dtype": true,
+      "gram_gb": true,
+      "gram_from_round0": true,
+      "execution_backend": true,
+      "rfe_gram_n_features": true,
+      "start_fields": true,
+      "pheasy_code_md5": true
+    },
+    "reasons": [],
+    "manifest_environment": {
+      "PHEASY_RFE_STEP": "0.05",
+      "PHEASY_RFE_RIDGE_ALPHA": "0",
+      "PHEASY_RFE_1SE": "1",
+      "PHEASY_SM_DTYPE": "float32",
+      "PHEASY_RFE_GRAM_GB": "9"
+    },
+    "manifest_code": {
+      "optimizer": {
+        "md5": "e348c1f73eda8fb57b1ea4db9dc3b7f1",
+        "path": "<gpu-host>:/home/software/pheasy-gpu-gh/core/optimizer.py"
+      },
+      "run_pheasy": {
+        "md5": "bc1219e0a6ae00f08e571f23c5623e38",
+        "path": "<gpu-host>:/home/software/pheasy-gpu-gh/run_pheasy.py"
+      }
+    },
+    "present": {
+      "PHEASY_RFE_STEP": true,
+      "PHEASY_RFE_RIDGE_ALPHA": true,
+      "PHEASY_RFE_1SE": true,
+      "PHEASY_SM_DTYPE": true,
+      "PHEASY_RFE_GRAM_GB": true
+    },
+    "start_line": "[RFE] START n_features=10540, step=0.05, cv=5, min_features=1, patience=5, solver=lstsq, ridge_alpha=0.00e+00",
+    "start_params": {
+      "n_features": 10540,
+      "step": 0.05,
+      "cv": 5,
+      "min_features": 1,
+      "patience": 5,
+      "solver": "lstsq",
+      "ridge_alpha": 0.0
+    },
+    "exact_gram_log_line": true,
+    "code_md5": "e348c1f73eda8fb57b1ea4db9dc3b7f1",
+    "probe_md5": "e348c1f73eda8fb57b1ea4db9dc3b7f1",
+    "failed_checks": []
+  },
+  "rfe_start_mismatch": false,
+  "fit_artifact_check": {
+    "checks": {
+      "force_matrix_not_short": true,
+      "ndata_all_present": true,
+      "ndata_consistent": true,
+      "pkl_rows": true,
+      "sm_ok": true
+    },
+    "reasons": [],
+    "ndata": {
+      "log": 296,
+      "cmdline": 296,
+      "prep": 296,
+      "pkl": 296,
+      "sm_meta": 296
+    },
+    "short_force_matrix_warning": null,
+    "sm": {
+      "checks": {
+        "sm_dtype": true,
+        "sm_shape": true,
+        "meta_dtype": true,
+        "meta_ndata": true,
+        "meta_excluded_empty": true,
+        "meta_shape_p": true
+      },
+      "reasons": [],
+      "sm_shape": [
+        454656,
+        10540
+      ],
+      "sm_dtype": "float32",
+      "meta": {
+        "src": [
+          "sm_prime.npz",
+          7714036109,
+          1794940963669317684
+        ],
+        "smp3_shape": [
+          454656,
+          20169
+        ],
+        "smp3_nnz": 265675392,
+        "smp3_digest": "f07a526c67961221f43cd4054ce1aae8936e2d5e0a538c71e3f25ecdbabfd76d",
+        "ns_shape": [
+          20169,
+          10540
+        ],
+        "ns_digest": "ec069a90087b7044048d5160250fd702656ce3152bf12e749693d5cf84835528",
+        "excluded_configs": [],
+        "dtype": "float32",
+        "ndata": 296
+      },
+      "ok": true,
+      "failed_checks": []
+    },
+    "ok": true,
+    "failed_checks": []
+  },
+  "pheasy_method": "RFE-OLS",
+  "fit_method_configured": "RFE-OLS",
+  "fit_method_delivered": "RFE-OLS",
+  "alpha_star": null,
+  "alpha_star_source": "not_applicable",
+  "pheasy_gpu_requested": false,
+  "pheasy_gpu_resident": false,
+  "pheasy_lasso_twolevel": false,
+  "fix_fc2": {
+    "enabled": true,
+    "sha256": "5bfd5038bf7402c3f45dad19684e8311eacfc5d187e34a5dc51a89551a6626c7",
+    "gate": "pass",
+    "reason": "fix_fc2 contract satisfied"
+  }
+}

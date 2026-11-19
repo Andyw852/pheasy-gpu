@@ -1,0 +1,18 @@
+[WARN] fc3.hdf5 would need 29.0 GB in memory (limit 8.0 GB); skipping the ShengBTE fc3 export.  Raise FC3_LOAD_GB_LIMIT if this node has the memory.
+[OK] ShengBTE export done
+[OK] shengbte/CONTROL written (natoms=128 scell=[2, 2, 1] ngrid=[5, 5, 3] nonanalytic=False convergence=False); FC_2ND 512 atoms = 128 x 4
+[..] fc3 full array 29.0 GB > 8.0 GB: sampling 8 frame(s) with fc2+fc3 (no fc2-only fallback)
+[OK] fit residual over 8 frame(s): RMSE 0.00671 eV/A (relative 0.0078)
+[..] fc3 full array 29.0 GB > 8.0 GB: sampling 8 frame(s) with fc2+fc3 (no fc2-only fallback)
+[..] fc3 full array 29.0 GB > 8.0 GB: sampling 296 frame(s) with fc2+fc3 (no fc2-only fallback)
+[self-check] frames=296 fc3_reeval=505.9s pheasy_re_total=0.007758 hiphive_re=0.007758
+[OK] self-check: same-frame re agrees with pheasy (rel diff 3.62e-10 <= 1e-3)
+[self-check/fix_fc2] hiphive re=0.00776: RMSE 与参考联合拟合一致（相差 0.846%）
+[OK] cutoff_scan.json（1 档，mode=single）
+<gpu-host>:/home/miniconda3/envs/mace-gpu/lib/python3.11/site-packages/seekpath/hpkot/__init__.py:172: DeprecationWarning: dict interface is deprecated. Use attribute interface instead
+  conv_lattice = dataset["std_lattice"]
+[OK] min_freq(no-NAC)=-0.000 THz; imag_policy=pass/noise; imag_policy min=-0.0000 THz (-0.00 cm-1); fc2 symmetry spread=1.63e-13 THz over 4 ops (tol 1e-03) -> no significant imaginary frequency
+[FAIL] a fit-quality gate flagged this run -- see the log above
+[DONE] post: phonon_summary.json + fc_fit_summary.json ready (stable=false, status=stable)
+[FIX_FC2] kl_bundle/fc2.hdf5 <- fixed fc.hdf5 (sha256 5bfd5038bf7402c3f45dad19684e8311eacfc5d187e34a5dc51a89551a6626c7)
+[OK] kl_bundle/（12 文件）—— kl-dft-cpu 跨集群复用 fc2/fc3 用

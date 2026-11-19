@@ -170,3 +170,41 @@ command line (`pheasy_f_cmdline.txt`), and the full fit log. The essential switc
 The κ values above were produced from these `fc2.hdf5` + `fc3.hdf5` pairs with phono3py 3.24.0
 (Wigner RTA, 8×8×8, 300 K, isotope on). When a q-grid subset is passed via `grid_points`,
 `conductivity.set_kappa_at_sigmas()` must be called explicitly, otherwise κ comes back as zero.
+
+---
+
+## 8. Update (2026-11-19): FC3 cutoff — truncation versus refit, and the acoustic sum rule
+
+After the five fits above, a follow-up experiment asked a sharper question:
+*what happens to kappa if the 3.5 A force constants are used but FC3 is restricted
+to 3.0 A range?* Two routes were taken.
+
+**(a) Truncation** — zero every FC3 triplet whose pair distances exceed 3.0 A
+(keeps exactly the 3.0 A fit's triplet set: 50336 of 73328 triplets, 31.4 % removed),
+then recompute kappa at 8x8x8 / 300 K / isotope:
+
+| case | kappa_P | kappa_C | kappa_TOT |
+|---|---|---|---|
+| 3.5 A full FC3 (02) | 1.1853 | 0.5475 | 1.7328 |
+| 3.5 A FC3 truncated to 3.0 A | **0.9720** | **0.5456** | **1.5176** |
+
+**(b) Refit** — freeze FC2 to the 3.5 A joint FC2 (dd90672d) and refit FC3 with
+c3_cutoff = 3.0 (RFE-OLS, CV=5, step 0.05, 1SE -> 7360 of 10540 anharmonic terms;
+train RMSE 0.0067372). Archived in 07_refit30_c3_3p0/; its kappa run was in flight
+when this note was written.
+
+**The truncation result is a trap: it breaks the acoustic sum rule.**
+Zeroing long-range triplets leaves max|sum_j Phi3(i,j,k)| = 3.139 instead of 0.
+Projecting the tensor back onto the ASR (phono3py set_translational_invariance_fc3
++ set_permutation_symmetry_fc3) changes FC3 by only **0.0959 %** in Frobenius norm,
+yet on a single q-point chunk it lifts kappa_P from 1.376 back to 2.755
+(the un-truncated 3.5 A value is 3.619) — i.e. **61.5 % of the apparent
+truncation effect is an ASR artefact**, while kappa_C stays unchanged (+-0.3 %).
+
+Full explanation, validation numbers and reproduction recipe:
+**[ASR_EFFECT_AND_TRUNCATION.md](ASR_EFFECT_AND_TRUNCATION.md)**.
+Data: 06_trunc30_kappa/ (sparse truncated FC3, 25-chunk kappa, chunk-3 pilot with
+all three FC3 variants) and 07_refit30_c3_3p0/ (refit FC3 + fit artifacts).
+
+Practical consequence: a shorter FC3 cutoff must be studied by **refitting** under
+the ASR constraint, not by zeroing a longer-range fit.
