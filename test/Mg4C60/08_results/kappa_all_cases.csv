@@ -1,0 +1,12 @@
+case,cutoff_A,protocol,fc2_md5,fc3_md5,support,kappa_P,kappa_C,kappa_TOT,status,note
+3p5A_1SE_9765,3.5,FC3 only (FC2 frozen 313d0f61),313d0f61,6683f98e,9765/16311,1.378284,0.545760,1.924045,FINAL,main value
+3p5A_CVmin_11390,3.5,FC3 only (FC2 frozen 313d0f61),313d0f61,054a4e82,11390/16311,1.310855,0.546613,1.857467,FINAL,
+3p5A_1SE_9765_mesh6,3.5,FC3 only (FC2 frozen 313d0f61),313d0f61,6683f98e,9765/16311,1.349515,0.560474,1.909990,FINAL,q-grid 6x6x6
+3p5A_joint_82686_iso,3.5,joint FC2+FC3,f19f63f0,0ec23e7d,82686/90328,1.185329,0.547494,1.732823,FINAL,earlier independent run
+3p5A_joint_82686_iso_exactgram,3.5,joint FC2+FC3,dd90672d,45594abf,82686/90328,1.235547,0.546538,1.782085,FINAL,reference for the 3.0 A truncation/refit
+3p5A_joint_82686_noniso,3.5,joint FC2+FC3 (no isotope),f19f63f0,0ec23e7d,82686/90328,1.213508,0.543139,1.756647,FINAL,
+3p0A_1SE_7360,3.0,FC3 only (FC2 frozen 313d0f61),313d0f61,d78fbaf2,7360/10540,1.440576,0.542429,1.983006,FINAL,
+3p0A_joint_7683,3.0,joint FC2+FC3,313d0f61,fed9fc93,7683/10540,1.521700,0.541578,2.063278,FINAL,
+3p0A_refit_frozen35FC2,3.0,FC3 refit at c3=3.0 (FC2 frozen dd90672d),dd90672d,69d399b8,7360/10540,1.463046,0.540712,2.003757,FINAL,clean FC3-range effect
+3p0A_trunc30_noASR,3.0,FC3 of the 3.5 A fit zeroed beyond 3.0 A (no ASR),dd90672d,45594abf truncated,50336 triplets,0.971976,0.545611,1.517587,FINAL,ASR artefact - do not quote
+3p0A_trunc30_ASR,3.0,same + ASR/permutation projection,dd90672d,truncated+projected,50336 triplets,1.122343,0.544583,1.666926,24/25 chunks,preliminary

@@ -208,3 +208,30 @@ all three FC3 variants) and 07_refit30_c3_3p0/ (refit FC3 + fit artifacts).
 
 Practical consequence: a shorter FC3 cutoff must be studied by **refitting** under
 the ASR constraint, not by zeroing a longer-range fit.
+
+---
+
+## 9. Current numbers (2026-11-21)
+
+All Wigner kappa values (8x8x8, 300 K, isotope), W m^-1 K^-1. Full tables,
+CSV and figure: **[08_results/](08_results/KAPPA_RESULTS.md)**.
+
+| case | kappa_P | kappa_C | kappa_TOT |
+|---|---|---|---|
+| 3.5 A 1SE 9765 — **main value** (FC2 frozen) | 1.3783 | 0.5458 | **1.9240** |
+| 3.5 A joint FC2+FC3 (exactgram) | 1.2355 | 0.5465 | 1.7821 |
+| **3.0 A FC3 refit, FC2 frozen at 3.5 A** | 1.4630 | 0.5407 | **2.0038** |
+| 3.0 A joint FC2+FC3 | 1.5217 | 0.5416 | 2.0633 |
+| 3.0 A FC3 truncated + ASR (24/25 chunks) | 1.1223 | 0.5446 | 1.6669 |
+| 3.0 A FC3 truncated, no ASR (artefact) | 0.9720 | 0.5456 | 1.5176 |
+
+Key points:
+
+* Shortening the FC3 range from 3.5 to 3.0 A and **refitting** raises kappa_TOT
+  by **+12.4 %**; the FC2 provenance adds another +3.0 %.
+* Truncating the same FC3 instead of refitting gives **-14.8 %** (and still
+  -7.1 % after fixing the acoustic sum rule) — opposite sign, ~20 % apart.
+  Truncation must not be used as a substitute for a refit.
+* kappa_C never leaves 0.5407-0.5475: all of the sensitivity is in kappa_P.
+* Reproducibility floor from two independent joint refits: **+-2.8 %**.
+* 4.0 A was abandoned: 121438 free IFCs would need >= 417 GB RAM (node: 257 GB).
