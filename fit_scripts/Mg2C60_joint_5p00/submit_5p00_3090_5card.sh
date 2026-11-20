@@ -64,6 +64,36 @@ COLNORMS=$CASE/colnorms_5p00.npy
 
 echo "[5p00c] start $(date) host=$(hostname) c3=5.0 5 cards stored-transpose ws_frac=0.01"
 
+# Wait (bounded) for the cards to become clear.  This box is shared: other
+# sessions' jobs sometimes hold GPU memory without a SLURM gres reservation,
+# and the 5.0 A layout needs 22.98 GiB free on EVERY card.  Poll for up to
+# 45 min before giving up, so a job that starts while the previous one is still
+# releasing does not abort needlessly.
+WAIT_MIN=${PHEASY_GPU_WAIT_MIN:-45}
+WAITED=0
+while [ $WAITED -lt $((WAIT_MIN * 60)) ]; do
+    MIN_FREE=$(python - <<'PYGPU'
+import torch
+vals = []
+for i in range(torch.cuda.device_count()):
+    f, _t = torch.cuda.mem_get_info(i)
+    vals.append(f / 2**30)
+print('%.2f' % min(vals) if vals else '0')
+PYGPU
+    )
+    echo "[5p00c] wait: min free VRAM %.2f GiB (need 22.98) after ${WAITED}s" % "$MIN_FREE" 2>/dev/null || echo "[5p00c] wait: min free VRAM $MIN_FREE GiB (need 22.98) after ${WAITED}s"
+    if python - <<PYOK
+import sys
+sys.exit(0 if float('$MIN_FREE') >= 22.98 else 1)
+PYOK
+    then
+        echo "[5p00c] cards are clear"
+        break
+    fi
+    sleep 120
+    WAITED=$((WAITED + 120))
+done
+
 echo "=== preflight ==="
 python - <<PYCHK
 import hashlib, os, sys
