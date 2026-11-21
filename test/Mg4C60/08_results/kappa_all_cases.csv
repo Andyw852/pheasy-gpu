@@ -9,4 +9,4 @@ case,cutoff_A,protocol,fc2_md5,fc3_md5,support,kappa_P,kappa_C,kappa_TOT,status,
 3p0A_joint_7683,3.0,joint FC2+FC3,313d0f61,fed9fc93,7683/10540,1.521700,0.541578,2.063278,FINAL,
 3p0A_refit_frozen35FC2,3.0,FC3 refit at c3=3.0 (FC2 frozen dd90672d),dd90672d,69d399b8,7360/10540,1.463046,0.540712,2.003757,FINAL,clean FC3-range effect
 3p0A_trunc30_noASR,3.0,FC3 of the 3.5 A fit zeroed beyond 3.0 A (no ASR),dd90672d,45594abf truncated,50336 triplets,0.971976,0.545611,1.517587,FINAL,ASR artefact - do not quote
-3p0A_trunc30_ASR,3.0,same + ASR/permutation projection,dd90672d,truncated+projected,50336 triplets,1.122343,0.544583,1.666926,24/25 chunks,preliminary
+3p0A_trunc30_ASR,3.0,same + ASR/permutation projection,dd90672d,truncated+projected,50336 triplets,1.114770,0.544204,1.658974,FINAL,ASR/permutation projection

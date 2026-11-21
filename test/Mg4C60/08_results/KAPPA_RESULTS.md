@@ -23,7 +23,7 @@ nothing is hand-computed.
 | 3p0A_joint_7683 | 3.0 A | joint FC2+FC3 | 313d0f61 | fed9fc93 | 7683/10540 | 1.521700 | 0.541578 | 2.063278 |
 | **3p0A_refit_frozen35FC2** | 3.0 A | FC3 refit at c3=3.0, FC2 frozen (3.5 A) | dd90672d | 69d399b8 | 7360/10540 | 1.463046 | 0.540712 | **2.003757** |
 | 3p0A_trunc30_noASR | 3.0 A | FC3 of the 3.5 A fit zeroed >3.0 A | dd90672d | truncated 45594abf | 50336 triplets | 0.971976 | 0.545611 | 1.517587 |
-| 3p0A_trunc30_ASR | 3.0 A | same + ASR/permutation projection | dd90672d | truncated+projected | 50336 triplets | 1.122343 | 0.544583 | 1.666926 (24/25 chunks) |
+| 3p0A_trunc30_ASR | 3.0 A | same + ASR/permutation projection | dd90672d | truncated+projected | 50336 triplets | 1.114770 | 0.544204 | 1.658974 |
 
 CSV: kappa_all_cases.csv (same table, machine readable).
 
@@ -39,7 +39,7 @@ Reference: the 3.5 A joint fit (exactgram, kappa_TOT = 1.782085).
 | FC2 provenance (3.5 frozen FC2 -> 3.0 joint FC2) | +4.01 % | +0.16 % | +3.00 % |
 | total, 3.5 joint -> 3.0 joint | +23.16 % | -0.91 % | +15.78 % |
 | truncation, no ASR | -21.33 % | -0.17 % | -14.84 % |
-| truncation after ASR projection (24/25 chunks) | -9.97 % | -0.44 % | -7.06 % |
+| truncation after ASR projection | -9.78 % | -0.43 % | -6.91 % |
 | support endpoint 1SE -> CV-min (3.5 A) | -4.89 % | +0.16 % | -3.46 % |
 | q-grid 6x6x6 -> 8x8x8 | +2.13 % | -2.63 % | +0.74 % |
 | isotope off -> on | -2.32 % | +0.80 % | -1.36 % |
@@ -94,9 +94,7 @@ kappa_C share 28.4 %) for 3.5 A / 8x8x8 / 300 K / isotope / frozen-FC2 protocol.
 
 * All 3.5 A cases: final.
 * 3.0 A refit (clean FC3-range effect): final, 25/25 chunks.
-* 3.0 A truncation + ASR: 24/25 chunks; the last chunk failed with NODE_FAIL and
-  is being re-run. Its weight is 24/512 = 4.7 %, so the merged value is not
-  expected to move by more than ~0.5 %.
+* 3.0 A truncation + ASR: final, 25/25 chunks (kappa_TOT 1.658974).
 * 4.0 A: cancelled. A full joint 4.0 A refit needs 121438 free IFCs
   (47421 anharmonic) and >= 417 GB of RAM; the available node has 257 GB.
 

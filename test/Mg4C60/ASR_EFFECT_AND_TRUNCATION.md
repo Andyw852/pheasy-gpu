@@ -150,6 +150,8 @@ to complete the comparison; their merged kappa JSONs will be added here.
   (no ASR projection), i.e. the artefact-affected number.
 * kappa_trunc30_asr_chunk03.json — chunk-3 pilot: all three FC3 variants on the
   same 6 q-points (this note's table).
+* kappa_trunc30_asr_merged.json — **full 25-chunk Wigner kappa of the ASR-projected
+  FC3** (see the section "Full-mesh result" below).
 * provenance.json — exact recipe, distances, validation counters, md5s.
 
 07_refit30_c3_3p0/
@@ -172,3 +174,21 @@ to complete the comparison; their merged kappa JSONs will be added here.
         set_translational_invariance_fc3(fc3)
         set_permutation_symmetry_fc3(fc3)     # residual -> 1.6e-12
     # write fc3 with the same layout (chunks (32,32,64,1,1,1), gzip) if needed
+
+---
+
+## 8. Full-mesh result (all 150 irreducible q-points, 25/25 chunks)
+
+The chunk-3 pilot above was later completed on the full 8x8x8 grid:
+
+| route | kappa_P | kappa_C | kappa_TOT | vs 3.5 A joint |
+|---|---|---|---|---|
+| 3.5 A joint (reference) | 1.235547 | 0.546538 | 1.782085 | — |
+| 3.5 A joint FC3 zeroed beyond 3.0 A (no ASR repair) | 0.971976 | 0.545611 | 1.517587 | -14.84 % |
+| **zeroed + ASR projection** | **1.114770** | **0.544204** | **1.658974** | **-6.91 %** |
+| 3.0 A FC3 **refitted** (FC2 frozen at 3.5 A) | 1.463046 | 0.540712 | 2.003757 | +12.44 % |
+
+Repairing the ASR moves the answer from -14.84 % to -6.91 % (i.e. recovers about
+half of the artefact), but it is still on the opposite side of the refit result
+(+12.44 %): truncation cannot replace a refit. kappa_C stays put in every row
+(0.5442-0.5465), as always.

@@ -222,7 +222,7 @@ CSV and figure: **[08_results/](08_results/KAPPA_RESULTS.md)**.
 | 3.5 A joint FC2+FC3 (exactgram) | 1.2355 | 0.5465 | 1.7821 |
 | **3.0 A FC3 refit, FC2 frozen at 3.5 A** | 1.4630 | 0.5407 | **2.0038** |
 | 3.0 A joint FC2+FC3 | 1.5217 | 0.5416 | 2.0633 |
-| 3.0 A FC3 truncated + ASR (24/25 chunks) | 1.1223 | 0.5446 | 1.6669 |
+| 3.0 A FC3 truncated + ASR projection | 1.1148 | 0.5442 | 1.6590 |
 | 3.0 A FC3 truncated, no ASR (artefact) | 0.9720 | 0.5456 | 1.5176 |
 
 Key points:
@@ -230,7 +230,7 @@ Key points:
 * Shortening the FC3 range from 3.5 to 3.0 A and **refitting** raises kappa_TOT
   by **+12.4 %**; the FC2 provenance adds another +3.0 %.
 * Truncating the same FC3 instead of refitting gives **-14.8 %** (and still
-  -7.1 % after fixing the acoustic sum rule) — opposite sign, ~20 % apart.
+  -6.9 % after fixing the acoustic sum rule) — opposite sign, ~20 % apart.
   Truncation must not be used as a substitute for a refit.
 * kappa_C never leaves 0.5407-0.5475: all of the sensitivity is in kappa_P.
 * Reproducibility floor from two independent joint refits: **+-2.8 %**.
