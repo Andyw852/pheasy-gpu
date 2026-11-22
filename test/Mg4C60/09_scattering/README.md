@@ -1,7 +1,7 @@
 # Mode-resolved phonon scattering data (Mg4C60)
 
 Per-mode anharmonic and isotope scattering data extracted from the **full-mesh
-Wigner runs** that produced the kappa values in ../08_results/. They are the raw
+Wigner runs** that produced the kappa values in ../kappa/. They are the raw
 material for scattering-rate / mean-free-path figures.
 
 ## Files
@@ -13,6 +13,8 @@ material for scattering-rate / mean-free-path figures.
 | scattering_modes_c3_3p50.csv | derived per-mode quantities for the 3.5 A case |
 | fig_scattering_c3_3p50.png / .pdf | three-panel figure (rates + mean free path) |
 | ../../scripts/plot_scattering.py | the script that produces the figure and the CSV |
+| scattering_section.html | ready-to-paste HTML section for a report (Chinese) |
+| insert_scattering_section.py | helper that inserts the section into an existing report.html |
 
 ## Arrays in the .npz
 
@@ -53,6 +55,23 @@ Both runs: phono3py 3.24.0, Wigner RTA, 8x8x8 mesh, 150 irreducible q-points,
 The two cases share the same FC2 (313d0f61), hence identical phonon frequencies
 (the stored spectra agree to 5e-7 THz); only FC3 differs, so the scattering
 rates are directly comparable.
+
+Group velocities are not stored in the phono3py output. They were recomputed from
+FC2 on the 3090 cluster node (SLURM job 7747, mace-gpu env, phonopy, ~97 s); the
+frequencies used for the recomputation agree with the Wigner output to
+5.7e-7 THz. (An independent run on a different machine gives the same velocities
+to within 1.2e-10 A/ps.)
+
+## Using the section in a report
+
+The folder also contains a self-contained HTML section and a small helper:
+
+    python insert_scattering_section.py /path/to/report_folder            # dry run
+    python insert_scattering_section.py /path/to/report_folder --write    # apply
+
+It copies the figure into <report>/figures/ and replaces the section that starts
+at the first <h2> containing "声子散射"/"散射"/"scattering" (or appends before
+</body> if no such heading exists), keeping a report.html.bak backup.
 
 ## Reproducing the figure
 

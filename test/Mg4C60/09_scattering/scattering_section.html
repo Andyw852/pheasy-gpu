@@ -1,0 +1,46 @@
+<section id="scattering">
+  <h2>3&nbsp;&nbsp;声子散射（逐模式）</h2>
+  <p>基于 3.5 Å 力常数的全网格 Wigner 计算输出的逐模式数据（150 个不可约 q 点 × 384 支，
+     8×8×8 网格，300 K，含天然同位素），给出模式分辨的三声子散射率、同位素散射率与平均自由程。
+     三声子线宽 γ 与同位素线宽 γ<sub>iso</sub> 直接取自 phono3py 的 <code>kappa-m888.hdf5</code>；
+     群速度由 FC2 经 phonopy 计算（频率与 Wigner 输出一致到 2.5×10<sup>-7</sup> THz）。</p>
+
+  <figure>
+    <img src="figures/fig_scattering_c3_3p50.png" alt="Mg4C60 mode-resolved phonon scattering"
+         style="width:100%;max-width:1500px">
+    <figcaption>
+      图 3&nbsp;&nbsp;Mg<sub>4</sub>C<sub>60</sub> 的逐模式声子散射（3.5 Å 力常数，300 K，8×8×8，含同位素）。
+      (a) 三声子散射率 τ<sup>-1</sup> = 2γ；(b) 天然同位素散射率，虚线为低频段 ∝ω<sup>4</sup> 的引导线；
+      (c) 平均自由程 |v|·τ（已剔除 Γ 点、ω &lt; 0.1 THz 与群速度趋零的模）。
+    </figcaption>
+  </figure>
+
+  <h3>3.1&nbsp;&nbsp;关键数字</h3>
+  <table>
+    <thead>
+      <tr><th>量（3.5 Å，57 216 个模）</th><th>p50</th><th>p90</th><th>p99</th><th>最大</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>寿命 τ (ps)</td><td>6.73</td><td>18.98</td><td>25.83</td><td>1200</td></tr>
+      <tr><td>平均自由程 (nm)</td><td>3.05</td><td>15.5</td><td>41.3</td><td>5838</td></tr>
+      <tr><td>三声子散射率 τ<sup>-1</sup> (THz)</td><td colspan="4">中位 1.49×10<sup>-1</sup></td></tr>
+      <tr><td>同位素散射率 (THz)</td><td colspan="4">中位 6.1×10<sup>-3</sup>（低频段与 ω<sup>4</sup> 一致）</td></tr>
+    </tbody>
+  </table>
+  <p>寿命与自由程呈强重尾分布：中位自由程仅 3 nm，但 1 % 的模超过 41 nm、最长可达 5.8 μm，
+     这些低频长寿命声学模主导了 κ<sub>P</sub>，也解释了为什么 κ<sub>P</sub> 对力常数高度敏感。</p>
+  <p>把 FC3 换成 3.0 Å 的拟合结果后：τ 中位 6.83 ps、自由程中位 3.16 nm、最长 4.05 μm（几乎不变），
+     与"低频声子主要受 FC2 控制、κ<sub>C</sub> 与低频散射对截断不敏感"的结论一致。</p>
+
+  <h3>3.2&nbsp;&nbsp;数据与复现</h3>
+  <ul>
+    <li><code>data/05_scattering/scattering_modes_c3_3p50.npz</code>：逐模式数组
+        frequency / gamma / gamma_isotope / group_velocity / heat_capacity / mode_kappa_P_RTA
+        （150×384，另含 weight、grid_point、qpoint、temperature、mesh）。</li>
+    <li><code>data/05_scattering/scattering_modes_c3_3p50.csv</code>：逐模式派生量
+        （τ、τ<sup>-1</sup>、同位素率、|v|、mfp）。3.0 Å 的对应文件为 <code>..._c3_3p00.*</code>。</li>
+    <li><code>scripts/plot_scattering.py</code>：生成上图与 CSV（
+        <code>python plot_scattering.py scattering_modes_c3_3p50.npz -o fig_scattering_c3_3p50</code>）。</li>
+    <li>单位约定：γ 为 THz，τ = 1/(2γ) 得 ps；|v| 为 THz·Å = Å/ps；mfp = |v|·τ（Å）÷10 = nm。</li>
+  </ul>
+</section>
