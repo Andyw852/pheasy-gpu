@@ -62,6 +62,12 @@ frequencies used for the recomputation agree with the Wigner output to
 5.7e-7 THz. (An independent run on a different machine gives the same velocities
 to within 1.2e-10 A/ps.)
 
+## eigenvectors/
+
+eigenvectors/ holds the phonon **eigenvectors** and **group velocities** on the
+same 150 irreducible q-points (3 npz parts < 60 MB each + manifest.json + README),
+computed from the same FC2 with phonopy. See eigenvectors/README.md.
+
 ## Using the section in a report
 
 The folder also contains a self-contained HTML section and a small helper:

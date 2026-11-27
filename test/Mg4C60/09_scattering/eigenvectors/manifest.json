@@ -1,0 +1,56 @@
+{
+ "source": "phonopy run_qpoints(with_eigenvectors=True, with_group_velocities=True) on fc2 313d0f61",
+ "mesh": [
+  8,
+  8,
+  8
+ ],
+ "nq": 150,
+ "nband": 384,
+ "ndof": 384,
+ "units": {
+  "frequency": "THz",
+  "group_velocity": "THz*A (= A/ps)",
+  "eigenvectors": "dimensionless, normalized sum|e|^2=1"
+ },
+ "qpoints_per_part": [
+  [
+   0,
+   50
+  ],
+  [
+   50,
+   100
+  ],
+  [
+   100,
+   150
+  ]
+ ],
+ "files": {
+  "mg4_eigenvectors_part1of3.npz": {
+   "q_range": [
+    0,
+    50
+   ],
+   "bytes": 51579462,
+   "md5": "162ec1080e78e16215ac2222bc4072c9"
+  },
+  "mg4_eigenvectors_part2of3.npz": {
+   "q_range": [
+    50,
+    100
+   ],
+   "bytes": 52013334,
+   "md5": "df9a2a20760882d65415ccb75346a874"
+  },
+  "mg4_eigenvectors_part3of3.npz": {
+   "q_range": [
+    100,
+    150
+   ],
+   "bytes": 52570252,
+   "md5": "7a9659313518cd175a7cea86418aec43"
+  }
+ }
+}
